@@ -3117,12 +3117,11 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
     
     # Compute per-SKU own-brand price index
     def compute_own_brand_idx(group):
-        # group is a DataFrame with one row (grouped by month, retailer, category, brand, sku)
-        m = group.index.get_level_values("month")[0]
-        r = group.index.get_level_values("retailer")[0]
-        c = group.index.get_level_values("category")[0]
-        b = group.index.get_level_values("brand")[0]
-        s = group.index.get_level_values("sku")[0]
+        m = group["month"].iloc[0]
+        r = group["retailer"].iloc[0]
+        c = group["category"].iloc[0]
+        b = group["brand"].iloc[0]
+        s = group["sku"].iloc[0]
         
         same_brand = df[
             (df["month"] == m) & 
@@ -3135,9 +3134,9 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
             return np.nan
         return np.average(same_brand["unit_price"], weights=same_brand["units"])
     
-    own_brand_idx = df.groupby(["month", "retailer", "category", "brand", "sku"]).apply(
+    own_brand_idx = df.groupby(["month", "retailer", "category", "brand", "sku"], as_index=False).apply(
         compute_own_brand_idx
-    ).reset_index(name="own_brand_price_index")
+    ).rename(columns={None: "own_brand_price_index"})
     
     df = df.merge(
         own_brand_idx[["month", "retailer", "category", "brand", "sku", "own_brand_price_index"]],
@@ -3147,11 +3146,11 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
     
     # Competitor price index (weighted avg of rival brands)
     def compute_comp_idx(group):
-        m = group.index.get_level_values("month")[0]
-        r = group.index.get_level_values("retailer")[0]
-        c = group.index.get_level_values("category")[0]
-        s = group.index.get_level_values("sku")[0]
-        b = group.index.get_level_values("brand")[0] if "brand" in group.index.names else None
+        m = group["month"].iloc[0]
+        r = group["retailer"].iloc[0]
+        c = group["category"].iloc[0]
+        b = group["brand"].iloc[0]
+        s = group["sku"].iloc[0]
         
         rivals = df[
             (df["month"] == m) & 
@@ -3163,9 +3162,9 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
             return np.nan
         return np.average(rivals["unit_price"], weights=rivals["units"])
     
-    comp_price_idx = df.groupby(["month", "retailer", "category", "brand", "sku"]).apply(
+    comp_price_idx = df.groupby(["month", "retailer", "category", "brand", "sku"], as_index=False).apply(
         compute_comp_idx
-    ).reset_index(name="competitor_price_index")
+    ).rename(columns={None: "competitor_price_index"})
     
     df = df.merge(
         comp_price_idx[["month", "retailer", "category", "brand", "sku", "competitor_price_index"]],
