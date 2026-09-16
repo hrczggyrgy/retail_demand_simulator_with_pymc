@@ -20,6 +20,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
 import streamlit as st
 import matplotlib.pyplot as plt
 
@@ -133,106 +134,6 @@ def build_filter_mask(
     return mask
 
 
-def calculate_market_shares(
-    baseline_df: pd.DataFrame,
-    scenario_df: pd.DataFrame,
-    share_level: str = "brand",
-) -> pd.DataFrame:
-    """
-    Calculate baseline and median-scenario market shares.
-
-    Market share is calculated from revenue by default. Since the dataset
-    contains the full competitive set, the denominator contains all rows in
-    the selected market/view scope.
-    """
-    group_cols = ["month"]
-    if share_level == "brand":
-        group_cols.append("brand")
-    elif share_level == "sku":
-        group_cols.extend(["brand", "sku"])
-    else:
-        group_cols.extend(["brand", "sku", "pack_size"])
-
-    base = (
-        baseline_df.groupby(group_cols, as_index=False)["revenue"]
-        .sum()
-        .rename(columns={"revenue": "baseline_value"})
-    )
-
-    scen = (
-        scenario_df.groupby(group_cols, as_index=False)["expected_revenue_median"]
-        .sum()
-        .rename(columns={"expected_revenue_median": "scenario_value"})
-    )
-
-    out = base.merge(scen, on=group_cols, how="outer").fillna(0)
-
-    totals = (
-        out.groupby("month", as_index=False)
-        .agg(
-            market_baseline=("baseline_value", "sum"),
-            market_scenario=("scenario_value", "sum"),
-        )
-    )
-    out = out.merge(totals, on="month", how="left")
-
-    out["baseline_share"] = np.where(
-        out["market_baseline"] > 0,
-        out["baseline_value"] / out["market_baseline"],
-        np.nan,
-    )
-    out["scenario_share"] = np.where(
-        out["market_scenario"] > 0,
-        out["scenario_value"] / out["market_scenario"],
-        np.nan,
-    )
-    out["share_change_pp"] = out["scenario_share"] - out["baseline_share"]
-    return out
-
-
-def summarize_period_shares(
-    baseline_df: pd.DataFrame,
-    scenario_df: pd.DataFrame,
-    share_level: str,
-) -> pd.DataFrame:
-    """
-    Aggregate over the selected period and calculate market shares.
-    """
-    if share_level == "brand":
-        group_cols = ["brand"]
-    elif share_level == "sku":
-        group_cols = ["brand", "sku"]
-    else:
-        group_cols = ["brand", "sku", "pack_size"]
-
-    base = (
-        baseline_df.groupby(group_cols, as_index=False)["revenue"]
-        .sum()
-        .rename(columns={"revenue": "baseline_value"})
-    )
-
-    scen = (
-        scenario_df.groupby(group_cols, as_index=False)["expected_revenue_median"]
-        .sum()
-        .rename(columns={"expected_revenue_median": "scenario_value"})
-    )
-
-    out = base.merge(scen, on=group_cols, how="outer").fillna(0)
-
-    base_total = out["baseline_value"].sum()
-    scen_total = out["scenario_value"].sum()
-
-    out["baseline_share"] = (
-        out["baseline_value"] / base_total if base_total > 0 else np.nan
-    )
-    out["scenario_share"] = (
-        out["scenario_value"] / scen_total if scen_total > 0 else np.nan
-    )
-    out["share_change_pp"] = out["scenario_share"] - out["baseline_share"]
-
-    return out.sort_values("scenario_share", ascending=False).reset_index(drop=True)
-
-
 def run_targeted_scenario(
     full_df: pd.DataFrame,
     trace,
@@ -253,7 +154,7 @@ def run_targeted_scenario(
     work = full_df.copy()
     work["_scenario_row_id"] = np.arange(len(work), dtype=int)
 
-    target_mask = apply_target_scope(work, target_level, target_value)
+    target_mask = engine.apply_target_scope(work, target_level, target_value)
 
     # Baseline scenario: zero change for everyone.
     baseline_scenario = engine.create_price_distribution_scenario(
@@ -672,12 +573,13 @@ def main() -> None:
     init_state()
     render_sidebar()
 
-    st.title("What happens to market share if price or distribution changes?")
+    st.title("Retail Demand & Scenario Cockpit")
     st.markdown(
         """
+        **Modelled historical response** — not causal guarantees.  
         The simulator uses the complete competitive market in the data. You choose
         **one action**, the products/retailers it applies to, and the app estimates
-        how **brand or SKU market shares move**.
+        how **brand or SKU market shares move** based on historical conditional associations.
         """
     )
 
@@ -724,6 +626,8 @@ def main() -> None:
     fit_model_if_needed()
 
     if st.session_state.model_result is None:
+        # Still show descriptive tabs even without model
+        show_descriptive_tabs(df, view_df, start_month, end_month)
         return
 
     idata = st.session_state.model_result
@@ -734,523 +638,790 @@ def main() -> None:
     elasticity_df = st.session_state.elasticities
     diagnostics = st.session_state.model_diagnostics or {}
 
-    tab_data, tab_model, tab_explorer, tab_scenario = st.tabs([
-        "1. Data quality",
-        "2. Model diagnostics",
-        "3. Price & distribution",
-        "4. Scenario builder",
+    # Build enriched features for all tabs
+    enriched_df = engine.build_retail_features(df)
+    view_enriched = enriched_df.loc[view_mask].copy()
+
+    # 6-tab navigation
+    tab_overview, tab_health, tab_market, tab_price, tab_scenario, tab_model = st.tabs([
+        "📊 Overview",
+        "🔍 Data health",
+        "📈 Market & share",
+        "💰 Price & distribution",
+        "⚙️ Scenario simulator",
+        "🏥 Model health",
     ])
 
-    with tab_data:
-        report = st.session_state.validation_report
-        quality = st.session_state.quality_report
+    with tab_overview:
+        render_overview_tab(view_df, view_enriched, elasticity_df, posterior_cache, meta, scales, spline, start_month, end_month)
 
-        if report is not None:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Rows", f"{report.row_count:,}")
-            c2.metric("Duplicates", f"{report.duplicate_count:,}")
-            c3.metric("Invalid rows", f"{report.invalid_rows:,}")
-            c4.metric("Valid", "Yes" if report.is_valid else "No")
+    with tab_health:
+        render_data_health_tab(df, st.session_state.validation_report, st.session_state.quality_report)
 
-        if quality is not None:
-            st.divider()
-            st.subheader("Market overview")
+    with tab_market:
+        render_market_share_tab(view_df, view_enriched, start_month, end_month)
 
-            c1, c2, c3, c4 = st.columns(4)
-            counts = quality.get("counts", {})
-            c1.metric("Retailers", counts.get("retailers", 0))
-            c2.metric("Categories", counts.get("categories", 0))
-            c3.metric("Brands", counts.get("brands", 0))
-            c4.metric("SKUs", counts.get("skus", 0))
+    with tab_price:
+        render_price_distribution_tab(view_df, view_enriched, idata, meta, scales, spline, posterior_cache, elasticity_df)
 
-            date_cov = quality.get("date_coverage", {})
-            if date_cov:
-                st.caption(
-                    f"Date range: {date_cov.get('min')} to {date_cov.get('max')} "
-                    f"({date_cov.get('n_months', 0)} months)"
+    with tab_scenario:
+        render_scenario_tab(
+            df, view_df, view_enriched, idata, meta, scales, spline,
+            posterior_cache, elasticity_df, diagnostics,
+            start_month, end_month, view_category, view_retailer, view_brand
+        )
+
+with tab_model:
+        render_model_health_tab(idata, df, diagnostics, meta, scales, spline, posterior_cache)
+
+
+def show_descriptive_tabs(df: pd.DataFrame, view_df: pd.DataFrame, start_month, end_month) -> None:
+    st.info("Model not yet fitted. Showing descriptive analytics only.")
+    tab_overview, tab_health, tab_market, tab_price = st.tabs([
+        "📊 Overview", "🔍 Data health", "📈 Market & share", "💰 Price & distribution"
+    ])
+    with tab_overview:
+        render_overview_tab(view_df, view_df, None, None, None, None, None, start_month, end_month)
+    with tab_health:
+        render_data_health_tab(df, st.session_state.validation_report, st.session_state.quality_report)
+    with tab_market:
+        render_market_share_tab(view_df, view_df, start_month, end_month)
+    with tab_price:
+        render_price_distribution_tab(view_df, view_df, None, None, None, None, None, None)
+
+
+def render_overview_tab(view_df, view_enriched, elasticity_df, posterior_cache, meta, scales, spline, start_month, end_month) -> None:
+    st.subheader(f"Market Overview ({start_month.strftime('%b %Y')} – {end_month.strftime('%b %Y')})")
+
+    if view_enriched is not None and "category_units" in view_enriched.columns:
+        latest_month = view_enriched["month"].max()
+        prev_month = view_enriched["month"].min()
+        latest = view_enriched[view_enriched["month"] == latest_month]
+        previous = view_enriched[view_enriched["month"] == prev_month]
+
+        cat_units_latest = latest["category_units"].sum()
+        cat_units_prev = previous["category_units"].sum()
+        cat_growth = (cat_units_latest - cat_units_prev) / cat_units_prev if cat_units_prev else 0
+
+        rev_latest = latest["revenue"].sum()
+        rev_prev = previous["revenue"].sum()
+        rev_growth = (rev_latest - rev_prev) / rev_prev if rev_prev else 0
+
+        sku_count = latest["sku"].nunique()
+        brand_count = latest["brand"].nunique()
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Category Units", f"{cat_units_latest:,.0f}", f"{cat_growth:+.1%}")
+        c2.metric("Revenue", f"{rev_latest:,.0f}", f"{rev_growth:+.1%}")
+        c3.metric("SKUs", f"{sku_count}")
+        c4.metric("Brands", f"{brand_count}")
+        c5.metric("Avg ND", f"{latest['nd'].mean():.1%}" if "nd" in latest.columns else "—")
+
+    st.divider()
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.markdown("### Category Trend")
+        if "category_units" in view_enriched.columns:
+            trend = view_enriched.groupby("month").agg(
+                units=("category_units", "sum"),
+                revenue=("revenue", "sum")
+            ).reset_index()
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=trend["month"], y=trend["units"], name="Units", yaxis="y", opacity=0.6))
+            fig.add_trace(go.Scatter(x=trend["month"], y=trend["revenue"], name="Revenue", yaxis="y2", line=dict(color="red")))
+            fig.update_layout(
+                yaxis=dict(title="Units", side="left"),
+                yaxis2=dict(title="Revenue", side="right", overlaying="y"),
+                height=350, hovermode="x unified", margin=dict(l=40, r=40, t=30, b=40)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Category units not available in view.")
+
+    with col2:
+        st.markdown("### Contribution to Growth")
+        if "brand_units" in view_enriched.columns:
+            contrib = view_enriched.groupby(["month", "brand"]).agg(
+                units=("units", "sum"),
+                brand_units=("brand_units", "first")
+            ).reset_index()
+            latest_m = contrib["month"].max()
+            prev_m = contrib["month"].min()
+            curr = contrib[contrib["month"] == latest_m][["brand", "units"]].rename(columns={"units": "curr"})
+            prev = contrib[contrib["month"] == prev_m][["brand", "units"]].rename(columns={"units": "prev"})
+            merged = curr.merge(prev, on="brand", how="outer").fillna(0)
+            merged["change"] = merged["curr"] - merged["prev"]
+            merged = merged.sort_values("change", ascending=True).tail(10)
+
+            fig = go.Figure(go.Bar(
+                x=merged["change"], y=merged["brand"], orientation="h",
+                marker_color=["red" if x < 0 else "green" for x in merged["change"]]
+            ))
+            fig.update_layout(height=350, margin=dict(l=100, r=20, t=30, b=40), xaxis_title="Unit change")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Brand contribution not available.")
+
+    st.divider()
+    st.markdown("### Key Alerts")
+    alerts = []
+
+    if view_enriched is not None and "nd" in view_enriched.columns:
+        low_nd = view_enriched[view_enriched["nd"] < 0.3]
+        if not low_nd.empty:
+            alerts.append(f"🔴 {len(low_nd)} SKU-months have ND < 30% (distribution gap)")
+
+        high_nd_low_vel = view_enriched[(view_enriched["nd"] > 0.8) & (view_enriched["velocity"] < view_enriched["velocity"].median())]
+        if not high_nd_low_vel.empty:
+            alerts.append(f"🟡 {len(high_nd_low_vel)} SKU-months have high ND but low velocity (rationalization candidates)")
+
+    if elasticity_df is not None:
+        high_elas = elasticity_df[elasticity_df["elasticity_median"] < -2.5]
+        if not high_elas.empty:
+            alerts.append(f"🔴 {len(high_elas)} SKUs have elasticity < -2.5 (high price sensitivity)")
+
+        low_precision = elasticity_df[elasticity_df["elasticity_p95"] - elasticity_df["elasticity_p05"] > 3.0]
+        if not low_precision.empty:
+            alerts.append(f"🟡 {len(low_precision)} SKUs have wide elasticity intervals (>3.0 width)")
+
+    if alerts:
+        for a in alerts:
+            st.warning(a)
+    else:
+        st.success("No major alerts detected in current view.")
+
+
+def render_data_health_tab(df, validation_report, quality_report) -> None:
+    st.subheader("Data Quality & Coverage")
+
+    if validation_report is not None:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Rows", f"{validation_report.row_count:,}")
+        c2.metric("Duplicates", f"{validation_report.duplicate_count:,}")
+        c3.metric("Invalid Rows", f"{validation_report.invalid_rows:,}")
+        c4.metric("Valid", "✅ Yes" if validation_report.is_valid else "❌ No")
+
+    if quality_report is not None:
+        st.divider()
+        st.markdown("### Market Coverage")
+        counts = quality_report.get("counts", {})
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Retailers", counts.get("retailers", 0))
+        c2.metric("Categories", counts.get("categories", 0))
+        c3.metric("Brands", counts.get("brands", 0))
+        c4.metric("SKUs", counts.get("skus", 0))
+
+        coverage = quality_report.get("coverage", {})
+        if coverage:
+            st.markdown("### Field Coverage")
+            cov_df = pd.DataFrame(list(coverage.items()), columns=["Field", "Coverage %"])
+            cov_df["Coverage %"] = cov_df["Coverage %"] * 100
+            fig = px.bar(cov_df, x="Field", y="Coverage %", color="Coverage %", color_continuous_scale="RdYlGn")
+            fig.update_layout(height=300)
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.markdown("### Data Quality Flags")
+
+    if "data_quality_status" in df.columns:
+        flag_counts = df["data_quality_status"].value_counts().reset_index()
+        flag_counts.columns = ["Flag", "Count"]
+        fig = px.bar(flag_counts, x="Flag", y="Count", color="Count", color_continuous_scale="Reds")
+        st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("Excluded / Flagged Records Detail"):
+            excluded = df[df["data_quality_status"] != "valid"]
+            if not excluded.empty:
+                display_cols = ["month", "retailer", "category", "brand", "sku", "units", "revenue", "data_quality_status"]
+                avail_cols = [c for c in display_cols if c in excluded.columns]
+                st.dataframe(excluded[avail_cols].head(200), use_container_width=True, hide_index=True)
+            else:
+                st.info("No excluded records.")
+    else:
+        st.info("Data quality flags not yet computed. Run feature engineering first.")
+
+    st.divider()
+    st.markdown("### Price Outlier Detection")
+    if "unit_price" in df.columns:
+        fig = px.box(df, y="unit_price", points="outliers", title="Unit Price Distribution")
+        st.plotly_chart(fig, use_container_width=True)
+
+        price_by_cat = df.groupby("category")["unit_price"].median().reset_index()
+        price_by_cat.columns = ["Category", "Median Unit Price"]
+        fig2 = px.bar(price_by_cat, x="Category", y="Median Unit Price", title="Median Unit Price by Category")
+        st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.info("Unit price not yet computed.")
+
+
+def render_market_share_tab(view_df, view_enriched, start_month, end_month) -> None:
+    st.subheader(f"Market Share & Growth ({start_month.strftime('%b %Y')} – {end_month.strftime('%b %Y')})")
+
+    if "brand_share" not in view_enriched.columns:
+        st.warning("Brand share not available. Run feature engineering first.")
+        return
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### Brand Share Trends")
+        share_trend = view_enriched.groupby(["month", "brand"]).agg(
+            share=("brand_share", "first"),
+            units=("units", "sum")
+        ).reset_index()
+        fig = px.area(share_trend, x="month", y="share", color="brand", title="Brand Unit Share Over Time")
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.markdown("### Brand Share (Latest Month)")
+        latest = view_enriched["month"].max()
+        latest_df = view_enriched[view_enriched["month"] == latest]
+        brand_share_latest = latest_df.groupby("brand").agg(
+            share=("brand_share", "first"),
+            units=("units", "sum")
+        ).reset_index().sort_values("share", ascending=False)
+        fig = px.pie(brand_share_latest, values="share", names="brand", title=f"Brand Share – {latest.strftime('%b %Y')}")
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    col3, col4 = st.columns(2)
+
+    with col3:
+        st.markdown("### Retailer × Category Heatmap")
+        if "retailer" in view_enriched.columns and "category" in view_enriched.columns:
+            heat = view_enriched.groupby(["retailer", "category"]).agg(
+                units=("units", "sum"),
+                revenue=("revenue", "sum")
+            ).reset_index()
+            fig = px.density_heatmap(heat, x="category", y="retailer", z="units", title="Units by Retailer × Category")
+            st.plotly_chart(fig, use_container_width=True)
+
+    with col4:
+        st.markdown("### Pack Mix by Brand")
+        if "pack_group" in view_enriched.columns:
+            pack_mix = view_enriched.groupby(["brand", "pack_group"]).agg(
+                units=("units", "sum")
+            ).reset_index()
+            fig = px.bar(pack_mix, x="brand", y="units", color="pack_group", title="Pack Size Mix by Brand", barmode="stack")
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.markdown("### Contribution Waterfall (Category Growth Decomposition)")
+    if "brand_units" in view_enriched.columns:
+        latest_m = view_enriched["month"].max()
+        prev_m = view_enriched["month"].min()
+        curr = view_enriched[view_enriched["month"] == latest_m].groupby("brand").agg(
+            units=("units", "sum"),
+            brand_units=("brand_units", "first")
+        )
+        prev = view_enriched[view_enriched["month"] == prev_m].groupby("brand").agg(
+            units=("units", "sum"),
+            brand_units=("brand_units", "first")
+        )
+        merged = curr.join(prev, lsuffix="_curr", rsuffix="_prev", how="outer").fillna(0)
+        merged["change"] = merged["units_curr"] - merged["units_prev"]
+        merged = merged.sort_values("change")
+
+        fig = go.Figure(go.Waterfall(
+            name="", orientation="v",
+            measure=["relative"] * len(merged) + ["total"],
+            x=list(merged.index) + ["Total"],
+            y=list(merged["change"]) + [merged["change"].sum()],
+            text=[f"{v:+,}" for v in merged["change"]] + [f"{merged['change'].sum():+,}"],
+            textposition="outside",
+            connector={"line": {"color": "rgb(63, 63, 63)"}},
+        ))
+        fig.update_layout(height=400, title="Category Growth by Brand Contribution")
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def render_price_distribution_tab(view_df, view_enriched, idata, meta, scales, spline, posterior_cache, elasticity_df) -> None:
+    st.subheader("Price & Distribution Analytics")
+
+    if view_enriched is None or "price_per_size_unit" not in view_enriched.columns:
+        st.warning("Price per size unit not available. Run feature engineering first.")
+        return
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### Price Ladder (Pack Size vs Unit Value)")
+        latest = view_enriched["month"].max()
+        latest_df = view_enriched[view_enriched["month"] == latest]
+        fig = px.scatter(
+            latest_df, x="pack_size", y="price_per_size_unit",
+            size="revenue", color="brand", hover_data=["sku", "units", "nd"],
+            title=f"Price per Size Unit by Pack Size – {latest.strftime('%b %Y')}",
+            labels={"pack_size": "Pack Size", "price_per_size_unit": "Price per Size Unit"}
+        )
+        if "category_price_median" in latest_df.columns:
+            cat_median = latest_df["category_price_median"].median()
+            fig.add_hline(y=cat_median, line_dash="dash", line_color="gray", annotation_text="Category Median")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.markdown("### ND vs Velocity Opportunity Quadrant")
+        fig = px.scatter(
+            latest_df, x="nd", y="velocity",
+            size="revenue", color="brand", hover_data=["sku", "pack_size", "units"],
+            title=f"Distribution vs Velocity – {latest.strftime('%b %Y')}",
+            labels={"nd": "Numeric Distribution", "velocity": "Velocity (units/store)"}
+        )
+        nd_median = latest_df["nd"].median()
+        vel_median = latest_df["velocity"].median()
+        fig.add_vline(x=nd_median, line_dash="dash", line_color="gray")
+        fig.add_hline(y=vel_median, line_dash="dash", line_color="gray")
+        fig.add_annotation(x=nd_median*0.5, y=vel_median*1.5, text="Expand", showarrow=False, font=dict(size=10, color="green"))
+        fig.add_annotation(x=nd_median*1.5, y=vel_median*1.5, text="Protect", showarrow=False, font=dict(size=10, color="blue"))
+        fig.add_annotation(x=nd_median*0.5, y=vel_median*0.5, text="Test/Review", showarrow=False, font=dict(size=10, color="orange"))
+        fig.add_annotation(x=nd_median*1.5, y=vel_median*0.5, text="Rationalize", showarrow=False, font=dict(size=10, color="red"))
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.markdown("### Relative Price Index by Brand")
+    if "relative_price_index" in latest_df.columns:
+        rpi = latest_df.groupby("brand").agg(
+            rpi=("relative_price_index", "median"),
+            revenue=("revenue", "sum")
+        ).reset_index().sort_values("rpi")
+        fig = px.bar(rpi, x="brand", y="rpi", color="rpi", color_continuous_scale="RdYlGn_r",
+                     title="Median Relative Price Index by Brand (vs Category Median)")
+        fig.add_hline(y=1.0, line_dash="dash", line_color="black")
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.markdown("### Distribution White-Space Matrix")
+    if "retailer" in latest_df.columns:
+        ws = latest_df.groupby(["retailer", "brand"]).agg(
+            skus=("sku", "nunique"),
+            avg_nd=("nd", "mean"),
+            revenue=("revenue", "sum")
+        ).reset_index()
+        fig = px.scatter(ws, x="retailer", y="brand", size="revenue", color="avg_nd",
+                         color_continuous_scale="RdYlGn", title="Avg ND by Retailer × Brand (bubble = revenue)")
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def render_scenario_tab(df, view_df, view_enriched, idata, meta, scales, spline,
+                         posterior_cache, elasticity_df, diagnostics,
+                         start_month, end_month, view_category, view_retailer, view_brand) -> None:
+    from app import render_scenario_builder
+
+    st.markdown("### Scenario Assumptions & Guardrails")
+
+    with st.expander("⚙️ Cross-Effect Multipliers (Assumption-Led)", expanded=False):
+        st.markdown("""
+        These multipliers approximate substitution effects **not estimated by the model**.
+        They are scenario assumptions, not statistically discovered relationships.
+
+        | Relationship | Multiplier | Status |
+        |---|---|---|
+        | Same brand, adjacent pack | 0.35 | Assumption |
+        | Same brand, other pack | 0.15 | Assumption |
+        | Other brand, same pack | 0.25 | Assumption |
+        | Other brand, other pack | 0.08 | Assumption |
+        """)
+
+    with st.expander("📊 Confidence Flags", expanded=False):
+        st.markdown("""
+        | Status | Meaning |
+        |---|---|
+        | **Estimated** | Posterior interval excludes zero, sufficient data |
+        | **Shrunk** | Group prior dominates, limited SKU-level evidence |
+        | **Assumption-Led** | User-specified rule, not data-supported |
+        | **Not Available** | Sparse/missing competitive set |
+        """)
+
+    st.divider()
+
+    render_scenario_builder()
+
+
+def render_model_health_tab(idata, df, diagnostics, meta, scales, spline, posterior_cache) -> None:
+    st.subheader("Model Health & Validation")
+
+    if idata is None:
+        st.warning("No model fitted yet.")
+        return
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### Convergence Diagnostics")
+        if "divergences" in diagnostics:
+            st.metric("Divergences", diagnostics["divergences"])
+        if "rhat_max" in diagnostics:
+            st.metric("Max R-hat", f"{diagnostics['rhat_max']:.3f}")
+        if "ess_bulk_min" in diagnostics:
+            st.metric("Min ESS (bulk)", f"{diagnostics['ess_bulk_min']:.0f}")
+        if "ess_tail_min" in diagnostics:
+            st.metric("Min ESS (tail)", f"{diagnostics['ess_tail_min']:.0f}")
+
+        st.caption("Target: R-hat < 1.01, ESS > 400, Divergences = 0")
+
+    with col2:
+        st.markdown("### Posterior Predictive Coverage")
+        if "coverage_90" in diagnostics:
+            c1, c2 = st.columns(2)
+            c1.metric("90% Interval Coverage", f"{diagnostics['coverage_90']:.1%}")
+            c2.metric("Target", "90%")
+            if diagnostics['coverage_90'] < 0.85:
+                st.warning("Coverage below 85% — intervals may be too narrow")
+            elif diagnostics['coverage_90'] > 0.95:
+                st.info("Coverage above 95% — intervals may be conservative")
+            else:
+                st.success("Coverage well-calibrated")
+
+    st.divider()
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        st.markdown("### Observed vs Predicted (PPC)")
+        try:
+            if hasattr(idata, "posterior_predictive") and "y" in idata.posterior_predictive:
+                y_obs = idata.observed_data["y"].values.flatten() if "y" in idata.observed_data else None
+                y_pred = idata.posterior_predictive["y"].values
+                if y_obs is not None and len(y_obs) > 0:
+                    pred_median = np.median(y_pred, axis=(0, 1))
+                    pred_p05 = np.percentile(y_pred, 5, axis=(0, 1))
+                    pred_p95 = np.percentile(y_pred, 95, axis=(0, 1))
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=y_obs, y=y_obs, mode="lines", name="Perfect fit", line=dict(dash="dash", color="gray")))
+                    fig.add_trace(go.Scatter(
+                        x=y_obs, y=pred_median, mode="markers", name="Posterior median",
+                        marker=dict(color="blue", size=4, opacity=0.6),
+                        error_y=dict(type="data", symmetric=False, array=pred_p95 - pred_median, arrayminus=pred_median - pred_p05, color="lightblue")
+                    ))
+                    fig.update_layout(height=400, xaxis_title="Observed", yaxis_title="Predicted",
+                                     title="Posterior Predictive Check: Observed vs Predicted")
+                    st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.info(f"PPC plot unavailable: {e}")
+
+    with col4:
+        st.markdown("### Residual Heatmap (Retailer × Month)")
+        try:
+            if hasattr(idata, "posterior_predictive") and "y" in idata.posterior_predictive:
+                y_obs = idata.observed_data["y"].values.flatten()
+                y_pred = np.median(idata.posterior_predictive["y"].values, axis=(0, 1))
+                residuals = y_obs - y_pred
+
+                if "retailer" in df.columns and "month" in df.columns:
+                    res_df = df[["retailer", "month"]].copy()
+                    res_df["residual"] = residuals[:len(res_df)]
+                    res_pivot = res_df.pivot_table(values="residual", index="retailer", columns="month", aggfunc="mean")
+                    fig = px.imshow(res_pivot, color_continuous_scale="RdBu", color_continuous_midpoint=0,
+                                    title="Mean Residual by Retailer × Month")
+                    st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.info(f"Residual heatmap unavailable: {e}")
+
+    st.divider()
+    st.markdown("### Elasticity Forest Plot")
+    if posterior_cache is not None:
+        try:
+            from engine import plot_elasticity_forest
+            pc = plot_elasticity_forest(posterior_cache)
+            if hasattr(pc, "viz") and "figure" in pc.viz:
+                fig = pc.viz["figure"].item()
+                st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.info(f"Elasticity forest plot unavailable: {e}")
+
+    st.divider()
+    st.markdown("### Holdout Validation (Rolling Backtest)")
+    st.info("Rolling holdout validation not yet implemented. Will show WAPE, bias, directional accuracy by horizon.")
+
+
+def render_scenario_builder() -> None:
+    """Scenario builder UI - extracted from original scenario tab."""
+    df = st.session_state.prepared_data.copy()
+    idata = st.session_state.model_result
+    meta = st.session_state.meta
+    spline = st.session_state.spline
+    scales = st.session_state.scales
+    posterior_cache = st.session_state.posterior_cache
+    elasticity_df = st.session_state.elasticities
+    view_category = st.session_state.get("view_category", "All")
+    view_retailer = st.session_state.get("view_retailer", "All")
+    view_brand = st.session_state.get("view_brand", "All")
+    start_month = st.session_state.get("view_start", df["month"].min())
+    end_month = st.session_state.get("view_end", df["month"].max())
+
+    if posterior_cache is None:
+        st.info("Fit the model first to run scenarios.")
+        return
+
+    st.subheader("Build your what-if scenario")
+
+    # Scenario type
+    scenario_type = st.radio(
+        "Scenario type",
+        ["Price only", "Distribution only", "Combined"],
+        horizontal=True,
+        help="Price only: change relative price. Distribution only: change ND. Combined: both.",
+    )
+
+    # Target definition
+    st.markdown("### Target")
+    target_level = st.radio(
+        "Apply to",
+        ["Market", "Retailer", "Brand", "SKU"],
+        horizontal=True,
+        index=2,
+    )
+
+    target_value = None
+    if target_level == "Retailer":
+        target_value = st.selectbox("Choose retailer", sorted(df["retailer"].dropna().unique()))
+    elif target_level == "Brand":
+        target_value = st.selectbox("Choose brand", sorted(df["brand"].dropna().unique()))
+    elif target_level == "SKU":
+        sku_options = (
+            df[["brand", "sku"]]
+            .drop_duplicates()
+            .sort_values(["brand", "sku"])
+        )
+        sku_labels = [f"{r.brand} | {r.sku}" for r in sku_options.itertuples()]
+        selected = st.selectbox("Choose SKU", sku_labels)
+        target_value = selected.split(" | ", 1)[1]
+
+    # Price control
+    price_change = 0.0
+    if scenario_type in ["Price only", "Combined"]:
+        st.divider()
+        st.markdown("### Price change")
+        price_change_pct = st.slider(
+            "Price change",
+            min_value=-50,
+            max_value=50,
+            value=0,
+            step=1,
+            format="%d%%",
+        )
+        price_change = price_change_pct / 100.0
+
+    # Distribution control
+    nd_mode = "pp"
+    if scenario_type in ["Distribution only", "Combined"]:
+        st.divider()
+        st.markdown("### Distribution change")
+        nd_mode = st.radio(
+            "Input mode",
+            ["Percentage points", "Relative change", "Target ND"],
+            horizontal=True,
+        )
+
+        if nd_mode == "Percentage points":
+            nd_change_pp = st.slider(
+                "ND change (pp)",
+                min_value=-30,
+                max_value=30,
+                value=0,
+                step=1,
+            )
+            nd_change_val = nd_change_pp / 100.0
+        elif nd_mode == "Relative change":
+            nd_rel = st.slider(
+                "ND relative change",
+                min_value=-50,
+                max_value=100,
+                value=0,
+                step=1,
+                format="%d%%",
+            )
+            nd_change_val = nd_rel / 100.0
+        else:
+            nd_target = st.slider(
+                "Target ND",
+                min_value=0.01,
+                max_value=1.00,
+                value=0.50,
+                step=0.01,
+            )
+            nd_change_val = nd_target
+
+    if st.button("Run scenario", type="primary", use_container_width=True):
+        market_scope_df = df[
+            df["month"].between(pd.Timestamp(start_month), pd.Timestamp(end_month))
+        ].copy()
+        if view_category != "All":
+            market_scope_df = market_scope_df[
+                market_scope_df["category"].eq(view_category)
+            ]
+
+        if market_scope_df.empty:
+            st.warning("No market rows remain for the selected scope.")
+        else:
+            with st.spinner("Calculating scenario..."):
+                nd_base = market_scope_df["nd"].to_numpy()
+                if scenario_type in ["Distribution only", "Combined"]:
+                    if nd_mode == "Percentage points":
+                        resolved_nd = engine.resolve_target_nd(nd_base, nd_change_val, "pp")
+                    elif nd_mode == "Relative change":
+                        resolved_nd = engine.resolve_target_nd(nd_base, nd_change_val, "relative")
+                    else:
+                        resolved_nd = engine.resolve_target_nd(nd_base, nd_change_val, "absolute")
+                else:
+                    resolved_nd = nd_base
+
+                target_mask = engine.apply_target_scope(market_scope_df, target_level, target_value)
+
+                price_effect = np.zeros((posterior_cache["price_slope_z"].shape[0], len(market_scope_df)))
+                if scenario_type in ["Price only", "Combined"] and price_change != 0:
+                    price_effect = engine.price_delta_log_volume(
+                        posterior_cache["price_slope_z"],
+                        market_scope_df["sku_idx"].to_numpy(dtype="int32"),
+                        price_change,
+                        target_mask.to_numpy(),
+                    )
+
+                nd_effect = np.zeros((posterior_cache["price_slope_z"].shape[0], len(market_scope_df)))
+                if scenario_type in ["Distribution only", "Combined"]:
+                    nd_effect = engine.nd_delta_log_volume(
+                        posterior_cache,
+                        spline,
+                        scales,
+                        market_scope_df["sku_idx"].to_numpy(dtype="int32"),
+                        nd_base,
+                        resolved_nd,
+                        target_mask.to_numpy(),
+                    )
+
+                total_effect = engine.combined_delta_log_volume(price_effect, nd_effect)
+
+                result = engine.summarise_scenario_draws(
+                    market_scope_df["units"].to_numpy(),
+                    market_scope_df["revenue"].to_numpy(),
+                    price_change,
+                    total_effect,
                 )
 
-            st.divider()
-            st.subheader("Data quality flags")
+                for col in result.columns:
+                    market_scope_df[col] = result[col]
 
-            col1, col2 = st.columns(2)
-            with col1:
-                miss = quality.get("missing_values", {})
-                if miss:
-                    st.write("**Missing values**")
-                    for k, v in miss.items():
-                        st.write(f"• {k}: {v:,}")
-                else:
-                    st.write("**Missing values**: None")
+                share_df = engine.calculate_market_shares(market_scope_df, market_scope_df, "brand")
+                sku_share_df = engine.calculate_market_shares(market_scope_df, market_scope_df, "sku")
 
-            with col2:
-                dist_val = quality.get("distribution_validity", {})
-                if dist_val:
-                    st.write("**Distribution validity**")
-                    st.write(f"• ND range: [{dist_val.get('nd_min', 0):.3f}, {dist_val.get('nd_max', 0):.3f}]")
-                    st.write(f"• ND > 1 count: {dist_val.get('nd_gt_1_count', 0)}")
+                st.session_state.scenario_df = market_scope_df
+                st.session_state.scenario_shares = share_df
+                st.session_state.scenario_sku_shares = sku_share_df
+                st.session_state.scenario_settings = {
+                    "type": scenario_type,
+                    "target_level": target_level,
+                    "target_value": target_value,
+                    "price_change": price_change,
+                    "nd_mode": nd_mode,
+                    "nd_change": nd_change_val if 'nd_change_val' in locals() else 0,
+                    "resolved_nd": resolved_nd if 'resolved_nd' in locals() else None,
+                }
 
-            low_obs = quality.get("low_observation_skus", [])
-            if low_obs:
-                st.write(f"**Low-observation SKUs (< 6 months)**: {len(low_obs)}")
-                with st.expander("Show SKUs"):
-                    st.write(low_obs)
+    if "scenario_shares" in st.session_state and st.session_state.scenario_shares is not None:
+        share_df = st.session_state.scenario_shares
+        settings = st.session_state.scenario_settings or {}
 
-            if report.warnings:
-                st.divider()
-                st.write("**Warnings**")
-                for w in report.warnings:
-                    st.warning(w)
+        st.divider()
+        st.subheader("Scenario results")
 
-    with tab_model:
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            st.metric("Divergences", diagnostics.get("divergences", 0))
-        with d2:
-            st.metric("Max R-hat", f'{diagnostics.get("max_rhat", np.nan):.3f}')
-        with d3:
-            st.metric("Min bulk ESS", f'{diagnostics.get("min_ess_bulk", np.nan):.0f}')
+        target_level = settings.get("target_level")
+        target_value = settings.get("target_value")
+        price_change = settings.get("price_change", 0.0)
 
-        if diagnostics.get("is_usable"):
-            st.success("Model diagnostics passed the configured checks.")
-        else:
-            for warning in diagnostics.get("warnings", []):
-                st.warning(warning)
+        target_label = (
+            "Entire market"
+            if target_level == "Market"
+            else f"{target_level}: {target_value}"
+        )
+
+        st.caption(
+            f"**Target**: {target_label}  |  "
+            f"**Price**: {price_change:+.0%}  |  "
+            f"**Type**: {settings.get('type', 'Combined')}"
+        )
+
+        total_base = share_df["baseline_value"].sum()
+        total_scen = share_df["scenario_value"].sum()
+        total_rev_change = total_scen / total_base - 1 if total_base > 0 else np.nan
+
+        a, b, c, d = st.columns(4)
+        with a:
+            st.metric("Market value change", f"{total_rev_change:+.1%}")
+        with b:
+            if target_level in ["Brand", "SKU"] and target_value:
+                target_rows = share_df[share_df[target_level.lower()] == target_value]
+                if not target_rows.empty:
+                    ts_change = target_rows["share_change_pp"].sum()
+                    st.metric("Target share change", f"{ts_change * 100:+.1f} pp")
+        with c:
+            scenario_df = st.session_state.scenario_df
+            target_mask = engine.apply_target_scope(scenario_df, target_level, target_value)
+            if target_mask.any():
+                bu = scenario_df.loc[target_mask, "units"].sum()
+                su = scenario_df.loc[target_mask, "units_median"].sum()
+                st.metric("Target units change", f"{(su/bu-1)*100:+.1f}%" if bu > 0 else "—")
+        with d:
+            if target_mask.any():
+                br = scenario_df.loc[target_mask, "revenue"].sum()
+                sr = scenario_df.loc[target_mask, "revenue_median"].sum()
+                st.metric("Target revenue change", f"{(sr/br-1)*100:+.1f}%" if br > 0 else "—")
 
         st.divider()
 
-        # Parameter group selector for trace/rank plots
-        param_group = st.selectbox(
-            "Diagnostic parameter group",
-            [
-                "Global parameters",
-                "Price elasticities",
-                "Distribution parameters",
-            ],
-            key="diag_param_group",
+        col1, col2 = st.columns(2)
+        with col1:
+            st.plotly_chart(
+                engine.create_share_change_chart(share_df),
+                use_container_width=True,
+            )
+        with col2:
+            st.plotly_chart(
+                engine.create_share_comparison_chart(share_df),
+                use_container_width=True,
+            )
+
+        # Detailed table
+        st.markdown("### Share changes by brand")
+        display = share_df.sort_values("share_change_pp", ascending=False)[
+            ["brand", "baseline_share", "scenario_share", "share_change_pp"]
+        ].copy()
+        display = display.rename(columns={
+            "brand": "Brand",
+            "baseline_share": "Baseline share",
+            "scenario_share": "Scenario share",
+            "share_change_pp": "Change (pp)",
+        })
+        st.dataframe(
+            display.style.format({
+                "Baseline share": "{:.1%}",
+                "Scenario share": "{:.1%}",
+                "Change (pp)": lambda x: f"{x * 100:+.1f} pp",
+            }),
+            use_container_width=True,
+            hide_index=True,
         )
 
-        param_groups = {
-            "Global parameters": [
-                "alpha",
-                "sigma_entity",
-                "sigma_month",
-                "sigma_price_sku",
-                "sigma_nd",
-                "sigma",
-            ],
-            "Price elasticities": ["price_slope_z"],
-            "Distribution parameters": ["nd_coef"],
-        }
-
-        selected_var_names = param_groups[param_group]
-
-        with st.expander("Trace plots", expanded=(param_group == "Global parameters")):
-            try:
-                fig = engine.make_trace_figure(idata, var_names=selected_var_names)
-                st.pyplot(fig, clear_figure=True)
-                plt.close(fig)
-            except Exception as e:
-                st.error(f"Trace plot failed: {e}")
-
-        with st.expander("Rank plots", expanded=False):
-            try:
-                fig = engine.make_rank_figure(idata, var_names=selected_var_names)
-                st.pyplot(fig, clear_figure=True)
-                plt.close(fig)
-            except Exception as e:
-                st.error(f"Rank plot failed: {e}")
-
-        with st.expander("Sampler energy", expanded=False):
-            try:
-                fig = engine.make_energy_figure(idata)
-                st.pyplot(fig, clear_figure=True)
-                plt.close(fig)
-            except Exception as e:
-                st.error(f"Energy plot failed: {e}")
-
-        with st.expander("Posterior predictive check", expanded=True):
-            try:
-                fig = engine.make_ppc_figure(idata)
-                st.pyplot(fig, clear_figure=True)
-                plt.close(fig)
-            except Exception as e:
-                st.error(f"PPC plot failed: {e}. Run posterior predictive sampling first.")
-
-    with tab_explorer:
-        if elasticity_df is not None and posterior_cache is not None:
-            # Filters
-            cat_col, brand_col, sku_col = st.columns(3)
-
-            categories = sorted(df["category"].dropna().unique())
-            selected_category = cat_col.selectbox("Category", categories, key="explorer_cat")
-
-            brands_in_cat = sorted(
-                df.loc[df["category"] == selected_category, "brand"].dropna().unique()
-            )
-            selected_brand = brand_col.selectbox("Brand", brands_in_cat, key="explorer_brand")
-
-            skus_in_brand = sorted(
-                df.loc[
-                    (df["category"] == selected_category) & (df["brand"] == selected_brand),
-                    "sku",
-                ].dropna().unique()
-            )
-
-            # Elasticity forest plot (ArviZ)
-            st.subheader("Price elasticity (posterior forest plot)")
-
-            brand_skus = [
-                s for s in skus_in_brand if s in idata.posterior.coords.get("sku", {}).values
-            ]
-
-            if brand_skus:
-                selected_skus_forest = st.multiselect(
-                    "SKUs to compare",
-                    options=brand_skus,
-                    default=brand_skus[:min(8, len(brand_skus))],
-                    key="explorer_skus_forest",
-                )
-
-                if selected_skus_forest:
-                    try:
-                        fig = engine.make_elasticity_forest_figure(
-                            idata,
-                            selected_skus=selected_skus_forest,
-                            hdi_prob=0.90,
-                        )
-                        st.pyplot(fig, clear_figure=True)
-                        plt.close(fig)
-                    except Exception as e:
-                        st.error(f"Elasticity forest plot failed: {e}")
-
-                st.caption(
-                    "Intervals show 90% posterior credible intervals. "
-                    "More negative own-price elasticities imply greater expected "
-                    "volume sensitivity to relative price changes."
-                )
-            else:
-                st.info("No SKUs available for forest plot in selected brand.")
-
-            st.divider()
-
-            # SKU-level elasticity table
-            st.subheader("Price elasticity (raw scale)")
-            sku_options = skus_in_brand
-            selected_sku = sku_col.selectbox("SKU", sku_options, key="explorer_sku")
-
-            sku_elasticity = elasticity_df[elasticity_df["sku"] == selected_sku]
-            if not sku_elasticity.empty:
-                st.dataframe(
-                    sku_elasticity[
-                        ["sku", "brand", "pack_group", "pack_size", "elasticity_p05", "elasticity_median", "elasticity_p95"]
-                    ].style.format({
-                        "elasticity_p05": "{:.3f}",
-                        "elasticity_median": "{:.3f}",
-                        "elasticity_p95": "{:.3f}",
-                    }),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            # ND response curve (using engine's build_nd_response_curve)
-            st.divider()
-            st.subheader("Distribution response curve")
-
-            sku_index = meta["sku_levels"].tolist().index(selected_sku)
-
-            try:
-                nd_curve = engine.build_nd_response_curve(idata, spline, sku_index=sku_index)
-
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=nd_curve["nd"],
-                    y=nd_curve["nd_p90"],
-                    mode="lines",
-                    line={"width": 0},
-                    showlegend=False,
-                    hoverinfo="skip",
-                ))
-                fig.add_trace(go.Scatter(
-                    x=nd_curve["nd"],
-                    y=nd_curve["nd_p10"],
-                    mode="lines",
-                    line={"width": 0},
-                    fill="tonexty",
-                    fillcolor="rgba(30, 136, 229, 0.18)",
-                    name="80% credible interval",
-                ))
-                fig.add_trace(go.Scatter(
-                    x=nd_curve["nd"],
-                    y=nd_curve["nd_median"],
-                    mode="lines",
-                    line={"color": "#1E88E5", "width": 3},
-                    name="Median expected multiplier",
-                ))
-                fig.add_vline(x=0.5, line_dash="dash", line_color="gray", annotation_text="50% ND (ref)")
-                fig.update_layout(
-                    title=f"Distribution response: {selected_sku}",
-                    xaxis_title="Numeric distribution",
-                    yaxis_title="Volume multiplier vs minimum ND",
-                    template="plotly_white",
-                    height=450,
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception as e:
-                st.error(f"ND response curve failed: {e}")
-
-            st.caption(
-                "Shows how estimated velocity changes with distribution, holding price constant. "
-                "Relative to 50% numeric distribution. Based on historical associations, not causal effects."
-            )
-        else:
-            st.info("Fit the model first to explore price and distribution responses.")
-
-    with tab_scenario:
-        if posterior_cache is None:
-            st.info("Fit the model first to run scenarios.")
-        else:
-            st.subheader("Build your what-if scenario")
-
-            # Scenario type
-            scenario_type = st.radio(
-                "Scenario type",
-                ["Price only", "Distribution only", "Combined"],
-                horizontal=True,
-                help="Price only: change relative price. Distribution only: change ND. Combined: both."
-            )
-
-            # Target definition
-            st.markdown("### Target")
-            target_level = st.radio(
-                "Apply to",
-                ["Market", "Retailer", "Brand", "SKU"],
-                horizontal=True,
-                index=2,
-            )
-
-            target_value = None
-            if target_level == "Retailer":
-                target_value = st.selectbox("Choose retailer", unique_sorted(view_df, "retailer"))
-            elif target_level == "Brand":
-                target_value = st.selectbox("Choose brand", unique_sorted(view_df, "brand"))
-            elif target_level == "SKU":
-                sku_options = (
-                    view_df[["brand", "sku"]]
-                    .drop_duplicates()
-                    .sort_values(["brand", "sku"])
-                )
-                sku_labels = [f"{r.brand} | {r.sku}" for r in sku_options.itertuples()]
-                selected = st.selectbox("Choose SKU", sku_labels)
-                target_value = selected.split(" | ", 1)[1]
-
-            # Price control
-            price_change = 0.0
-            if scenario_type in ["Price only", "Combined"]:
-                st.divider()
-                st.markdown("### Price change")
-                price_change_pct = st.slider(
-                    "Price change",
-                    min_value=-50,
-                    max_value=50,
-                    value=0,
-                    step=1,
-                    format="%d%%",
-                )
-                price_change = price_change_pct / 100.0
-
-            # Distribution control
-            nd_new = None
-            nd_mode = "pp"
-            if scenario_type in ["Distribution only", "Combined"]:
-                st.divider()
-                st.markdown("### Distribution change")
-                nd_mode = st.radio(
-                    "Input mode",
-                    ["Percentage points", "Relative change", "Target ND"],
-                    horizontal=True,
-                )
-
-                if nd_mode == "Percentage points":
-                    nd_change_pp = st.slider(
-                        "ND change (pp)",
-                        min_value=-30,
-                        max_value=30,
-                        value=0,
-                        step=1,
-                    )
-                    nd_change_val = nd_change_pp / 100.0
-                elif nd_mode == "Relative change":
-                    nd_rel = st.slider(
-                        "ND relative change",
-                        min_value=-50,
-                        max_value=100,
-                        value=0,
-                        step=1,
-                        format="%d%%",
-                    )
-                    nd_change_val = nd_rel / 100.0
-                else:
-                    nd_target = st.slider(
-                        "Target ND",
-                        min_value=0.01,
-                        max_value=1.00,
-                        value=0.50,
-                        step=0.01,
-                    )
-                    nd_change_val = nd_target
-
-            if st.button("Run scenario", type="primary", use_container_width=True):
-                market_scope_df = df[
-                    df["month"].between(pd.Timestamp(start_month), pd.Timestamp(end_month))
+        if "scenario_sku_shares" in st.session_state:
+            with st.expander("SKU-level share changes"):
+                sku_share_df = st.session_state.scenario_sku_shares
+                sku_display = sku_share_df.sort_values("share_change_pp", ascending=False)[
+                    ["brand", "sku", "baseline_share", "scenario_share", "share_change_pp"]
                 ].copy()
-                if view_category != "All":
-                    market_scope_df = market_scope_df[
-                        market_scope_df["category"].eq(view_category)
-                    ]
-
-                if market_scope_df.empty:
-                    st.warning("No market rows remain for the selected scope.")
-                else:
-                    with st.spinner("Calculating scenario..."):
-                        nd_base = market_scope_df["nd"].to_numpy()
-                        if scenario_type in ["Distribution only", "Combined"]:
-                            if nd_mode == "Percentage points":
-                                resolved_nd = engine.resolve_target_nd(nd_base, nd_change_val, "pp")
-                            elif nd_mode == "Relative change":
-                                resolved_nd = engine.resolve_target_nd(nd_base, nd_change_val, "relative")
-                            else:
-                                resolved_nd = engine.resolve_target_nd(nd_base, nd_change_val, "absolute")
-                        else:
-                            resolved_nd = nd_base
-
-                        target_mask = engine.apply_target_scope(market_scope_df, target_level, target_value)
-
-                        price_effect = np.zeros((posterior_cache["price_slope_z"].shape[0], len(market_scope_df)))
-                        if scenario_type in ["Price only", "Combined"] and price_change != 0:
-                            price_effect = engine.price_delta_log_volume(
-                                posterior_cache["price_slope_z"],
-                                market_scope_df["sku_idx"].to_numpy(dtype="int32"),
-                                price_change,
-                                target_mask.to_numpy(),
-                            )
-
-                        nd_effect = np.zeros((posterior_cache["price_slope_z"].shape[0], len(market_scope_df)))
-                        if scenario_type in ["Distribution only", "Combined"]:
-                            nd_effect = engine.nd_delta_log_volume(
-                                posterior_cache,
-                                spline,
-                                scales,
-                                market_scope_df["sku_idx"].to_numpy(dtype="int32"),
-                                nd_base,
-                                resolved_nd,
-                                target_mask.to_numpy(),
-                            )
-
-                        total_effect = engine.combined_delta_log_volume(price_effect, nd_effect)
-
-                        result = engine.summarise_scenario_draws(
-                            market_scope_df["units"].to_numpy(),
-                            market_scope_df["revenue"].to_numpy(),
-                            price_change,
-                            total_effect,
-                        )
-
-                        for col in result.columns:
-                            market_scope_df[col] = result[col]
-
-                        share_df = engine.calculate_market_shares(market_scope_df, market_scope_df, "brand")
-                        sku_share_df = engine.calculate_market_shares(market_scope_df, market_scope_df, "sku")
-
-                        st.session_state.scenario_df = market_scope_df
-                        st.session_state.scenario_shares = share_df
-                        st.session_state.scenario_sku_shares = sku_share_df
-                        st.session_state.scenario_settings = {
-                            "type": scenario_type,
-                            "target_level": target_level,
-                            "target_value": target_value,
-                            "price_change": price_change,
-                            "nd_mode": nd_mode,
-                            "nd_change": nd_change_val if 'nd_change_val' in locals() else 0,
-                            "resolved_nd": resolved_nd if 'resolved_nd' in locals() else None,
-                        }
-
-            if "scenario_shares" in st.session_state and st.session_state.scenario_shares is not None:
-                share_df = st.session_state.scenario_shares
-                settings = st.session_state.scenario_settings or {}
-
-                st.divider()
-                st.subheader("Scenario results")
-
-                target_level = settings.get("target_level")
-                target_value = settings.get("target_value")
-                price_change = settings.get("price_change", 0.0)
-
-                target_label = (
-                    "Entire market"
-                    if target_level == "Market"
-                    else f"{target_level}: {target_value}"
-                )
-
-                st.caption(
-                    f"**Target**: {target_label}  |  "
-                    f"**Price**: {price_change:+.0%}  |  "
-                    f"**Type**: {settings.get('type', 'Combined')}"
-                )
-
-                total_base = share_df["baseline_value"].sum()
-                total_scen = share_df["scenario_value"].sum()
-                total_rev_change = total_scen / total_base - 1 if total_base > 0 else np.nan
-
-                a, b, c, d = st.columns(4)
-                with a:
-                    st.metric("Market value change", f"{total_rev_change:+.1%}")
-                with b:
-                    if target_level in ["Brand", "SKU"] and target_value:
-                        target_rows = share_df[share_df[target_level.lower()] == target_value]
-                        if not target_rows.empty:
-                            ts_change = target_rows["share_change_pp"].sum()
-                            st.metric("Target share change", f"{ts_change * 100:+.1f} pp")
-                with c:
-                    scenario_df = st.session_state.scenario_df
-                    target_mask = engine.apply_target_scope(scenario_df, target_level, target_value)
-                    if target_mask.any():
-                        bu = scenario_df.loc[target_mask, "units"].sum()
-                        su = scenario_df.loc[target_mask, "units_median"].sum()
-                        st.metric("Target units change", f"{(su/bu-1)*100:+.1f}%" if bu > 0 else "—")
-                with d:
-                    if target_mask.any():
-                        br = scenario_df.loc[target_mask, "revenue"].sum()
-                        sr = scenario_df.loc[target_mask, "revenue_median"].sum()
-                        st.metric("Target revenue change", f"{(sr/br-1)*100:+.1f}%" if br > 0 else "—")
-
-                st.divider()
-
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.plotly_chart(
-                        engine.create_share_change_chart(share_df),
-                        use_container_width=True,
-                    )
-                with col2:
-                    st.plotly_chart(
-                        engine.create_share_comparison_chart(share_df),
-                        use_container_width=True,
-                    )
-
-                # Detailed table
-                st.markdown("### Share changes by brand")
-                display = share_df.sort_values("share_change_pp", ascending=False)[
-                    ["brand", "baseline_share", "scenario_share", "share_change_pp"]
-                ].copy()
-                display = display.rename(columns={
+                sku_display = sku_display.rename(columns={
                     "brand": "Brand",
+                    "sku": "SKU",
                     "baseline_share": "Baseline share",
                     "scenario_share": "Scenario share",
                     "share_change_pp": "Change (pp)",
                 })
                 st.dataframe(
-                    display.style.format({
+                    sku_display.style.format({
                         "Baseline share": "{:.1%}",
                         "Scenario share": "{:.1%}",
                         "Change (pp)": lambda x: f"{x * 100:+.1f} pp",
@@ -1259,65 +1430,42 @@ def main() -> None:
                     hide_index=True,
                 )
 
-                if "scenario_sku_shares" in st.session_state:
-                    with st.expander("SKU-level share changes"):
-                        sku_share_df = st.session_state.scenario_sku_shares
-                        sku_display = sku_share_df.sort_values("share_change_pp", ascending=False)[
-                            ["brand", "sku", "baseline_share", "scenario_share", "share_change_pp"]
-                        ].copy()
-                        sku_display = sku_display.rename(columns={
-                            "brand": "Brand",
-                            "sku": "SKU",
-                            "baseline_share": "Baseline share",
-                            "scenario_share": "Scenario share",
-                            "share_change_pp": "Change (pp)",
-                        })
-                        st.dataframe(
-                            sku_display.style.format({
-                                "Baseline share": "{:.1%}",
-                                "Scenario share": "{:.1%}",
-                                "Change (pp)": lambda x: f"{x * 100:+.1f} pp",
-                            }),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
+        st.divider()
+        st.subheader("Growth opportunities")
+        opportunities = engine.get_growth_opportunities(df, elasticity_df)
+        opp_display = opportunities.head(20)[
+            ["retailer", "category", "brand", "sku", "pack_group",
+             "unit_sales", "revenue", "avg_nd", "avg_velocity_std",
+             "distribution_headroom", "velocity_index",
+             "distribution_opportunity_score", "price_opportunity_score",
+             "primary_lever"]
+        ].copy()
+        opp_display = opp_display.rename(columns={
+            "retailer": "Retailer", "category": "Category", "brand": "Brand",
+            "sku": "SKU", "pack_group": "Pack group",
+            "unit_sales": "Units", "revenue": "Revenue",
+            "avg_nd": "Avg ND", "avg_velocity_std": "Avg velocity (std)",
+            "distribution_headroom": "Dist. headroom", "velocity_index": "Velocity index",
+            "distribution_opportunity_score": "Dist. opp. score",
+            "price_opportunity_score": "Price opp. score",
+            "primary_lever": "Primary lever",
+        })
+        st.dataframe(
+            opp_display.style.format({
+                "Revenue": "{:,.0f}", "Units": "{:,.0f}",
+                "Avg ND": "{:.1%}", "Avg velocity (std)": "{:.2f}",
+                "Dist. headroom": "{:.1%}", "Velocity index": "{:.2f}",
+                "Dist. opp. score": "{:.1f}", "Price opp. score": "{:.1f}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-                st.divider()
-                st.subheader("Growth opportunities")
-                opportunities = engine.get_growth_opportunities(df, elasticity_df)
-                opp_display = opportunities.head(20)[
-                    ["retailer", "category", "brand", "sku", "pack_group",
-                     "unit_sales", "revenue", "avg_nd", "avg_velocity_std",
-                     "distribution_headroom", "velocity_index",
-                     "distribution_opportunity_score", "price_opportunity_score",
-                     "primary_lever"]
-                ].copy()
-                opp_display = opp_display.rename(columns={
-                    "retailer": "Retailer", "category": "Category", "brand": "Brand",
-                    "sku": "SKU", "pack_group": "Pack group",
-                    "unit_sales": "Units", "revenue": "Revenue",
-                    "avg_nd": "Avg ND", "avg_velocity_std": "Avg velocity (std)",
-                    "distribution_headroom": "Dist. headroom", "velocity_index": "Velocity index",
-                    "distribution_opportunity_score": "Dist. opp. score",
-                    "price_opportunity_score": "Price opp. score",
-                    "primary_lever": "Primary lever",
-                })
-                st.dataframe(
-                    opp_display.style.format({
-                        "Revenue": "{:,.0f}", "Units": "{:,.0f}",
-                        "Avg ND": "{:.1%}", "Avg velocity (std)": "{:.2f}",
-                        "Dist. headroom": "{:.1%}", "Velocity index": "{:.2f}",
-                        "Dist. opp. score": "{:.1f}", "Price opp. score": "{:.1f}",
-                    }),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                st.caption(
-                    "**Interpretation**: Historical model-based estimates. Not causal guarantees. "
-                    "Distribution opportunity: high velocity + low ND + large revenue. "
-                    "Price opportunity: high elasticity + revenue, adjusted for uncertainty."
-                )
+        st.caption(
+            "**Interpretation**: Historical model-based estimates. Not causal guarantees. "
+            "Distribution opportunity: high velocity + low ND + large revenue. "
+            "Price opportunity: high elasticity + revenue, adjusted for uncertainty."
+        )
 
 
 if __name__ == "__main__":

@@ -1277,6 +1277,106 @@ def apply_target_scope(
     return pd.Series(False, index=df.index)
 
 
+def calculate_market_shares(
+    baseline_df: pd.DataFrame,
+    scenario_df: pd.DataFrame,
+    share_level: str = "brand",
+) -> pd.DataFrame:
+    """
+    Calculate baseline and median-scenario market shares.
+
+    Market share is calculated from revenue by default. Since the dataset
+    contains the full competitive set, the denominator contains all rows in
+    the selected market/view scope.
+    """
+    group_cols = ["month"]
+    if share_level == "brand":
+        group_cols.append("brand")
+    elif share_level == "sku":
+        group_cols.extend(["brand", "sku"])
+    else:
+        group_cols.extend(["brand", "sku", "pack_size"])
+
+    base = (
+        baseline_df.groupby(group_cols, as_index=False)["revenue"]
+        .sum()
+        .rename(columns={"revenue": "baseline_value"})
+    )
+
+    scen = (
+        scenario_df.groupby(group_cols, as_index=False)["expected_revenue_median"]
+        .sum()
+        .rename(columns={"expected_revenue_median": "scenario_value"})
+    )
+
+    out = base.merge(scen, on=group_cols, how="outer").fillna(0)
+
+    totals = (
+        out.groupby("month", as_index=False)
+        .agg(
+            market_baseline=("baseline_value", "sum"),
+            market_scenario=("scenario_value", "sum"),
+        )
+    )
+    out = out.merge(totals, on="month", how="left")
+
+    out["baseline_share"] = np.where(
+        out["market_baseline"] > 0,
+        out["baseline_value"] / out["market_baseline"],
+        np.nan,
+    )
+    out["scenario_share"] = np.where(
+        out["market_scenario"] > 0,
+        out["scenario_value"] / out["market_scenario"],
+        np.nan,
+    )
+    out["share_change_pp"] = out["scenario_share"] - out["baseline_share"]
+    return out
+
+
+def summarize_period_shares(
+    baseline_df: pd.DataFrame,
+    scenario_df: pd.DataFrame,
+    share_level: str,
+) -> pd.DataFrame:
+    """
+    Aggregate over the selected period and calculate market shares.
+    """
+    if share_level == "brand":
+        group_cols = ["brand"]
+    elif share_level == "sku":
+        group_cols = ["brand", "sku"]
+    else:
+        group_cols = ["brand", "sku", "pack_size"]
+
+    base = (
+        baseline_df.groupby(group_cols, as_index=False)["revenue"]
+        .sum()
+        .rename(columns={"revenue": "baseline_value"})
+    )
+
+    scen = (
+        scenario_df.groupby(group_cols, as_index=False)["expected_revenue_median"]
+        .sum()
+        .rename(columns={"expected_revenue_median": "scenario_value"})
+    )
+
+    out = base.merge(scen, on=group_cols, how="outer").fillna(0)
+
+    base_total = out["baseline_value"].sum()
+    scen_total = out["scenario_value"].sum()
+
+    out["baseline_share"] = (
+        out["baseline_value"] / base_total if base_total > 0 else np.nan
+    )
+    out["scenario_share"] = (
+        out["scenario_value"] / scen_total if scen_total > 0 else np.nan
+    )
+    out["share_change_pp"] = out["scenario_share"] - out["baseline_share"]
+
+    return out.sort_values("scenario_share", ascending=False).reset_index(drop=True)
+
+
 def extract_elasticities(
     trace: Any,
     meta: Dict[str, Any],
@@ -2309,3 +2409,543 @@ def run_fast_share_scenario(
         level=level,
     )
     return scenario, shares
+
+
+# ============================================================================
+# New Analytics Helpers for Retail Cockpit
+# ============================================================================
+
+def decompose_sales_growth(
+    df: pd.DataFrame,
+    start_month: str,
+    end_month: str,
+    group_cols: List[str] = None,
+) -> pd.DataFrame:
+    """
+    Decompose sales growth into distribution, velocity, and interaction effects.
+    
+    Units = sku_stores * velocity_std
+    Growth = Distribution effect + Velocity effect + Interaction effect
+    
+    Returns a DataFrame with growth components per group.
+    """
+    if group_cols is None:
+        group_cols = ["retailer", "category", "brand", "sku"]
+    
+    # Filter to period
+    start = pd.Timestamp(start_month)
+    end = pd.Timestamp(end_month)
+    df = df[df["month"].between(start, end)].copy()
+    
+    # Get first and last month per group
+    period_data = df.sort_values(group_cols + ["month"]).groupby(group_cols).agg(
+        first_month=("month", "first"),
+        last_month=("month", "last"),
+        first_units=("units", "first"),
+        last_units=("units", "last"),
+        first_stores=("sku_stores", "first"),
+        last_stores=("sku_stores", "last"),
+        first_velocity=("velocity_std", "first"),
+        last_velocity=("velocity_std", "last"),
+        first_revenue=("revenue", "first"),
+        last_revenue=("revenue", "last"),
+        first_price=("price_std", "first"),
+        last_price=("price_std", "last"),
+        first_nd=("nd", "first"),
+        last_nd=("nd", "last"),
+    ).reset_index()
+    
+    # Only keep groups with data in both periods
+    period_data = period_data.dropna()
+    
+    if period_data.empty:
+        return pd.DataFrame()
+    
+    # Decomposition
+    # Units = stores * velocity
+    # ΔUnits = Δstores * velocity_old + stores_old * Δvelocity + Δstores * Δvelocity
+    
+    period_data["distribution_effect"] = (
+        (period_data["last_stores"] - period_data["first_stores"]) 
+        * period_data["first_velocity"]
+    )
+    period_data["velocity_effect"] = (
+        period_data["first_stores"] 
+        * (period_data["last_velocity"] - period_data["first_velocity"])
+    )
+    period_data["interaction_effect"] = (
+        (period_data["last_stores"] - period_data["first_stores"])
+        * (period_data["last_velocity"] - period_data["first_velocity"])
+    )
+    period_data["total_units_change"] = (
+        period_data["last_units"] - period_data["first_units"]
+    )
+    
+    # Revenue decomposition
+    # Revenue = Units * Price
+    period_data["unit_volume_effect"] = (
+        period_data["total_units_change"] * period_data["first_price"]
+    )
+    period_data["price_effect"] = (
+        period_data["last_units"] * (period_data["last_price"] - period_data["first_price"])
+    )
+    period_data["total_revenue_change"] = (
+        period_data["last_revenue"] - period_data["first_revenue"]
+    )
+    
+    # Growth rates
+    period_data["units_growth_pct"] = (
+        period_data["total_units_change"] / period_data["first_units"] * 100
+    )
+    period_data["revenue_growth_pct"] = (
+        period_data["total_revenue_change"] / period_data["first_revenue"] * 100
+    )
+    
+    return period_data.sort_values("total_units_change", ascending=False).reset_index(drop=True)
+
+
+def compute_price_architecture(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Compute price architecture metrics per SKU.
+    
+    Returns per-SKU price metrics for price ladder analysis.
+    """
+    sku_metrics = df.groupby(["retailer", "category", "brand", "sku", "pack_size"]).agg(
+        avg_price=("price_std", "mean"),
+        avg_units=("units", "mean"),
+        avg_revenue=("revenue", "mean"),
+        avg_velocity=("velocity_std", "mean"),
+        avg_nd=("nd", "mean"),
+        months=("month", "nunique"),
+    ).reset_index()
+    
+    # Price per physical unit
+    sku_metrics["price_per_unit"] = sku_metrics["avg_price"] / sku_metrics["pack_size"]
+    
+    # Category benchmarks
+    cat_price = sku_metrics.groupby(["retailer", "category"])["price_per_unit"].transform("median")
+    sku_metrics["rel_price_index"] = sku_metrics["price_per_unit"] / cat_price
+    
+    # Brand benchmarks
+    brand_price = sku_metrics.groupby(["retailer", "category", "brand"])["price_per_unit"].transform("median")
+    sku_metrics["brand_price_index"] = sku_metrics["price_per_unit"] / brand_price
+    
+    # Pack segment
+    sku_metrics["pack_segment"] = pd.cut(
+        sku_metrics["pack_size"],
+        bins=[-np.inf, 0.5, 1.0, 2.0, np.inf],
+        labels=["small", "medium", "large", "xl"]
+    )
+    
+    # Pack segment benchmarks
+    seg_price = sku_metrics.groupby(["retailer", "category", "pack_segment"])["price_per_unit"].transform("median")
+    sku_metrics["pack_value_index"] = sku_metrics["price_per_unit"] / seg_price
+    
+    # Price dispersion (within SKU across months)
+    price_disp = df.groupby(["retailer", "category", "brand", "sku"])["price_std"].agg(
+        price_p10=lambda x: x.quantile(0.10),
+        price_p90=lambda x: x.quantile(0.90),
+    ).reset_index()
+    price_disp["price_dispersion"] = price_disp["price_p90"] - price_disp["price_p10"]
+    
+    sku_metrics = sku_metrics.merge(
+        price_disp[["retailer", "category", "brand", "sku", "price_dispersion"]],
+        on=["retailer", "category", "brand", "sku"],
+        how="left"
+    )
+    
+    return sku_metrics.sort_values(["retailer", "category", "brand", "price_per_unit"]).reset_index(drop=True)
+
+
+def compute_distribution_opportunity(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Compute distribution opportunity metrics per SKU.
+    
+    Identifies white-space (high velocity, low ND) and 
+    rationalization candidates (low velocity, high ND).
+    """
+    sku_metrics = df.groupby(["retailer", "category", "brand", "sku", "pack_size"]).agg(
+        avg_nd=("nd", "mean"),
+        avg_velocity=("velocity_std", "mean"),
+        total_units=("units", "sum"),
+        total_revenue=("revenue", "sum"),
+        max_stores=("retailer_stores", "max"),
+        avg_stores=("sku_stores", "mean"),
+    ).reset_index()
+    
+    # Category benchmarks for velocity
+    cat_vel = sku_metrics.groupby(["retailer", "category"])["avg_velocity"].transform("median")
+    sku_metrics["velocity_index"] = sku_metrics["avg_velocity"] / cat_vel
+    
+    # Distribution headroom
+    sku_metrics["distribution_headroom"] = 1.0 - sku_metrics["avg_nd"]
+    sku_metrics["potential_extra_stores"] = (
+        sku_metrics["distribution_headroom"] * sku_metrics["max_stores"]
+    )
+    
+    # Opportunity scoring
+    # High velocity + low ND + large revenue = listing expansion opportunity
+    sku_metrics["distribution_opportunity_score"] = (
+        np.log1p(sku_metrics["total_revenue"])
+        * sku_metrics["distribution_headroom"]
+        * np.clip(sku_metrics["velocity_index"], 0.0, 3.0)
+    )
+    
+    # Rationalization score
+    # Low velocity + high ND = potential delist candidate
+    sku_metrics["rationalization_score"] = (
+        sku_metrics["avg_nd"]
+        / np.maximum(sku_metrics["velocity_index"], 0.1)
+        * np.log1p(sku_metrics["total_revenue"])
+    )
+    
+    # Classification
+    conditions = [
+        (sku_metrics["avg_velocity"] > cat_vel) & (sku_metrics["avg_nd"] < 0.5),
+        (sku_metrics["avg_velocity"] > cat_vel) & (sku_metrics["avg_nd"] >= 0.5),
+        (sku_metrics["avg_velocity"] <= cat_vel) & (sku_metrics["avg_nd"] < 0.5),
+        (sku_metrics["avg_velocity"] <= cat_vel) & (sku_metrics["avg_nd"] >= 0.5),
+    ]
+    choices = ["Expand", "Protect", "Test/Review", "Rationalize"]
+    sku_metrics["distribution_action"] = np.select(conditions, choices, default="Review")
+    
+    return sku_metrics.sort_values("distribution_opportunity_score", ascending=False).reset_index(drop=True)
+
+
+def compute_market_share_analytics(
+    df: pd.DataFrame,
+    group_cols: List[str] = None,
+) -> pd.DataFrame:
+    """
+    Compute comprehensive market share analytics.
+    """
+    if group_cols is None:
+        group_cols = ["retailer", "category", "month", "brand", "sku"]
+    
+    # Monthly share by group
+    monthly = df.groupby(group_cols).agg(
+        units=("units", "sum"),
+        revenue=("revenue", "sum"),
+    ).reset_index()
+    
+    # Total market per retailer/category/month
+    market_cols = ["retailer", "category", "month"]
+    market_total = monthly.groupby(market_cols).agg(
+        market_units=("units", "sum"),
+        market_revenue=("revenue", "sum"),
+    ).reset_index()
+    
+    monthly = monthly.merge(market_total, on=market_cols, how="left")
+    monthly["unit_share"] = monthly["units"] / monthly["market_units"]
+    monthly["revenue_share"] = monthly["revenue"] / monthly["market_revenue"]
+    
+    # Share momentum (3, 6, 12 month changes)
+    monthly = monthly.sort_values(group_cols + ["month"])
+    for window in [3, 6, 12]:
+        monthly[f"unit_share_change_{window}m"] = monthly.groupby(group_cols)["unit_share"].transform(
+            lambda x: x - x.shift(window)
+        )
+        monthly[f"revenue_share_change_{window}m"] = monthly.groupby(group_cols)["revenue_share"].transform(
+            lambda x: x - x.shift(window)
+        )
+    
+    # Pack segment share
+    if "pack_size" in df.columns:
+        monthly["pack_segment"] = pd.cut(
+            monthly["pack_size"] if "pack_size" in monthly.columns else df["pack_size"],
+            bins=[-np.inf, 0.5, 1.0, 2.0, np.inf],
+            labels=["small", "medium", "large", "xl"]
+        )
+    
+    return monthly
+
+
+def compute_contribution_to_growth(
+    df: pd.DataFrame,
+    start_month: str,
+    end_month: str,
+    level: str = "brand",
+) -> pd.DataFrame:
+    """
+    Compute contribution to category growth at specified level.
+    
+    Level can be: brand, sku, retailer
+    """
+    start = pd.Timestamp(start_month)
+    end = pd.Timestamp(end_month)
+    df_period = df[df["month"].between(start, end)].copy()
+    
+    if df_period.empty:
+        return pd.DataFrame()
+    
+    if level == "brand":
+        group_cols = ["retailer", "category", "brand"]
+    elif level == "sku":
+        group_cols = ["retailer", "category", "brand", "sku"]
+    elif level == "retailer":
+        group_cols = ["category", "retailer"]
+    else:
+        group_cols = ["retailer", "category", "brand"]
+    
+    # Start and end period values
+    start_data = df_period[df_period["month"] == start].groupby(group_cols).agg(
+        start_units=("units", "sum"),
+        start_revenue=("revenue", "sum"),
+    ).reset_index()
+    
+    end_data = df_period[df_period["month"] == end].groupby(group_cols).agg(
+        end_units=("units", "sum"),
+        end_revenue=("revenue", "sum"),
+    ).reset_index()
+    
+    growth = start_data.merge(end_data, on=group_cols, how="outer").fillna(0)
+    growth["unit_change"] = growth["end_units"] - growth["start_units"]
+    growth["revenue_change"] = growth["end_revenue"] - growth["start_revenue"]
+    
+    # Total category change
+    total_unit_change = growth["unit_change"].sum()
+    total_rev_change = growth["revenue_change"].sum()
+    
+    growth["unit_contribution_pct"] = np.where(
+        total_unit_change != 0,
+        growth["unit_change"] / total_unit_change * 100,
+        0
+    )
+    growth["revenue_contribution_pct"] = np.where(
+        total_rev_change != 0,
+        growth["revenue_change"] / total_rev_change * 100,
+        0
+    )
+    
+    # Share of growth
+    growth["unit_share_of_growth"] = np.where(
+        total_unit_change > 0,
+        growth["unit_change"] / total_unit_change * 100,
+        0
+    )
+    
+    return growth.sort_values("unit_contribution_pct", ascending=False).reset_index(drop=True)
+
+
+def generate_data_health_report(
+    raw_df: pd.DataFrame,
+    prepared_df: pd.DataFrame = None,
+) -> Dict[str, Any]:
+    """
+    Generate comprehensive data health report.
+    
+    Returns dict with completeness, exclusions, outliers, coverage metrics.
+    """
+    report = {}
+    
+    # Basic counts
+    report["total_rows"] = len(raw_df)
+    report["date_range"] = {
+        "min": str(raw_df["month"].min()) if "month" in raw_df.columns else None,
+        "max": str(raw_df["month"].max()) if "month" in raw_df.columns else None,
+        "n_months": int(raw_df["month"].nunique()) if "month" in raw_df.columns else 0,
+    }
+    report["n_retailers"] = int(raw_df["retailer"].nunique()) if "retailer" in raw_df.columns else 0
+    report["n_categories"] = int(raw_df["category"].nunique()) if "category" in raw_df.columns else 0
+    report["n_brands"] = int(raw_df["brand"].nunique()) if "brand" in raw_df.columns else 0
+    report["n_skus"] = int(raw_df["sku"].nunique()) if "sku" in raw_df.columns else 0
+    
+    # Missing values
+    numeric_cols = ["units", "revenue", "sku_stores", "retailer_stores", "pack_size"]
+    missing = {}
+    for col in numeric_cols:
+        if col in raw_df.columns:
+            missing[col] = int(raw_df[col].isna().sum())
+    report["missing_values"] = missing
+    
+    # Zero/negative values
+    zero_neg = {}
+    for col in numeric_cols:
+        if col in raw_df.columns:
+            zero_neg[col] = int((raw_df[col] <= 0).sum())
+    report["zero_or_negative"] = zero_neg
+    
+    # Distribution validity
+    if all(c in raw_df.columns for c in ["sku_stores", "retailer_stores"]):
+        invalid_dist = int((raw_df["sku_stores"] > raw_df["retailer_stores"]).sum())
+        zero_stores = int((raw_df["sku_stores"] <= 0).sum() | (raw_df["retailer_stores"] <= 0).sum())
+        report["distribution_validity"] = {
+            "sku_stores_gt_retailer_stores": invalid_dist,
+            "zero_stores": zero_stores,
+        }
+    
+    # Price outliers (using IQR method)
+    if "revenue" in raw_df.columns and "units" in raw_df.columns:
+        raw_df = raw_df.copy()
+        raw_df["implied_price"] = raw_df["revenue"] / raw_df["units"].replace(0, np.nan)
+        valid_price = raw_df["implied_price"].replace([np.inf, -np.inf], np.nan).dropna()
+        if len(valid_price) > 0:
+            q1, q3 = valid_price.quantile([0.25, 0.75])
+            iqr = q3 - q1
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+            outliers = int(((raw_df["implied_price"] < lower) | (raw_df["implied_price"] > upper)).sum())
+            report["price_outliers_iqr"] = outliers
+            report["price_stats"] = {
+                "median": float(valid_price.median()),
+                "q1": float(q1),
+                "q3": float(q3),
+                "lower_bound": float(lower),
+                "upper_bound": float(upper),
+            }
+    
+    # Coverage completeness
+    if "month" in raw_df.columns and "retailer" in raw_df.columns and "sku" in raw_df.columns:
+        expected = raw_df.groupby(["retailer", "sku"])["month"].nunique()
+        max_months = raw_df["month"].nunique()
+        coverage = (expected / max_months).mean()
+        report["avg_sku_coverage"] = float(coverage)
+        
+        # Monthly completeness heatmap data
+        if "retailer" in raw_df.columns and "category" in raw_df.columns:
+            pivot = raw_df.pivot_table(
+                index="retailer",
+                columns="category",
+                values="sku",
+                aggfunc="nunique",
+                fill_value=0
+            )
+            report["retailer_category_sku_counts"] = pivot.to_dict()
+    
+    # Prepared data stats
+    if prepared_df is not None:
+        report["prepared_rows"] = len(prepared_df)
+        report["prepared_n_retailers"] = int(prepared_df["retailer"].nunique())
+        report["prepared_n_categories"] = int(prepared_df["category"].nunique())
+        report["prepared_n_brands"] = int(prepared_df["brand"].nunique())
+        report["prepared_n_skus"] = int(prepared_df["sku"].nunique())
+        report["prepared_date_range"] = {
+            "min": str(prepared_df["month"].min()),
+            "max": str(prepared_df["month"].max()),
+        }
+        
+        # Exclusion rate
+        report["exclusion_rate"] = 1.0 - (len(prepared_df) / len(raw_df)) if len(raw_df) > 0 else 0
+    
+    return report
+
+
+def compute_model_validation_metrics(
+    idata,
+    prepared_df: pd.DataFrame,
+    observed_var: str = "log_velocity_z_obs",
+) -> Dict[str, Any]:
+    """
+    Compute model validation metrics: backtest coverage, residual patterns, calibration.
+    """
+    metrics = {}
+    
+    if observed_var not in idata.observed_data:
+        return {"error": f"Observed variable {observed_var} not found"}
+    
+    observed = idata.observed_data[observed_var].values
+    
+    if "posterior_predictive" in idata:
+        pred = idata.posterior_predictive[observed_var]
+        pred_median = pred.median(dim=("chain", "draw")).values
+        pred_p10 = pred.quantile(0.05, dim=("chain", "draw")).values
+        pred_p90 = pred.quantile(0.95, dim=("chain", "draw")).values
+        
+        # Coverage
+        coverage_90 = np.mean((observed >= pred_p10) & (observed <= pred_p90))
+        coverage_50 = np.mean((observed >= pred.quantile(0.25, dim=("chain", "draw")).values) & 
+                              (observed <= pred.quantile(0.75, dim=("chain", "draw")).values))
+        
+        # RMSE, MAE
+        rmse = np.sqrt(np.mean((observed - pred_median) ** 2))
+        mae = np.mean(np.abs(observed - pred_median))
+        
+        # Bias
+        bias = np.mean(pred_median - observed)
+        
+        metrics["posterior_predictive"] = {
+            "coverage_90": float(coverage_90),
+            "coverage_50": float(coverage_50),
+            "rmse": float(rmse),
+            "mae": float(mae),
+            "bias": float(bias),
+        }
+        
+        # Residuals by retailer/category
+        if "retailer" in prepared_df.columns and "category" in prepared_df.columns:
+            residuals = observed - pred_median
+            residual_df = prepared_df[["retailer", "category", "month"]].copy()
+            residual_df["residual"] = residuals
+            
+            # Retailer residual heatmap data
+            retailer_month = residual_df.pivot_table(
+                index="retailer",
+                columns="month",
+                values="residual",
+                aggfunc="mean"
+            )
+            metrics["residuals_by_retailer_month"] = retailer_month.to_dict()
+            
+            # Category residual stats
+            cat_residuals = residual_df.groupby("category")["residual"].agg(["mean", "std", "count"])
+            metrics["residuals_by_category"] = cat_residuals.to_dict()
+    
+    return metrics
+
+
+def build_observed_vs_predicted_data(
+    idata,
+    prepared_df: pd.DataFrame,
+    observed_var: str = "log_velocity_z_obs",
+) -> pd.DataFrame:
+    """
+    Build DataFrame for observed vs predicted scatter plot.
+    """
+    if observed_var not in idata.observed_data:
+        raise KeyError(f"Observed variable {observed_var} not found")
+    
+    observed = idata.observed_data[observed_var].values
+    
+    if "posterior_predictive" in idata:
+        pred = idata.posterior_predictive[observed_var]
+        pred_median = pred.median(dim=("chain", "draw")).values
+        pred_p10 = pred.quantile(0.05, dim=("chain", "draw")).values
+        pred_p90 = pred.quantile(0.95, dim=("chain", "draw")).values
+    else:
+        pred_median = np.full_like(observed, np.nan)
+        pred_p10 = np.full_like(observed, np.nan)
+        pred_p90 = np.full_like(observed, np.nan)
+    
+    result = prepared_df[["retailer", "category", "brand", "sku", "month", observed_var]].copy()
+    result = result.rename(columns={observed_var: "observed"})
+    result["predicted_median"] = pred_median
+    result["predicted_p10"] = pred_p10
+    result["predicted_p90"] = pred_p90
+    result["residual"] = result["observed"] - result["predicted_median"]
+    result["inside_90"] = (result["observed"] >= result["predicted_p10"]) & (result["observed"] <= result["predicted_p90"])
+    
+    return result
+
+
+def build_price_ladder_data(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Build data for price ladder visualization.
+    
+    Returns per-SKU price metrics suitable for scatter/bubble plots.
+    """
+    return compute_price_architecture(df)
+
+
+def build_nd_velocity_quadrant_data(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Build data for ND/Velocity quadrant chart.
+    """
+    return compute_distribution_opportunity(df)
