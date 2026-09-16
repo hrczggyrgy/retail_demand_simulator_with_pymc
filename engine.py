@@ -22,7 +22,29 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 import xarray as xr
+import arviz as az
 from sklearn.preprocessing import SplineTransformer
+
+
+# ============================================================================
+# Pack group utilities
+# ============================================================================
+
+def make_pack_group(pack_size: pd.Series) -> pd.Series:
+    """
+    Create meaningful pack-group categories from continuous pack_size values.
+    
+    Bins are based on typical retail pack size distributions.
+    Adjust bins/labels based on category-specific domain knowledge if needed.
+    """
+    bins = [-np.inf, 0.33, 0.75, 1.50, np.inf]
+    labels = ["small", "medium", "large", "extra_large"]
+    return pd.cut(
+        pack_size.astype(float),
+        bins=bins,
+        labels=labels,
+        include_lowest=True,
+    ).astype(str)
 
 
 # ============================================================================
@@ -65,6 +87,49 @@ ADVANCED_CHAINS = 4
 
 # How many posterior draws to retain for interactive scenarios.
 DEFAULT_SCENARIO_DRAWS = 400
+
+
+# ============================================================================
+# Model Configuration
+# ============================================================================
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """Configuration for PyMC model fitting."""
+    draws: int = 800
+    tune: int = 800
+    chains: int = 4
+    target_accept: float = 0.95
+    random_seed: int = 42
+
+    likelihood: str = "student_t"       # "normal" or "student_t"
+    use_category_price_pooling: bool = True
+    use_sku_nd_effects: bool = False    # Turn on after base model validates
+    n_spline_knots: int = 4
+    scenario_draws: int = 400
+
+
+FAST_CONFIG = ModelConfig(
+    draws=500,
+    tune=500,
+    chains=2,
+    target_accept=0.92,
+    likelihood="normal",
+    use_category_price_pooling=False,
+    use_sku_nd_effects=False,
+)
+
+DEFAULT_CONFIG = ModelConfig()
+
+ADVANCED_CONFIG = ModelConfig(
+    draws=1_000,
+    tune=1_000,
+    chains=4,
+    target_accept=0.97,
+    likelihood="student_t",
+    use_category_price_pooling=True,
+    use_sku_nd_effects=True,
+)
 
 
 # ============================================================================
@@ -380,7 +445,7 @@ def prepare_data(
         df[f"{col}_z"] = (df[col] - mean) / sd
         scales[col] = {"mean": mean, "sd": sd}
 
-    df["pack_group"] = df["pack_size"].astype(str)
+    df["pack_group"] = make_pack_group(df["pack_size"])
 
     df = df.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
     if df.empty:
@@ -395,7 +460,7 @@ def add_indices(
     df = df.copy()
 
     level_map: Dict[str, np.ndarray] = {}
-    for col in ["retailer", "sku", "brand", "month", "pack_group"]:
+    for col in ["retailer", "category", "sku", "brand", "month", "pack_group"]:
         codes, levels = pd.factorize(df[col], sort=True)
         df[f"{col}_idx"] = codes.astype("int32")
         level_map[col] = levels
@@ -406,14 +471,17 @@ def add_indices(
     entity_codes, entity_levels = pd.factorize(df["entity"], sort=True)
     df["entity_idx"] = entity_codes.astype("int32")
 
+    # SKU-level lookup arrays
     sku_info = (
         df[
             [
                 "sku_idx",
                 "brand_idx",
+                "category_idx",
                 "pack_group_idx",
                 "sku",
                 "brand",
+                "category",
                 "pack_group",
                 "pack_size",
             ]
@@ -427,15 +495,28 @@ def add_indices(
     if not np.array_equal(sku_info["sku_idx"].to_numpy(), expected):
         raise ValueError("SKU indexing is inconsistent.")
 
+    # Brand-level lookup for brand -> category mapping
+    brand_info = (
+        df[["brand_idx", "category_idx", "brand", "category"]]
+        .sort_values("brand_idx")
+        .drop_duplicates("brand_idx")
+        .reset_index(drop=True)
+    )
+
     meta = {
         "retailer_levels": level_map["retailer"],
+        "category_levels": level_map["category"],
         "sku_levels": level_map["sku"],
         "brand_levels": level_map["brand"],
         "month_levels": level_map["month"],
         "pack_group_levels": level_map["pack_group"],
         "entity_levels": entity_levels,
+        # Per-SKU lookup arrays used directly in the model
         "sku_brand_idx": sku_info["brand_idx"].to_numpy(dtype="int32"),
+        "sku_category_idx": sku_info["category_idx"].to_numpy(dtype="int32"),
         "sku_pack_idx": sku_info["pack_group_idx"].to_numpy(dtype="int32"),
+        # Per-brand category mapping, necessary for category -> brand pooling
+        "brand_category_idx": brand_info["category_idx"].to_numpy(dtype="int32"),
         "sku_info": sku_info,
     }
     return df, meta
@@ -646,117 +727,302 @@ def build_pymc_model(
     return model
 
 
-def fit_model(
-    model: pm.Model,
-    draws: int = DEFAULT_DRAWS,
-    tune: int = DEFAULT_TUNE,
-    chains: int = DEFAULT_CHAINS,
-    target_accept: float = DEFAULT_TARGET_ACCEPT,
-    random_seed: int = 42,
-    sample_posterior_predictive: bool = False,
-) -> xr.Dataset:
-    """
-    Fit the Bayesian model.
+# ============================================================================
+# Hierarchical Model v2 (improved hierarchy)
+# ============================================================================
 
-    Normal application mode deliberately skips posterior-predictive sampling.
-    This is the largest unnecessary cost in the original interactive flow.
+def build_pymc_model_v2(
+    df: pd.DataFrame,
+    meta: Dict[str, Any],
+    nd_basis: np.ndarray,
+    config: ModelConfig = DEFAULT_CONFIG,
+) -> pm.Model:
     """
-    with model:
-        trace = pm.sample(
-            draws=draws,
-            tune=tune,
-            chains=chains,
-            target_accept=target_accept,
-            random_seed=random_seed,
-            return_inferencedata=True,
-            progressbar=False,
-            cores=1,
-            idata_kwargs={"log_likelihood": False},
+    Hierarchical log-standard-velocity model with deeper pooling.
+
+    Dependent variable: log_velocity_z
+    Predictors: log_relative_price_z, ND spline basis
+    Hierarchy: category -> brand x pack_group -> SKU for price slopes
+    """
+    coords = {
+        "obs": np.arange(len(df)),
+        "entity": meta["entity_levels"],
+        "month": meta["month_levels"],
+        "category": meta["category_levels"],
+        "brand": meta["brand_levels"],
+        "sku": meta["sku_levels"],
+        "pack_group": meta["pack_group_levels"],
+        "spline_basis": np.arange(nd_basis.shape[1]),
+    }
+
+    entity_idx = df["entity_idx"].to_numpy(dtype="int32")
+    month_idx = df["month_idx"].to_numpy(dtype="int32")
+    sku_idx = df["sku_idx"].to_numpy(dtype="int32")
+
+    sku_brand_idx = np.asarray(meta["sku_brand_idx"], dtype="int32")
+    sku_pack_idx = np.asarray(meta["sku_pack_idx"], dtype="int32")
+    sku_category_idx = np.asarray(meta["sku_category_idx"], dtype="int32")
+    brand_category_idx = np.asarray(meta["brand_category_idx"], dtype="int32")
+
+    y = df["log_velocity_z"].to_numpy(dtype=float)
+    price_x = df["log_relative_price_z"].to_numpy(dtype=float)
+
+    with pm.Model(coords=coords) as model:
+        # Data containers for scenario reuse
+        price_x_data = pm.Data("price_x", price_x, dims="obs")
+        nd_basis_data = pm.Data("nd_basis", nd_basis, dims=("obs", "spline_basis"))
+
+        # Global intercept
+        alpha = pm.Normal("alpha", mu=0.0, sigma=1.0)
+
+        # Retailer x SKU persistent baseline
+        sigma_entity = pm.HalfNormal("sigma_entity", sigma=0.7)
+        entity_offset = pm.Normal("entity_offset", 0.0, 1.0, dims="entity")
+        entity_effect = pm.Deterministic(
+            "entity_effect", entity_offset * sigma_entity, dims="entity"
         )
 
-        if sample_posterior_predictive:
-            # Kept as an explicit opt-in diagnostic path.
-            ppc = pm.sample_posterior_predictive(
-                trace,
-                var_names=["log_velocity_z_obs"],
-                random_seed=random_seed,
-                progressbar=False,
-            )
-            trace.extend(ppc)
+        # Monthly seasonality
+        sigma_month = pm.HalfNormal("sigma_month", sigma=0.4)
+        month_offset = pm.Normal("month_offset", 0.0, 1.0, dims="month")
+        month_effect = pm.Deterministic(
+            "month_effect", month_offset * sigma_month, dims="month"
+        )
 
-    return trace
+        # Price elasticity hierarchy: category -> brand x pack -> SKU
+        if config.use_category_price_pooling:
+            sigma_price_category = pm.HalfNormal("sigma_price_category", sigma=0.35)
+            price_mean_category = pm.Normal(
+                "price_mean_category",
+                mu=-0.4,
+                sigma=sigma_price_category,
+                dims="category",
+            )
+
+            sigma_price_brand_pack = pm.HalfNormal(
+                "sigma_price_brand_pack", sigma=0.25
+            )
+            price_mean_brand_pack = pm.Normal(
+                "price_mean_brand_pack",
+                mu=price_mean_category[brand_category_idx][:, None],
+                sigma=sigma_price_brand_pack,
+                dims=("brand", "pack_group"),
+            )
+        else:
+            price_mean_brand_pack = pm.Normal(
+                "price_mean_brand_pack",
+                mu=-0.4,
+                sigma=0.4,
+                dims=("brand", "pack_group"),
+            )
+
+        sigma_price_sku = pm.HalfNormal("sigma_price_sku", sigma=0.25)
+        price_sku_offset = pm.Normal(
+            "price_sku_offset", mu=0.0, sigma=1.0, dims="sku"
+        )
+
+        price_slope_z = pm.Deterministic(
+            "price_slope_z",
+            price_mean_brand_pack[sku_brand_idx, sku_pack_idx]
+            + price_sku_offset * sigma_price_sku,
+            dims="sku",
+        )
+
+        # Distribution effect f(ND)
+        if config.use_sku_nd_effects:
+            sigma_nd_brand = pm.HalfNormal("sigma_nd_brand", sigma=0.5)
+            nd_brand_coef = pm.Normal(
+                "nd_brand_coef",
+                mu=0.0,
+                sigma=sigma_nd_brand,
+                dims=("brand", "spline_basis"),
+            )
+
+            sigma_nd_sku = pm.HalfNormal("sigma_nd_sku", sigma=0.25)
+            nd_sku_offset = pm.Normal(
+                "nd_sku_offset", mu=0.0, sigma=1.0, dims=("sku", "spline_basis")
+            )
+
+            nd_coef = pm.Deterministic(
+                "nd_coef",
+                nd_brand_coef[sku_brand_idx, :] + nd_sku_offset * sigma_nd_sku,
+                dims=("sku", "spline_basis"),
+            )
+
+            nd_effect = pm.Deterministic(
+                "nd_effect",
+                pm.math.sum(nd_coef[sku_idx, :] * nd_basis_data, axis=1),
+                dims="obs",
+            )
+        else:
+            # Shared ND curve
+            sigma_nd = pm.HalfNormal("sigma_nd", sigma=0.5)
+            nd_coef = pm.Normal(
+                "nd_coef", mu=0.0, sigma=sigma_nd, dims="spline_basis"
+            )
+
+            nd_effect = pm.Deterministic(
+                "nd_effect",
+                pm.math.dot(nd_basis_data, nd_coef),
+                dims="obs",
+            )
+
+        mu = pm.Deterministic(
+            "mu",
+            alpha
+            + entity_effect[entity_idx]
+            + month_effect[month_idx]
+            + price_slope_z[sku_idx] * price_x_data
+            + nd_effect,
+            dims="obs",
+        )
+
+        sigma = pm.HalfNormal("sigma", sigma=0.7)
+
+        if config.likelihood == "student_t":
+            nu_minus_two = pm.Exponential("nu_minus_two", lam=1 / 10)
+            nu = pm.Deterministic("nu", nu_minus_two + 2.0)
+
+            pm.StudentT(
+                "log_velocity_z_obs",
+                nu=nu,
+                mu=mu,
+                sigma=sigma,
+                observed=y,
+                dims="obs",
+            )
+        else:
+            pm.Normal(
+                "log_velocity_z_obs",
+                mu=mu,
+                sigma=sigma,
+                observed=y,
+                dims="obs",
+            )
+
+    return model
+
+
+def fit_model(
+    model: pm.Model,
+    config: ModelConfig = DEFAULT_CONFIG,
+) -> az.InferenceData:
+    """
+    Fit the Bayesian model with standard configuration.
+
+    Returns ArviZ InferenceData for consistent diagnostics and posterior access.
+    """
+    with model:
+        idata = pm.sample(
+            draws=config.draws,
+            tune=config.tune,
+            chains=config.chains,
+            cores=min(config.chains, 4),
+            target_accept=config.target_accept,
+            random_seed=config.random_seed,
+            return_inferencedata=True,
+            init="jitter+adapt_diag",
+            progressbar=True,
+        )
+
+    return idata
 
 
 # ============================================================================
 # Diagnostics / elasticity
 # ============================================================================
 
-def get_model_diagnostics(trace: Any) -> Dict[str, Any]:
-    posterior = _posterior_group(trace)
+def get_model_diagnostics(idata: az.InferenceData) -> Dict[str, Any]:
+    sample_stats = idata.sample_stats
 
-    divergences = 0
-    if hasattr(trace, "sample_stats") and "diverging" in trace.sample_stats:
-        divergences = int(np.asarray(trace.sample_stats["diverging"]).sum())
+    divergences = int(
+        sample_stats["diverging"].sum().values
+    ) if "diverging" in sample_stats else 0
 
-    max_rhat = np.nan
-    min_ess = np.nan
+    summary = az.summary(
+        idata,
+        var_names=[
+            "alpha",
+            "sigma",
+            "sigma_entity",
+            "sigma_month",
+            "sigma_price_sku",
+        ],
+        round_to=None,
+    )
 
-    try:
-        # Avoid requiring a full ArviZ import path; calculate directly.
-        chains = max(1, int(posterior.sizes.get("chain", 1)))
-        draws = max(1, int(posterior.sizes.get("draw", 1)))
+    max_rhat = (
+        float(summary["r_hat"].max())
+        if "r_hat" in summary.columns
+        else np.nan
+    )
 
-        rhats: List[float] = []
-        esses: List[float] = []
+    min_ess_bulk = (
+        float(summary["ess_bulk"].min())
+        if "ess_bulk" in summary.columns
+        else np.nan
+    )
 
-        for var in ["price_slope_z", "nd_coef", "sigma", "sigma_entity"]:
-            if var not in posterior:
-                continue
+    warnings = []
 
-            arr = np.asarray(posterior[var])
-            if arr.ndim < 2:
-                continue
+    if divergences > 0:
+        warnings.append(
+            f"{divergences} divergent samples. "
+            "Increase target_accept or simplify/reparameterise the model."
+        )
 
-            # Flatten parameter dimensions.
-            arr = arr.reshape(chains, draws, -1)
+    if np.isfinite(max_rhat) and max_rhat > 1.01:
+        warnings.append(
+            f"Maximum R-hat is {max_rhat:.3f}; chains may not have converged."
+        )
 
-            # R-hat and ESS across every parameter element.
-            chain_means = arr.mean(axis=1)
-            chain_vars = arr.var(axis=1, ddof=1)
-
-            if chains > 1 and draws > 1:
-                between = draws * chain_means.var(axis=0, ddof=1)
-                within = chain_vars.mean(axis=0)
-                var_hat = ((draws - 1) / draws) * within + between / draws
-                rhat = np.sqrt(var_hat / np.maximum(within, 1e-12))
-                rhats.extend(rhat[np.isfinite(rhat)].ravel().tolist())
-
-            # Simple bulk ESS approximation from lag-1 autocorrelation.
-            x = arr - arr.mean(axis=1, keepdims=True)
-            var = np.mean(x * x, axis=1)
-            ac_num = np.mean(x[:, 1:] * x[:, :-1], axis=1)
-            rho = np.clip(
-                ac_num / np.maximum(var, 1e-12),
-                -0.99,
-                0.99,
-            )
-            ess = (chains * draws) * (1.0 - rho.mean(axis=0)) / (
-                1.0 + rho.mean(axis=0)
-            )
-            esses.extend(ess[np.isfinite(ess)].ravel().tolist())
-
-        if rhats:
-            max_rhat = float(np.max(rhats))
-        if esses:
-            min_ess = float(np.min(esses))
-    except Exception:
-        pass
+    if np.isfinite(min_ess_bulk) and min_ess_bulk < 400:
+        warnings.append(
+            f"Minimum bulk ESS is {min_ess_bulk:.0f}; posterior estimates may be noisy."
+        )
 
     return {
         "divergences": divergences,
-        "max_rhat": max_rhat if np.isfinite(max_rhat) else None,
-        "min_ess": min_ess if np.isfinite(min_ess) else None,
+        "max_rhat": max_rhat,
+        "min_ess_bulk": min_ess_bulk,
+        "is_usable": len(warnings) == 0,
+        "warnings": warnings,
     }
+
+
+def get_posterior_predictive_check(
+    model: pm.Model,
+    idata: az.InferenceData,
+    prepared_df: pd.DataFrame,
+    random_seed: int = 42,
+) -> pd.DataFrame:
+    with model:
+        ppc = pm.sample_posterior_predictive(
+            idata,
+            var_names=["log_velocity_z_obs"],
+            random_seed=random_seed,
+            progressbar=False,
+        )
+
+    draws = ppc.posterior_predictive["log_velocity_z_obs"]
+    pred_median = draws.median(dim=("chain", "draw")).values
+    pred_p10 = draws.quantile(0.10, dim=("chain", "draw")).values
+    pred_p90 = draws.quantile(0.90, dim=("chain", "draw")).values
+
+    result = prepared_df[
+        ["month", "retailer", "category", "brand", "sku", "log_velocity_z"]
+    ].copy()
+
+    result["predicted_z_p10"] = pred_p10
+    result["predicted_z_median"] = pred_median
+    result["predicted_z_p90"] = pred_p90
+    result["residual_z"] = result["log_velocity_z"] - result["predicted_z_median"]
+    result["inside_p10_p90"] = (
+        (result["log_velocity_z"] >= result["predicted_z_p10"])
+        & (result["log_velocity_z"] <= result["predicted_z_p90"])
+    )
+
+    return result
 
 
 def extract_elasticities(
@@ -798,38 +1064,297 @@ def extract_elasticities(
 
 
 # ============================================================================
-# Posterior extraction for fast scenarios
+# Posterior extraction for fast scenarios (v2 compatible)
 # ============================================================================
 
 def extract_scenario_posterior(
-    trace: Any,
+    idata: az.InferenceData,
     max_draws: int = DEFAULT_SCENARIO_DRAWS,
-) -> Dict[str, np.ndarray]:
-    """
-    Extract only the posterior quantities needed by a scenario.
+    random_seed: int = 42,
+) -> dict:
+    rng = np.random.default_rng(random_seed)
 
-    This makes repeated slider interactions dramatically cheaper than carrying
-    the full PyMC trace through every scenario calculation.
-    """
-    result: Dict[str, np.ndarray] = {}
+    posterior = idata.posterior.stack(sample=("chain", "draw"))
+    n_all = posterior.sizes["sample"]
 
-    price_name = _find_posterior_variable(trace, ["price_slope_z", "price_slope"])
-    if price_name is not None:
-        result["price_slope_z"] = _posterior_array(
-            trace, price_name, ("sku",)
+    chosen = np.sort(
+        rng.choice(
+            n_all,
+            size=min(max_draws, n_all),
+            replace=False,
         )
-
-    nd_name = _find_posterior_variable(
-        trace,
-        ["nd_coef", "distribution_coef", "nd_slope"],
     )
-    if nd_name is not None:
-        result["nd_coef"] = _posterior_array(
-            trace, nd_name, ("spline_basis",)
+
+    cache = {
+        "price_slope_z": (
+            posterior["price_slope_z"]
+            .isel(sample=chosen)
+            .transpose("sample", "sku")
+            .values
+        ),
+        "entity_effect": (
+            posterior["entity_effect"]
+            .isel(sample=chosen)
+            .transpose("sample", "entity")
+            .values
+        ),
+        "month_effect": (
+            posterior["month_effect"]
+            .isel(sample=chosen)
+            .transpose("sample", "month")
+            .values
+        ),
+    }
+
+    # v1 shared curve versus v2 SKU-specific curve
+    nd_coef = posterior["nd_coef"].isel(sample=chosen)
+
+    if "sku" in nd_coef.dims:
+        cache["nd_coef_type"] = "sku_specific"
+        cache["nd_coef"] = nd_coef.transpose(
+            "sample", "sku", "spline_basis"
+        ).values
+    else:
+        cache["nd_coef_type"] = "shared"
+        cache["nd_coef"] = nd_coef.transpose(
+            "sample", "spline_basis"
+        ).values
+
+    return cache
+
+
+# ============================================================================
+# Corrected scenario math
+# ============================================================================
+
+def price_delta_log_volume(
+    price_slope_draws: np.ndarray,
+    sku_idx: np.ndarray,
+    price_change: float,
+    target_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Returns log-volume deltas with shape:
+        (n_posterior_draws, n_observations)
+    """
+    if price_change <= -1:
+        raise ValueError("price_change must be greater than -1.0")
+
+    price_delta = np.log1p(price_change)
+    beta_by_obs = price_slope_draws[:, sku_idx]
+    effect = beta_by_obs * price_delta
+
+    return effect * target_mask[None, :]
+
+
+def resolve_target_nd(
+    nd_base: np.ndarray,
+    value: float,
+    mode: str,
+) -> np.ndarray:
+    if mode == "pp":
+        nd_new = nd_base + value
+    elif mode == "relative":
+        nd_new = nd_base * (1.0 + value)
+    elif mode == "absolute":
+        nd_new = np.full_like(nd_base, value, dtype=float)
+    else:
+        raise ValueError("mode must be one of: pp, relative, absolute")
+
+    return np.clip(nd_new, 1e-4, 1.0)
+
+
+def nd_delta_log_volume(
+    posterior_cache: dict,
+    spline,
+    scales: dict,
+    sku_idx: np.ndarray,
+    nd_base: np.ndarray,
+    nd_new: np.ndarray,
+    target_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Returns draw-level log-volume deltas:
+    log(ND_new / ND_base) + f(ND_new) - f(ND_base).
+    """
+    nd_old = np.clip(nd_base, 1e-4, 1.0)
+    nd_future = np.clip(nd_new, 1e-4, 1.0)
+
+    # Reapply the transformation used during fitting.
+    nd_old_z = (
+        np.log(nd_old) - scales["log_nd"]["mean"]
+    ) / scales["log_nd"]["sd"]
+
+    nd_new_z = (
+        np.log(nd_future) - scales["log_nd"]["mean"]
+    ) / scales["log_nd"]["sd"]
+
+    basis_old = spline.transform(nd_old_z.reshape(-1, 1))
+    basis_new = spline.transform(nd_new_z.reshape(-1, 1))
+
+    coef = posterior_cache["nd_coef"]
+
+    if posterior_cache["nd_coef_type"] == "sku_specific":
+        coef_by_obs = coef[:, sku_idx, :]
+        f_old = np.einsum("dos,os->do", coef_by_obs, basis_old)
+        f_new = np.einsum("dos,os->do", coef_by_obs, basis_new)
+    else:
+        f_old = coef @ basis_old.T
+        f_new = coef @ basis_new.T
+
+    mechanical_listing_effect = np.log(nd_future / nd_old)[None, :]
+    fitted_velocity_effect = f_new - f_old
+
+    result = mechanical_listing_effect + fitted_velocity_effect
+    return result * target_mask[None, :]
+
+
+def combined_delta_log_volume(
+    price_effect: np.ndarray,
+    nd_effect: np.ndarray,
+) -> np.ndarray:
+    return price_effect + nd_effect
+
+
+def summarise_scenario_draws(
+    base_units: np.ndarray,
+    base_revenue: np.ndarray,
+    price_change: float,
+    delta_log_volume_draws: np.ndarray,
+) -> pd.DataFrame:
+    multiplier = np.exp(delta_log_volume_draws)
+
+    scenario_units = multiplier * base_units[None, :]
+    scenario_revenue = (
+        scenario_units
+        * (base_revenue / np.maximum(base_units, 1e-8))[None, :]
+        * (1.0 + price_change)
+    )
+
+    return pd.DataFrame({
+        "units_p10": np.quantile(scenario_units, 0.10, axis=0),
+        "units_median": np.quantile(scenario_units, 0.50, axis=0),
+        "units_p90": np.quantile(scenario_units, 0.90, axis=0),
+        "revenue_p10": np.quantile(scenario_revenue, 0.10, axis=0),
+        "revenue_median": np.quantile(scenario_revenue, 0.50, axis=0),
+        "revenue_p90": np.quantile(scenario_revenue, 0.90, axis=0),
+    })
+
+
+def get_nd_response_curve(
+    posterior_cache: dict,
+    sku_index: int,
+    spline,
+    scales: dict,
+    nd_grid: np.ndarray | None = None,
+) -> pd.DataFrame:
+    if nd_grid is None:
+        nd_grid = np.linspace(0.05, 0.95, 50)
+
+    nd_grid = np.clip(nd_grid, 1e-4, 1.0)
+
+    nd_z = (
+        np.log(nd_grid) - scales["log_nd"]["mean"]
+    ) / scales["log_nd"]["sd"]
+
+    basis = spline.transform(nd_z.reshape(-1, 1))
+    coef = posterior_cache["nd_coef"]
+
+    if posterior_cache["nd_coef_type"] == "sku_specific":
+        effect_draws = coef[:, sku_index, :] @ basis.T
+    else:
+        effect_draws = coef @ basis.T
+
+    # Relative to 50% distribution to aid interpretation.
+    reference_idx = np.argmin(np.abs(nd_grid - 0.50))
+    effect_draws = effect_draws - effect_draws[:, [reference_idx]]
+
+    multiplier = np.exp(effect_draws)
+
+    return pd.DataFrame({
+        "nd": nd_grid,
+        "velocity_multiplier_p10": np.quantile(multiplier, 0.10, axis=0),
+        "velocity_multiplier_median": np.quantile(multiplier, 0.50, axis=0),
+        "velocity_multiplier_p90": np.quantile(multiplier, 0.90, axis=0),
+    })
+
+
+def get_growth_opportunities(
+    df: pd.DataFrame,
+    elasticity_df: pd.DataFrame,
+) -> pd.DataFrame:
+    group_cols = [
+        "retailer",
+        "category",
+        "brand",
+        "sku",
+        "pack_group",
+    ]
+
+    summary = (
+        df.groupby(group_cols, as_index=False)
+        .agg(
+            unit_sales=("units", "sum"),
+            revenue=("revenue", "sum"),
+            avg_nd=("nd", "mean"),
+            avg_velocity_std=("velocity_std", "mean"),
+            retailer_stores=("retailer_stores", "max"),
         )
+    )
 
-    return _thin_posterior(result, max_draws=max_draws)
+    category_benchmark = (
+        summary.groupby(["retailer", "category"])["avg_velocity_std"]
+        .transform("median")
+    )
 
+    summary["velocity_index"] = (
+        summary["avg_velocity_std"]
+        / np.maximum(category_benchmark, 1e-8)
+    )
+
+    summary["distribution_headroom"] = 1.0 - summary["avg_nd"]
+    summary["potential_extra_stores"] = (
+        summary["distribution_headroom"] * summary["retailer_stores"]
+    )
+
+    elastic = elasticity_df[
+        ["sku", "elasticity_median", "elasticity_p05", "elasticity_p95"]
+    ].drop_duplicates("sku")
+
+    summary = summary.merge(elastic, on="sku", how="left")
+
+    summary["distribution_opportunity_score"] = (
+        np.log1p(summary["revenue"])
+        * summary["distribution_headroom"]
+        * np.clip(summary["velocity_index"], 0.0, 3.0)
+    )
+
+    summary["elasticity_uncertainty"] = (
+        summary["elasticity_p95"] - summary["elasticity_p05"]
+    )
+
+    summary["price_opportunity_score"] = (
+        np.log1p(summary["revenue"])
+        * summary["elasticity_median"].abs()
+        / np.maximum(summary["elasticity_uncertainty"], 0.1)
+    )
+
+    summary["primary_lever"] = np.where(
+        summary["distribution_opportunity_score"]
+        > summary["price_opportunity_score"],
+        "distribution",
+        "price",
+    )
+
+    return summary.sort_values(
+        ["distribution_opportunity_score", "price_opportunity_score"],
+        ascending=False,
+    )
+
+
+# ============================================================================
+# Fast scenario engine (legacy compatibility)
+# ============================================================================
 
 def _thin_posterior(
     posterior: Dict[str, np.ndarray],
