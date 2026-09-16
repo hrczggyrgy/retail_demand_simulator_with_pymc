@@ -671,7 +671,7 @@ def main() -> None:
             start_month, end_month, view_category, view_retailer, view_brand
         )
 
-with tab_model:
+    with tab_model:
         render_model_health_tab(idata, df, diagnostics, meta, scales, spline, posterior_cache)
 
 
