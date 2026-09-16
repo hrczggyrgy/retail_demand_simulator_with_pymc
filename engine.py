@@ -669,7 +669,7 @@ def fit_model(
             target_accept=target_accept,
             random_seed=random_seed,
             return_inferencedata=True,
-            progressbar="tqdm",
+            progressbar=False,
             idata_kwargs={"log_likelihood": False},
         )
 
