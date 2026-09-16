@@ -233,24 +233,6 @@ def summarize_period_shares(
     return out.sort_values("scenario_share", ascending=False).reset_index(drop=True)
 
 
-def apply_target_scope(
-    df: pd.DataFrame,
-    target_level: str,
-    target_value,
-) -> pd.Series:
-    if target_level == "Market":
-        return pd.Series(True, index=df.index)
-    if target_level == "Retailer":
-        return df["retailer"].eq(target_value)
-    if target_level == "Brand":
-        return df["brand"].eq(target_value)
-    if target_level == "SKU":
-        return df["sku"].eq(target_value)
-    if target_level == "Pack size":
-        return df["pack_size"].eq(target_value)
-    return pd.Series(False, index=df.index)
-
-
 def run_targeted_scenario(
     full_df: pd.DataFrame,
     trace,

@@ -1259,6 +1259,24 @@ def add_posterior_predictive(model, idata, random_seed: int = 42):
     return ppc
 
 
+def apply_target_scope(
+    df: pd.DataFrame,
+    target_level: str,
+    target_value,
+) -> pd.Series:
+    if target_level == "Market":
+        return pd.Series(True, index=df.index)
+    if target_level == "Retailer":
+        return df["retailer"].eq(target_value)
+    if target_level == "Brand":
+        return df["brand"].eq(target_value)
+    if target_level == "SKU":
+        return df["sku"].eq(target_value)
+    if target_level == "Pack size":
+        return df["pack_size"].eq(target_value)
+    return pd.Series(False, index=df.index)
+
+
 def extract_elasticities(
     trace: Any,
     meta: Dict[str, Any],
