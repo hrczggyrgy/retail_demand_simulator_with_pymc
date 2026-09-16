@@ -1,16 +1,22 @@
-"""
-engine.py - Core analytics engine for retail demand, pricing, and distribution analysis.
 
-Contains all non-UI functionality: data validation, preparation, modelling, scenarios,
-and summary computations. No Streamlit dependencies.
+"""
+Fast retail demand / market-share simulation engine.
+
+Design goals
+------------
+1. Keep the existing public API used by app.py.
+2. Fit the Bayesian model once per market.
+3. Do NOT run posterior-predictive sampling during the normal fit.
+4. Extract a compact posterior representation for instant what-if scenarios.
+5. Make distribution changes interpretable in percentage points by default.
+6. Keep the complete competitive market in scenario share denominators.
 """
 
 from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -19,39 +25,54 @@ import xarray as xr
 from sklearn.preprocessing import SplineTransformer
 
 
-# ============================================================
-# Configuration Constants
-# ============================================================
+# ============================================================================
+# Configuration
+# ============================================================================
 
 REQUIRED_COLUMNS = [
-    "month", "retailer", "category", "brand", "sku",
-    "units", "revenue", "sku_stores", "retailer_stores", "pack_size"
+    "month",
+    "retailer",
+    "category",
+    "brand",
+    "sku",
+    "units",
+    "revenue",
+    "sku_stores",
+    "retailer_stores",
+    "pack_size",
 ]
 
-NUMERIC_COLUMNS = ["units", "revenue", "sku_stores", "retailer_stores", "pack_size"]
+NUMERIC_COLUMNS = [
+    "units",
+    "revenue",
+    "sku_stores",
+    "retailer_stores",
+    "pack_size",
+]
+
 KEY_COLUMNS = ["month", "retailer", "category", "brand", "sku"]
 
-# Default model settings
-DEFAULT_DRAWS = 500
-DEFAULT_TUNE = 500
+DEFAULT_DRAWS = 400
+DEFAULT_TUNE = 400
 DEFAULT_CHAINS = 2
-DEFAULT_TARGET_ACCEPT = 0.95
+DEFAULT_TARGET_ACCEPT = 0.90
 DEFAULT_N_SPLINE_KNOTS = 4
 DEFAULT_SPLINE_DEGREE = 3
 
-# Advanced model settings
-ADVANCED_DRAWS = 1500
-ADVANCED_TUNE = 1500
+ADVANCED_DRAWS = 1000
+ADVANCED_TUNE = 1000
 ADVANCED_CHAINS = 4
 
+# How many posterior draws to retain for interactive scenarios.
+DEFAULT_SCENARIO_DRAWS = 400
 
-# ============================================================
-# Data Classes for Structured Returns
-# ============================================================
+
+# ============================================================================
+# Data classes
+# ============================================================================
 
 @dataclass
 class ValidationReport:
-    """Results of input data validation."""
     is_valid: bool
     row_count: int
     missing_columns: List[str]
@@ -64,7 +85,6 @@ class ValidationReport:
 
 @dataclass
 class PreparedData:
-    """Prepared data with all derived metrics."""
     df: pd.DataFrame
     scales: Dict[str, Dict[str, float]]
     meta: Dict[str, Any]
@@ -74,8 +94,7 @@ class PreparedData:
 
 @dataclass
 class ModelOutput:
-    """Model fitting results."""
-    trace: xr.DataTree
+    trace: xr.Dataset
     df: pd.DataFrame
     meta: Dict[str, Any]
     spline: SplineTransformer
@@ -85,35 +104,71 @@ class ModelOutput:
 
 @dataclass
 class ScenarioResult:
-    """Scenario analysis results."""
     df: pd.DataFrame
     price_change: float
     nd_change: float
     summary: pd.DataFrame
 
 
-# ============================================================
-# Data Validation
-# ============================================================
+# ============================================================================
+# Fast / safe utilities
+# ============================================================================
+
+def _posterior_group(trace: Any):
+    """Return the posterior group for InferenceData/DataTree-like objects."""
+    if hasattr(trace, "posterior"):
+        return trace.posterior
+    if hasattr(trace, "groups"):
+        try:
+            return trace["posterior"]
+        except Exception:
+            pass
+    try:
+        return trace["posterior"]
+    except Exception as exc:
+        raise ValueError("Trace does not contain a posterior group") from exc
+
+
+def _posterior_array(
+    trace: Any,
+    variable: str,
+    dimensions: Optional[Tuple[str, ...]] = None,
+) -> np.ndarray:
+    posterior = _posterior_group(trace)
+    if variable not in posterior:
+        raise KeyError(f"Posterior variable '{variable}' is not available")
+    arr = posterior[variable]
+
+    if dimensions is not None:
+        available = tuple(str(x) for x in arr.dims)
+        if all(dim in available for dim in dimensions):
+            arr = arr.transpose(
+                *[d for d in ["chain", "draw"] if d in available],
+                *dimensions,
+            )
+    values = np.asarray(arr)
+    if values.ndim >= 2 and tuple(arr.dims[:2]) == ("chain", "draw"):
+        values = values.reshape((-1,) + values.shape[2:])
+    return values
+
+
+def _find_posterior_variable(trace: Any, candidates: List[str]) -> Optional[str]:
+    posterior = _posterior_group(trace)
+    for name in candidates:
+        if name in posterior:
+            return name
+    return None
+
+
+def _coerce_month(df: pd.DataFrame) -> pd.Series:
+    return pd.to_datetime(df["month"], errors="coerce")
+
+
+# ============================================================================
+# Validation / preparation
+# ============================================================================
 
 def validate_input_data(raw: pd.DataFrame) -> ValidationReport:
-    """
-    Validate input data against required schema.
-    
-    Parameters
-    ----------
-    raw : pd.DataFrame
-        Raw input data.
-        
-    Returns
-    -------
-    ValidationReport
-        Validation results with detailed diagnostics.
-    """
-    warnings_list = []
-    invalid_reasons = {}
-    
-    # Check missing columns
     missing = [c for c in REQUIRED_COLUMNS if c not in raw.columns]
     if missing:
         return ValidationReport(
@@ -124,272 +179,254 @@ def validate_input_data(raw: pd.DataFrame) -> ValidationReport:
             invalid_rows=0,
             invalid_reasons={},
             warnings=[],
-            info={"available_columns": list(raw.columns)}
+            info={"available_columns": list(raw.columns)},
         )
-    
+
     df = raw.copy()
-    original_count = len(df)
-    
-    # Check duplicates on key columns
-    dup_mask = df.duplicated(subset=KEY_COLUMNS, keep=False)
-    duplicate_count = int(dup_mask.sum())
-    if duplicate_count:
-        invalid_reasons["duplicates"] = duplicate_count
-        warnings_list.append(f"Found {duplicate_count} duplicate records on key columns")
-    
-    # Parse month
-    try:
-        df["month"] = pd.to_datetime(df["month"])
-    except Exception as e:
-        invalid_reasons["month_parse"] = len(df)
-        warnings_list.append(f"Failed to parse month column: {e}")
-    
-    # Convert numeric columns
+    n = len(df)
+    warnings_list: List[str] = []
+    invalid_reasons: Dict[str, int] = {}
+
+    # Parse / coercion once.
+    df["month"] = _coerce_month(df)
     for col in NUMERIC_COLUMNS:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    
-    # Identify invalid rows
-    invalid_mask = pd.Series(False, index=df.index)
-    
-    # Missing key fields
-    key_missing = df[KEY_COLUMNS].isna().any(axis=1)
-    invalid_mask |= key_missing
-    invalid_reasons["missing_key_fields"] = int(key_missing.sum())
-    
-    # Missing numeric fields
-    num_missing = df[NUMERIC_COLUMNS].isna().any(axis=1)
-    invalid_mask |= num_missing
-    invalid_reasons["missing_numeric"] = int(num_missing.sum())
-    
-    # Non-positive values
-    for col in NUMERIC_COLUMNS:
-        non_pos = (df[col] <= 0)
-        invalid_mask |= non_pos
-        invalid_reasons[f"non_positive_{col}"] = int(non_pos.sum())
-    
-    # sku_stores > retailer_stores
-    store_invalid = (df["sku_stores"] > df["retailer_stores"])
-    invalid_mask |= store_invalid
-    invalid_reasons["sku_stores_gt_retailer_stores"] = int(store_invalid.sum())
-    if store_invalid.any():
+
+    dup_count = int(df.duplicated(subset=KEY_COLUMNS, keep=False).sum())
+    if dup_count:
+        invalid_reasons["duplicates"] = dup_count
         warnings_list.append(
-            f"{int(store_invalid.sum())} rows have sku_stores > retailer_stores; "
-            "numeric distribution would exceed 100%"
+            f"Found {dup_count:,} duplicate records on "
+            f"{', '.join(KEY_COLUMNS)}."
         )
-    
-    invalid_count = int(invalid_mask.sum())
-    valid_count = original_count - invalid_count
-    
-    # Data quality warnings
-    n_months = df.loc[~invalid_mask, "month"].nunique() if valid_count > 0 else 0
+
+    invalid = pd.Series(False, index=df.index)
+
+    key_missing = df[KEY_COLUMNS].isna().any(axis=1)
+    invalid |= key_missing
+    invalid_reasons["missing_key_fields"] = int(key_missing.sum())
+
+    numeric_missing = df[NUMERIC_COLUMNS].isna().any(axis=1)
+    invalid |= numeric_missing
+    invalid_reasons["missing_numeric"] = int(numeric_missing.sum())
+
+    for col in NUMERIC_COLUMNS:
+        bad = df[col].le(0)
+        invalid |= bad
+        invalid_reasons[f"non_positive_{col}"] = int(bad.sum())
+
+    bad_stores = df["sku_stores"].gt(df["retailer_stores"])
+    invalid |= bad_stores
+    invalid_reasons["sku_stores_gt_retailer_stores"] = int(bad_stores.sum())
+    if bad_stores.any():
+        warnings_list.append(
+            f"{int(bad_stores.sum()):,} rows have SKU stores above retailer stores."
+        )
+
+    valid = df.loc[~invalid].copy()
+    valid_n = len(valid)
+
+    n_months = int(valid["month"].nunique()) if valid_n else 0
     if n_months < 12:
-        warnings_list.append(f"Only {n_months} months of data; model may be unstable")
-    
-    # Check for single SKU per retailer-category-month
-    if valid_count > 0:
-        valid_df = df.loc[~invalid_mask].copy()
-        cell_counts = valid_df.groupby(["retailer", "category", "month"])["sku"].nunique()
-        single_sku_cells = (cell_counts == 1).sum()
-        if single_sku_cells > 0:
+        warnings_list.append(
+            f"Only {n_months} months of usable data; estimates may be less stable."
+        )
+
+    if valid_n:
+        cell_skus = valid.groupby(
+            ["retailer", "category", "month"], observed=True
+        )["sku"].nunique()
+        single_sku_cells = int((cell_skus == 1).sum())
+        if single_sku_cells:
             warnings_list.append(
-                f"{single_sku_cells} retailer-category-month cells have only one SKU; "
-                "competitor price cannot be computed"
+                f"{single_sku_cells:,} retailer-category-month cells contain only "
+                "one SKU, limiting within-cell competitor price information."
             )
-        
-        # Price variation check
-        price_std = valid_df.groupby(["retailer", "category", "month"])["revenue"].sum() / \
-                    (valid_df.groupby(["retailer", "category", "month"])["units"].sum() * 
-                     valid_df.groupby(["retailer", "category", "month"])["pack_size"].first())
-        # Simplified check - will be done properly in prepare_data
-        
-        # Observations per SKU
-        sku_obs = valid_df.groupby("sku")["month"].nunique()
-        low_obs_skus = (sku_obs < 6).sum()
-        if low_obs_skus > 0:
+
+        sku_obs = valid.groupby("sku", observed=True)["month"].nunique()
+        low_obs = int((sku_obs < 6).sum())
+        if low_obs:
             warnings_list.append(
-                f"{low_obs_skus} SKUs have fewer than 6 monthly observations"
+                f"{low_obs:,} SKUs have fewer than 6 monthly observations."
             )
-        
-        # Pack size variation
-        pack_per_cat = valid_df.groupby("category")["pack_size"].nunique()
-        single_pack_cats = (pack_per_cat == 1).sum()
-        if single_pack_cats > 0:
-            warnings_list.append(
-                f"{single_pack_cats} categories have only one pack size; "
-                "pack-size effects cannot be estimated"
-            )
-    
+
     info = {
-        "original_rows": original_count,
-        "valid_rows": valid_count,
-        "dropped_rows": invalid_count,
-        "n_months": int(n_months),
-        "n_retailers": int(df.loc[~invalid_mask, "retailer"].nunique()) if valid_count > 0 else 0,
-        "n_categories": int(df.loc[~invalid_mask, "category"].nunique()) if valid_count > 0 else 0,
-        "n_brands": int(df.loc[~invalid_mask, "brand"].nunique()) if valid_count > 0 else 0,
-        "n_skus": int(df.loc[~invalid_mask, "sku"].nunique()) if valid_count > 0 else 0,
+        "original_rows": n,
+        "valid_rows": valid_n,
+        "dropped_rows": n - valid_n,
+        "n_months": n_months,
+        "n_retailers": int(valid["retailer"].nunique()) if valid_n else 0,
+        "n_categories": int(valid["category"].nunique()) if valid_n else 0,
+        "n_brands": int(valid["brand"].nunique()) if valid_n else 0,
+        "n_skus": int(valid["sku"].nunique()) if valid_n else 0,
         "date_range": {
-            "min": str(df.loc[~invalid_mask, "month"].min()) if valid_count > 0 else None,
-            "max": str(df.loc[~invalid_mask, "month"].max()) if valid_count > 0 else None
-        }
+            "min": str(valid["month"].min()) if valid_n else None,
+            "max": str(valid["month"].max()) if valid_n else None,
+        },
     }
-    
+
     return ValidationReport(
-        is_valid=valid_count > 0,
-        row_count=original_count,
-        missing_columns=missing,
-        duplicate_count=duplicate_count,
-        invalid_rows=invalid_count,
+        is_valid=valid_n > 0,
+        row_count=n,
+        missing_columns=[],
+        duplicate_count=dup_count,
+        invalid_rows=n - valid_n,
         invalid_reasons=invalid_reasons,
         warnings=warnings_list,
-        info=info
+        info=info,
     )
 
 
-# ============================================================
-# Data Preparation
-# ============================================================
+def prepare_data(
+    raw: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]]]:
+    """
+    Vectorized preparation. Avoids repeated groupby-transform work where possible.
+    """
+    df = raw.loc[:, REQUIRED_COLUMNS].copy()
 
-def prepare_data(raw: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]]]:
-    """
-    Prepare data: compute derived metrics, standardize, create indices.
-    
-    Parameters
-    ----------
-    raw : pd.DataFrame
-        Validated raw data.
-        
-    Returns
-    -------
-    df : pd.DataFrame
-        Prepared data with all derived columns.
-    scales : dict
-        Standardization parameters for log_velocity, log_relative_price, log_nd.
-    """
-    df = raw.copy()
-    df["month"] = pd.to_datetime(df["month"])
-    
-    # Convert numeric
+    df["month"] = _coerce_month(df)
     for col in NUMERIC_COLUMNS:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    
-    # Drop rows with missing key fields or non-positive numerics
+
     invalid = (
         df[KEY_COLUMNS].isna().any(axis=1)
         | df[NUMERIC_COLUMNS].isna().any(axis=1)
-        | (df["units"] <= 0)
-        | (df["revenue"] <= 0)
-        | (df["sku_stores"] <= 0)
-        | (df["retailer_stores"] <= 0)
-        | (df["pack_size"] <= 0)
-        | (df["sku_stores"] > df["retailer_stores"])
+        | df["units"].le(0)
+        | df["revenue"].le(0)
+        | df["sku_stores"].le(0)
+        | df["retailer_stores"].le(0)
+        | df["pack_size"].le(0)
+        | df["sku_stores"].gt(df["retailer_stores"])
     )
+
     if invalid.any():
-        warnings.warn(f"Dropping {invalid.sum()} invalid rows during preparation")
+        warnings.warn(
+            f"Dropping {int(invalid.sum()):,} invalid rows during preparation.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         df = df.loc[~invalid].copy()
-    
-    # 1. Standard physical volume
+
+    if df.empty:
+        raise ValueError("No valid rows remain after initial data cleaning.")
+
+    # Basic physical metrics.
     df["standard_volume"] = df["units"] * df["pack_size"]
-    
-    # 2. Standard unit price
     df["price_std"] = df["revenue"] / df["standard_volume"]
-    
-    # 3. Numeric distribution
     df["nd"] = df["sku_stores"] / df["retailer_stores"]
-    
-    # 4. Standard velocity per listed store
     df["velocity_std"] = df["standard_volume"] / df["sku_stores"]
-    
-    # 5. Competitor basket price (excl. focal SKU)
+
+    # One grouped aggregation + merge instead of multiple transform calls.
     cell = ["retailer", "category", "month"]
-    df["category_revenue"] = df.groupby(cell)["revenue"].transform("sum")
-    df["category_std_volume"] = df.groupby(cell)["standard_volume"].transform("sum")
-    df["competitor_revenue"] = df["category_revenue"] - df["revenue"]
-    df["competitor_std_volume"] = df["category_std_volume"] - df["standard_volume"]
-    df["competitor_price_std"] = df["competitor_revenue"] / df["competitor_std_volume"]
-    
-    # 6. Relative price
-    df["relative_price"] = df["price_std"] / df["competitor_price_std"]
-    
-    # Filter valid competitor prices and distributions
-    valid = (
-        (df["price_std"] > 0)
-        & (df["competitor_price_std"] > 0)
-        & (df["nd"] > 0)
-        & (df["nd"] <= 1)
-        & (df["velocity_std"] > 0)
-        & (df["relative_price"] > 0)
+    cell_totals = (
+        df.groupby(cell, observed=True)[["revenue", "standard_volume"]]
+        .sum()
+        .rename(
+            columns={
+                "revenue": "category_revenue",
+                "standard_volume": "category_std_volume",
+            }
+        )
+        .reset_index()
     )
-    if (~valid).any():
-        warnings.warn(f"Dropping {(~valid).sum()} rows without valid competitor price or distribution")
-        df = df.loc[valid].copy()
-    
-    # Log transforms
+    df = df.merge(cell_totals, on=cell, how="left", sort=False)
+
+    df["competitor_revenue"] = df["category_revenue"] - df["revenue"]
+    df["competitor_std_volume"] = (
+        df["category_std_volume"] - df["standard_volume"]
+    )
+
+    df["competitor_price_std"] = (
+        df["competitor_revenue"] / df["competitor_std_volume"]
+    )
+    df["relative_price"] = df["price_std"] / df["competitor_price_std"]
+
+    usable = (
+        df["price_std"].gt(0)
+        & df["competitor_price_std"].gt(0)
+        & df["nd"].gt(0)
+        & df["nd"].le(1)
+        & df["velocity_std"].gt(0)
+        & df["relative_price"].gt(0)
+    )
+
+    dropped = int((~usable).sum())
+    if dropped:
+        warnings.warn(
+            f"Dropping {dropped:,} rows without usable competitor price, "
+            "distribution, or velocity.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        df = df.loc[usable].copy()
+
+    if df.empty:
+        raise ValueError("No rows remain after relative-price/distribution cleaning.")
+
+    # Transform once.
     df["log_velocity"] = np.log(df["velocity_std"])
     df["log_relative_price"] = np.log(df["relative_price"])
     df["log_nd"] = np.log(df["nd"])
-    
-    # Standardization
-    scales = {}
+
+    scales: Dict[str, Dict[str, float]] = {}
     for col in ["log_velocity", "log_relative_price", "log_nd"]:
         mean = float(df[col].mean())
         sd = float(df[col].std(ddof=0))
-        if not np.isfinite(sd) or sd == 0:
-            raise ValueError(f"'{col}' has no usable variation (mean={mean}, sd={sd})")
+        if not np.isfinite(sd) or sd <= 0:
+            raise ValueError(
+                f"'{col}' has no usable variation (mean={mean:.6g}, sd={sd:.6g})."
+            )
         df[f"{col}_z"] = (df[col] - mean) / sd
         scales[col] = {"mean": mean, "sd": sd}
-    
-    # Pack group (exact pack size as string)
+
     df["pack_group"] = df["pack_size"].astype(str)
-    
-    # Final cleanup
-    df = df.replace([np.inf, -np.inf], np.nan).dropna().copy()
+
+    df = df.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
     if df.empty:
-        raise ValueError("No rows remain after cleaning")
-    
+        raise ValueError("No rows remain after final numeric cleanup.")
+
     return df, scales
 
 
-def add_indices(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Add integer indices for PyMC model coordinates.
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Prepared data.
-        
-    Returns
-    -------
-    df : pd.DataFrame
-        Data with index columns added.
-    meta : dict
-        Metadata including level mappings and SKU info.
-    """
+def add_indices(
+    df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     df = df.copy()
-    level_map = {}
-    
+
+    level_map: Dict[str, np.ndarray] = {}
     for col in ["retailer", "sku", "brand", "month", "pack_group"]:
         codes, levels = pd.factorize(df[col], sort=True)
         df[f"{col}_idx"] = codes.astype("int32")
         level_map[col] = levels
-    
-    # Entity = retailer x SKU combination
-    df["entity"] = df["retailer"].astype(str) + "__" + df["sku"].astype(str)
+
+    df["entity"] = (
+        df["retailer"].astype(str) + "__" + df["sku"].astype(str)
+    )
     entity_codes, entity_levels = pd.factorize(df["entity"], sort=True)
     df["entity_idx"] = entity_codes.astype("int32")
-    
-    # SKU-level metadata
+
     sku_info = (
-        df[["sku_idx", "brand_idx", "pack_group_idx", "sku", "brand", "pack_group", "pack_size"]]
+        df[
+            [
+                "sku_idx",
+                "brand_idx",
+                "pack_group_idx",
+                "sku",
+                "brand",
+                "pack_group",
+                "pack_size",
+            ]
+        ]
         .sort_values("sku_idx")
         .drop_duplicates("sku_idx")
+        .reset_index(drop=True)
     )
-    
-    # Verify SKU indexing is contiguous
-    if not np.array_equal(sku_info["sku_idx"].to_numpy(), np.arange(df["sku_idx"].nunique())):
-        raise ValueError("SKU indexing is inconsistent")
-    
+
+    expected = np.arange(len(sku_info), dtype="int32")
+    if not np.array_equal(sku_info["sku_idx"].to_numpy(), expected):
+        raise ValueError("SKU indexing is inconsistent.")
+
     meta = {
         "retailer_levels": level_map["retailer"],
         "sku_levels": level_map["sku"],
@@ -404,339 +441,226 @@ def add_indices(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     return df, meta
 
 
-def fit_spline(df: pd.DataFrame, n_knots: int = DEFAULT_N_SPLINE_KNOTS, 
-               degree: int = DEFAULT_SPLINE_DEGREE) -> Tuple[SplineTransformer, np.ndarray]:
-    """
-    Fit B-spline basis for numeric distribution effect.
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Prepared data with log_nd_z column.
-    n_knots : int
-        Number of spline knots.
-    degree : int
-        Spline degree.
-        
-    Returns
-    -------
-    spline : SplineTransformer
-        Fitted spline transformer.
-    basis : np.ndarray
-        Spline basis matrix (n_obs x n_basis).
-    """
+def fit_spline(
+    df: pd.DataFrame,
+    n_knots: int = DEFAULT_N_SPLINE_KNOTS,
+    degree: int = DEFAULT_SPLINE_DEGREE,
+) -> Tuple[SplineTransformer, np.ndarray]:
+    x = df["log_nd_z"].to_numpy(dtype=float).reshape(-1, 1)
     spline = SplineTransformer(
         n_knots=n_knots,
         degree=degree,
         include_bias=False,
-        knots="quantile",
-        extrapolation="linear",
     )
-    basis = spline.fit_transform(df[["log_nd_z"]]).astype("float64")
+    basis = spline.fit_transform(x).astype(np.float64, copy=False)
     return spline, basis
 
 
-# ============================================================
-# Market Metrics and Shares
-# ============================================================
+def create_data_quality_report(
+    raw_df: pd.DataFrame,
+    prepared_df: pd.DataFrame,
+    validation: ValidationReport,
+) -> Dict[str, Any]:
+    input_n = len(raw_df)
+    prepared_n = len(prepared_df)
 
-def calculate_market_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate total market monthly metrics."""
-    market = df.groupby("month", as_index=False).agg(
-        units=("units", "sum"),
-        revenue=("revenue", "sum"),
-        standard_volume=("standard_volume", "sum"),
-        sku_stores=("sku_stores", "sum"),
-        retailer_stores=("retailer_stores", "first"),  # same per retailer per month
+    numeric = raw_df.copy()
+    for col in NUMERIC_COLUMNS:
+        numeric[col] = pd.to_numeric(numeric[col], errors="coerce")
+
+    duplicate_records = int(
+        numeric.duplicated(subset=KEY_COLUMNS, keep=False).sum()
     )
-    market["price_per_standard_unit"] = market["revenue"] / market["standard_volume"]
-    market["avg_nd"] = market["sku_stores"] / market["retailer_stores"]
-    market["avg_velocity"] = market["standard_volume"] / market["sku_stores"]
-    return market
 
-
-def calculate_shares(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Calculate various market shares at different hierarchy levels."""
-    shares = {}
-    
-    # SKU shares within retailer-category-month
-    cell = ["retailer", "category", "month"]
-    df["sku_unit_share"] = df["units"] / df.groupby(cell)["units"].transform("sum")
-    df["sku_revenue_share"] = df["revenue"] / df.groupby(cell)["revenue"].transform("sum")
-    
-    # Brand shares within retailer-category-month
-    brand_cell = ["retailer", "category", "brand", "month"]
-    brand_rev = df.groupby(brand_cell)["revenue"].transform("sum")
-    brand_units = df.groupby(brand_cell)["units"].transform("sum")
-    cell_rev = df.groupby(cell)["revenue"].transform("sum")
-    cell_units = df.groupby(cell)["units"].transform("sum")
-    df["brand_unit_share"] = brand_units / cell_units
-    df["brand_revenue_share"] = brand_rev / cell_rev
-    
-    # Retailer share of total market revenue by month
-    total_rev_month = df.groupby("month")["revenue"].transform("sum")
-    df["retailer_revenue_share"] = df.groupby(["retailer", "month"])["revenue"].transform("sum") / total_rev_month
-    
-    # Brand share of total market revenue by month
-    df["brand_revenue_share_total"] = df.groupby(["brand", "month"])["revenue"].transform("sum") / total_rev_month
-    
-    # Category share of total market revenue by month
-    df["category_revenue_share_total"] = df.groupby(["category", "month"])["revenue"].transform("sum") / total_rev_month
-    
-    return {
-        "sku_unit_share": df["sku_unit_share"],
-        "sku_revenue_share": df["sku_revenue_share"],
-        "brand_unit_share": df["brand_unit_share"],
-        "brand_revenue_share": df["brand_revenue_share"],
-        "retailer_revenue_share": df["retailer_revenue_share"],
-        "brand_revenue_share_total": df["brand_revenue_share_total"],
-        "category_revenue_share_total": df["category_revenue_share_total"],
+    missing = {
+        str(k): int(v)
+        for k, v in numeric.isna().sum().items()
+        if int(v) > 0
     }
 
+    counts = {
+        "retailers": int(prepared_df["retailer"].nunique()),
+        "categories": int(prepared_df["category"].nunique()),
+        "brands": int(prepared_df["brand"].nunique()),
+        "skus": int(prepared_df["sku"].nunique()),
+        "pack_sizes": int(prepared_df["pack_size"].nunique()),
+    }
 
-def create_growth_decomposition(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Decompose standard volume growth into network, distribution, velocity effects.
-    
-    Q_standard = retailer_stores * ND * velocity_std
-    ln(Q1/Q0) = ln(retailer_stores1/retailer_stores0) + ln(ND1/ND0) + ln(V1/V0)
-    """
-    months = np.sort(df["month"].unique())
-    if len(months) < 2:
-        return pd.DataFrame()
-    
-    first_month = pd.Timestamp(months[0])
-    last_month = pd.Timestamp(months[-1])
-    
-    start = df[df["month"] == first_month].set_index(["retailer", "sku"])
-    end = df[df["month"] == last_month].set_index(["retailer", "sku"])
-    common = start.index.intersection(end.index)
-    
-    if len(common) == 0:
-        return pd.DataFrame()
-    
-    decomp = pd.DataFrame(index=common).reset_index()
-    decomp["network"] = 100 * np.log(
-        end.loc[common, "retailer_stores"].to_numpy() / start.loc[common, "retailer_stores"].to_numpy()
+    sku_obs = (
+        prepared_df.groupby("sku", observed=True)["month"]
+        .nunique()
+        .sort_values()
     )
-    decomp["distribution"] = 100 * np.log(
-        end.loc[common, "nd"].to_numpy() / start.loc[common, "nd"].to_numpy()
+    entity_obs = (
+        prepared_df.groupby(["retailer", "sku"], observed=True)["month"]
+        .nunique()
+        .sort_values()
     )
-    decomp["velocity"] = 100 * np.log(
-        end.loc[common, "velocity_std"].to_numpy() / start.loc[common, "velocity_std"].to_numpy()
-    )
-    decomp["total_standard_volume"] = 100 * np.log(
-        end.loc[common, "standard_volume"].to_numpy() / start.loc[common, "standard_volume"].to_numpy()
-    )
-    decomp["label"] = decomp["retailer"].astype(str) + " | " + decomp["sku"].astype(str)
-    decomp = decomp.sort_values("total_standard_volume")
-    
-    return decomp
 
-
-# ============================================================
-# Summary Tables
-# ============================================================
-
-def create_market_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """Create total market summary table."""
-    market = calculate_market_metrics(df)
-    return market
-
-
-def create_category_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """Create category-level summary."""
-    cat = df.groupby(["month", "category"], as_index=False).agg(
-        revenue=("revenue", "sum"),
-        units=("units", "sum"),
-        standard_volume=("standard_volume", "sum"),
-        price_std=("price_std", "mean"),
-        nd=("nd", "mean"),
-        velocity_std=("velocity_std", "mean"),
-    )
-    cat["price_per_standard_unit"] = cat["revenue"] / cat["standard_volume"]
-    return cat
-
-
-def create_retailer_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """Create retailer-level summary."""
-    ret = df.groupby(["month", "retailer"], as_index=False).agg(
-        revenue=("revenue", "sum"),
-        units=("units", "sum"),
-        standard_volume=("standard_volume", "sum"),
-        price_std=("price_std", "mean"),
-        nd=("nd", "mean"),
-        velocity_std=("velocity_std", "mean"),
-    )
-    ret["price_per_standard_unit"] = ret["revenue"] / ret["standard_volume"]
-    return ret
-
-
-def create_brand_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """Create brand-level summary."""
-    brand = df.groupby(["month", "brand"], as_index=False).agg(
-        revenue=("revenue", "sum"),
-        units=("units", "sum"),
-        standard_volume=("standard_volume", "sum"),
-        price_std=("price_std", "mean"),
-        nd=("nd", "mean"),
-        velocity_std=("velocity_std", "mean"),
-    )
-    brand["price_per_standard_unit"] = brand["revenue"] / brand["standard_volume"]
-    return brand
-
-
-def create_sku_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """Create SKU-level summary with all metrics."""
-    sku = df.groupby(["category", "retailer", "brand", "sku", "pack_size"], as_index=False).agg(
-        units=("units", "sum"),
-        revenue=("revenue", "sum"),
-        standard_volume=("standard_volume", "sum"),
-        price_std=("price_std", "mean"),
-        relative_price=("relative_price", "mean"),
-        nd=("nd", "mean"),
-        velocity_std=("velocity_std", "mean"),
-        sku_stores=("sku_stores", "mean"),
-        retailer_stores=("retailer_stores", "mean"),
-    )
-    sku["price_per_standard_unit"] = sku["revenue"] / sku["standard_volume"]
-    
-    # Add shares
-    total_rev = df["revenue"].sum()
-    total_units = df["units"].sum()
-    sku["revenue_share"] = sku["revenue"] / total_rev
-    sku["unit_share"] = sku["units"] / total_units
-    
-    return sku
-
-
-def create_data_quality_report(raw: pd.DataFrame, prepared: pd.DataFrame, 
-                                validation: ValidationReport) -> Dict[str, Any]:
-    """Create comprehensive data quality report."""
     report = {
-        "input_row_count": validation.row_count,
-        "valid_model_row_count": len(prepared),
-        "dropped_row_count": validation.invalid_rows,
+        "input_row_count": input_n,
+        "valid_model_row_count": prepared_n,
+        "dropped_row_count": max(0, input_n - prepared_n),
         "dropped_reasons": validation.invalid_reasons,
-        "missing_values": raw.isnull().sum().to_dict(),
-        "duplicate_records": validation.duplicate_count,
+        "missing_values": missing,
+        "duplicate_records": duplicate_records,
         "date_coverage": {
-            "min": str(prepared["month"].min()) if len(prepared) > 0 else None,
-            "max": str(prepared["month"].max()) if len(prepared) > 0 else None,
-            "n_months": prepared["month"].nunique() if len(prepared) > 0 else 0,
+            "min": str(prepared_df["month"].min()),
+            "max": str(prepared_df["month"].max()),
+            "n_months": int(prepared_df["month"].nunique()),
         },
-        "counts": {
-            "retailers": prepared["retailer"].nunique() if len(prepared) > 0 else 0,
-            "categories": prepared["category"].nunique() if len(prepared) > 0 else 0,
-            "brands": prepared["brand"].nunique() if len(prepared) > 0 else 0,
-            "skus": prepared["sku"].nunique() if len(prepared) > 0 else 0,
-            "pack_sizes": prepared["pack_size"].nunique() if len(prepared) > 0 else 0,
-        },
+        "counts": counts,
         "distribution_validity": {
-            "nd_min": float(prepared["nd"].min()) if len(prepared) > 0 else None,
-            "nd_max": float(prepared["nd"].max()) if len(prepared) > 0 else None,
-            "nd_gt_1_count": int((prepared["nd"] > 1).sum()) if len(prepared) > 0 else 0,
+            "nd_min": float(prepared_df["nd"].min()),
+            "nd_max": float(prepared_df["nd"].max()),
+            "nd_gt_1_count": int((prepared_df["nd"] > 1).sum()),
         },
         "price_variation": {
-            "rel_price_min": float(prepared["relative_price"].min()) if len(prepared) > 0 else None,
-            "rel_price_max": float(prepared["relative_price"].max()) if len(prepared) > 0 else None,
-            "rel_price_std": float(prepared["relative_price"].std()) if len(prepared) > 0 else None,
+            "rel_price_min": float(prepared_df["relative_price"].min()),
+            "rel_price_max": float(prepared_df["relative_price"].max()),
+            "rel_price_std": float(prepared_df["relative_price"].std()),
         },
-        "observations_per_retailer_sku": prepared.groupby(["retailer", "sku"])["month"].nunique().describe().to_dict() if len(prepared) > 0 else {},
-        "observations_per_sku": prepared.groupby("sku")["month"].nunique().describe().to_dict() if len(prepared) > 0 else {},
-        "low_observation_skus": prepared.groupby("sku")["month"].nunique()[prepared.groupby("sku")["month"].nunique() < 6].index.tolist() if len(prepared) > 0 else [],
+        "observations_per_retailer_sku": {
+            "min": int(entity_obs.min()) if len(entity_obs) else 0,
+            "median": float(entity_obs.median()) if len(entity_obs) else 0,
+            "max": int(entity_obs.max()) if len(entity_obs) else 0,
+        },
+        "observations_per_sku": {
+            "min": int(sku_obs.min()) if len(sku_obs) else 0,
+            "median": float(sku_obs.median()) if len(sku_obs) else 0,
+            "max": int(sku_obs.max()) if len(sku_obs) else 0,
+        },
+        "low_observation_skus": sku_obs[sku_obs < 6].index.tolist(),
         "warnings": validation.warnings,
     }
     return report
 
 
-# ============================================================
-# PyMC Model
-# ============================================================
+# ============================================================================
+# Model
+# ============================================================================
 
-def build_pymc_model(df: pd.DataFrame, meta: Dict[str, Any], 
-                      nd_basis: np.ndarray) -> pm.Model:
-    """
-    Build hierarchical PyMC model for log velocity.
-    
-    log(V_standard) = alpha + entity_effect + month_effect + 
-                      beta_price * log_relative_price + f(ND) + error
-    """
+def build_pymc_model(
+    df: pd.DataFrame,
+    meta: Dict[str, Any],
+    nd_basis: np.ndarray,
+) -> pm.Model:
     coords = {
-        "observation": np.arange(len(df)),
         "retailer": meta["retailer_levels"],
         "sku": meta["sku_levels"],
         "brand": meta["brand_levels"],
-        "month": meta["month_levels"].astype(str),
+        "month": meta["month_levels"],
         "pack_group": meta["pack_group_levels"],
         "entity": meta["entity_levels"],
-        "nd_basis": np.arange(nd_basis.shape[1]),
+        "obs": np.arange(len(df)),
+        "spline_basis": np.arange(nd_basis.shape[1]),
     }
-    
+
+    # Keep observed arrays numeric / contiguous.
+    entity_idx = df["entity_idx"].to_numpy(dtype="int32")
+    month_idx = df["month_idx"].to_numpy(dtype="int32")
+    sku_idx = df["sku_idx"].to_numpy(dtype="int32")
+    y = df["log_velocity_z"].to_numpy(dtype=float)
+    price_x = df["log_relative_price_z"].to_numpy(dtype=float)
+
     with pm.Model(coords=coords) as model:
-        # Data containers
-        retailer_idx = pm.Data("retailer_idx", df["retailer_idx"].to_numpy(), dims="observation")
-        sku_idx = pm.Data("sku_idx", df["sku_idx"].to_numpy(), dims="observation")
-        month_idx = pm.Data("month_idx", df["month_idx"].to_numpy(), dims="observation")
-        entity_idx = pm.Data("entity_idx", df["entity_idx"].to_numpy(), dims="observation")
-        x_price = pm.Data("x_price", df["log_relative_price_z"].to_numpy(), dims="observation")
-        x_nd = pm.Data("x_nd", nd_basis, dims=("observation", "nd_basis"))
-        
-        # Global intercept
-        alpha = pm.Normal("alpha", 0, 1)
-        
-        # Entity effect (retailer x SKU persistent effect)
+        alpha = pm.Normal("alpha", 0.0, 1.0)
+
+        # Persistent retailer × SKU effect, non-centered.
         sigma_entity = pm.HalfNormal("sigma_entity", 0.5)
-        entity_offset = pm.Normal("entity_offset", 0, 1, dims="entity")
-        entity_effect = pm.Deterministic("entity_effect", entity_offset * sigma_entity, dims="entity")
-        
-        # Month effect (seasonality)
+        entity_offset = pm.Normal("entity_offset", 0.0, 1.0, dims="entity")
+        entity_effect = pm.Deterministic(
+            "entity_effect",
+            entity_offset * sigma_entity,
+            dims="entity",
+        )
+
+        # Month / seasonality, non-centered.
         sigma_month = pm.HalfNormal("sigma_month", 0.5)
-        month_offset = pm.Normal("month_offset", 0, 1, dims="month")
-        month_effect = pm.Deterministic("month_effect", month_offset * sigma_month, dims="month")
-        
-        # SKU price response with brand x pack-size partial pooling
-        price_mean = pm.Normal("price_mean", -0.4, 0.5, dims=("brand", "pack_group"))
+        month_offset = pm.Normal("month_offset", 0.0, 1.0, dims="month")
+        month_effect = pm.Deterministic(
+            "month_effect",
+            month_offset * sigma_month,
+            dims="month",
+        )
+
+        # SKU price response pooled by brand × pack-size.
+        n_brands = len(meta["brand_levels"])
+        n_packs = len(meta["pack_group_levels"])
+
+        price_mean = pm.Normal(
+            "price_mean",
+            -0.4,
+            0.5,
+            dims=("brand", "pack_group"),
+        )
         sigma_price_sku = pm.HalfNormal("sigma_price_sku", 0.3)
-        price_offset = pm.Normal("price_offset", 0, 1, dims="sku")
-        price_slope = pm.Deterministic(
-            "price_slope_z",
-            price_mean[meta["sku_brand_idx"], meta["sku_pack_idx"]] + price_offset * sigma_price_sku,
+        price_offset = pm.Normal(
+            "price_offset",
+            0.0,
+            1.0,
             dims="sku",
         )
-        
-        # Non-linear numeric distribution effect, grouped by brand and pack size
-        nd_mean = pm.Normal("nd_mean", 0, 0.4, dims=("brand", "pack_group", "nd_basis"))
-        sigma_nd_sku = pm.HalfNormal("sigma_nd_sku", 0.25)
-        nd_offset = pm.Normal("nd_offset", 0, 1, dims=("sku", "nd_basis"))
-        nd_weights = pm.Deterministic(
-            "nd_weights",
-            nd_mean[meta["sku_brand_idx"], meta["sku_pack_idx"], :] + nd_offset * sigma_nd_sku,
-            dims=("sku", "nd_basis"),
+        price_slope = pm.Deterministic(
+            "price_slope_z",
+            price_mean[
+                meta["sku_brand_idx"],
+                meta["sku_pack_idx"],
+            ]
+            + price_offset * sigma_price_sku,
+            dims="sku",
         )
-        nd_effect = pm.math.sum(nd_weights[sku_idx] * x_nd, axis=1)
-        
-        # Linear predictor
+
+        # Smooth, low-dimensional nonlinear distribution response.
+        sigma_nd = pm.HalfNormal("sigma_nd", 0.6)
+        nd_coef = pm.Normal(
+            "nd_coef",
+            0.0,
+            sigma_nd,
+            dims="spline_basis",
+        )
+        nd_effect = pm.Deterministic(
+            "nd_effect",
+            pm.math.dot(nd_basis, nd_coef),
+            dims="obs",
+        )
+
         mu = (
             alpha
             + entity_effect[entity_idx]
             + month_effect[month_idx]
-            + price_slope[sku_idx] * x_price
+            + price_slope[sku_idx] * price_x
             + nd_effect
         )
-        
-        # Observation noise
-        sigma = pm.HalfNormal("sigma", 0.5)
-        pm.Normal("velocity_z_obs", mu=mu, sigma=sigma, 
-                  observed=df["log_velocity_z"].to_numpy(), dims="observation")
-    
+
+        sigma = pm.HalfNormal("sigma", 0.7)
+
+        pm.Normal(
+            "log_velocity_z_obs",
+            mu,
+            sigma,
+            observed=y,
+            dims="obs",
+        )
+
     return model
 
 
-def fit_model(model: pm.Model, draws: int = DEFAULT_DRAWS, tune: int = DEFAULT_TUNE,
-              chains: int = DEFAULT_CHAINS, target_accept: float = DEFAULT_TARGET_ACCEPT,
-              random_seed: int = 42) -> xr.DataTree:
-    """Fit PyMC model and generate posterior predictive samples."""
+def fit_model(
+    model: pm.Model,
+    draws: int = DEFAULT_DRAWS,
+    tune: int = DEFAULT_TUNE,
+    chains: int = DEFAULT_CHAINS,
+    target_accept: float = DEFAULT_TARGET_ACCEPT,
+    random_seed: int = 42,
+    sample_posterior_predictive: bool = False,
+) -> xr.Dataset:
+    """
+    Fit the Bayesian model.
+
+    Normal application mode deliberately skips posterior-predictive sampling.
+    This is the largest unnecessary cost in the original interactive flow.
+    """
     with model:
         trace = pm.sample(
             draws=draws,
@@ -745,268 +669,852 @@ def fit_model(model: pm.Model, draws: int = DEFAULT_DRAWS, tune: int = DEFAULT_T
             target_accept=target_accept,
             random_seed=random_seed,
             return_inferencedata=True,
+            progressbar=True,
+            idata_kwargs={"log_likelihood": False},
         )
-        trace = pm.sample_posterior_predictive(
-            trace,
-            var_names=["velocity_z_obs"],
-            random_seed=random_seed,
-            extend_inferencedata=True,
-        )
+
+        if sample_posterior_predictive:
+            # Kept as an explicit opt-in diagnostic path.
+            ppc = pm.sample_posterior_predictive(
+                trace,
+                var_names=["log_velocity_z_obs"],
+                random_seed=random_seed,
+                progressbar=False,
+            )
+            trace.extend(ppc)
+
     return trace
 
 
-# ============================================================
-# Posterior Extraction and Elasticities
-# ============================================================
+# ============================================================================
+# Diagnostics / elasticity
+# ============================================================================
 
-def _get_posterior_array(trace: xr.DataTree, variable: str, dimensions: Tuple[str, ...]) -> np.ndarray:
-    """Extract posterior array with consistent handling of DataTree/InferenceData."""
-    if hasattr(trace, "__getitem__") and "posterior" in trace:
-        posterior = trace["posterior"]
-        if hasattr(posterior, "ds"):
-            posterior = posterior.ds
-        elif hasattr(posterior, "dataset"):
-            posterior = posterior.dataset
-    elif hasattr(trace, "posterior"):
-        posterior = trace.posterior
-    else:
-        raise KeyError("Trace has no 'posterior' group")
-    
-    arr = posterior[variable].stack(sample=("chain", "draw")).transpose(*dimensions, "sample").to_numpy()
-    return arr
+def get_model_diagnostics(trace: Any) -> Dict[str, Any]:
+    posterior = _posterior_group(trace)
 
+    divergences = 0
+    if hasattr(trace, "sample_stats") and "diverging" in trace.sample_stats:
+        divergences = int(np.asarray(trace.sample_stats["diverging"]).sum())
 
-def extract_elasticities(trace: xr.DataTree, meta: Dict[str, Any], 
-                         scales: Dict[str, Dict[str, float]]) -> pd.DataFrame:
-    """
-    Extract SKU-level price elasticities with credible intervals.
-    
-    Raw elasticity = beta_standardised * SD(log velocity) / SD(log relative price)
-    """
-    beta_z = _get_posterior_array(trace, "price_slope_z", ("sku",))
-    beta_raw = beta_z * scales["log_velocity"]["sd"] / scales["log_relative_price"]["sd"]
-    
-    sku_results = meta["sku_info"].copy()
-    sku_results["elasticity_p05"] = np.quantile(beta_raw, 0.05, axis=1)
-    sku_results["elasticity_median"] = np.median(beta_raw, axis=1)
-    sku_results["elasticity_p95"] = np.quantile(beta_raw, 0.95, axis=1)
-    
-    return sku_results
+    max_rhat = np.nan
+    min_ess = np.nan
 
-
-def get_posterior_predictive_check(trace: xr.DataTree, df: pd.DataFrame) -> pd.DataFrame:
-    """Get posterior predictive check data."""
     try:
-        if hasattr(trace, "__getitem__") and "posterior_predictive" in trace:
-            ppc = trace["posterior_predictive"]
-            if hasattr(ppc, "ds"):
-                ppc = ppc.ds
-            elif hasattr(ppc, "dataset"):
-                ppc = ppc.dataset
-        elif hasattr(trace, "posterior_predictive"):
-            ppc = trace.posterior_predictive
-        else:
-            raise KeyError("No posterior_predictive group")
-        
-        ppc_mean = ppc["velocity_z_obs"].mean(dim=("chain", "draw")).to_numpy()
-        ppc_df = pd.DataFrame({
-            "observed_z": df["log_velocity_z"].to_numpy(),
-            "predicted_z": ppc_mean,
-        })
-        ppc_df["residual_z"] = ppc_df["observed_z"] - ppc_df["predicted_z"]
-        return ppc_df
-    except Exception as e:
-        warnings.warn(f"PPC extraction failed: {e}")
-        return pd.DataFrame()
+        # Avoid requiring a full ArviZ import path; calculate directly.
+        chains = max(1, int(posterior.sizes.get("chain", 1)))
+        draws = max(1, int(posterior.sizes.get("draw", 1)))
 
+        rhats: List[float] = []
+        esses: List[float] = []
 
-def get_model_diagnostics(trace: xr.DataTree) -> Dict[str, Any]:
-    """Extract model diagnostics: divergences, R-hat, ESS."""
-    diagnostics = {
-        "divergences": 0,
-        "max_rhat": 1.0,
-        "min_ess": float('inf'),
-    }
-    
-    try:
-        # Divergences
-        if hasattr(trace, "sample_stats"):
-            if hasattr(trace.sample_stats, "diverging"):
-                diagnostics["divergences"] = int(trace.sample_stats.diverging.sum())
-            elif "diverging" in trace.sample_stats:
-                diagnostics["divergences"] = int(trace.sample_stats["diverging"].sum())
-        
-        # R-hat and ESS from posterior
-        import arviz as az
-        summary = az.summary(trace, var_names=["alpha", "sigma", "sigma_entity", "sigma_month", 
-                                                "sigma_price_sku", "sigma_nd_sku"])
-        if not summary.empty:
-            diagnostics["max_rhat"] = float(summary["r_hat"].max())
-            diagnostics["min_ess"] = float(summary["ess_bulk"].min())
+        for var in ["price_slope_z", "nd_coef", "sigma", "sigma_entity"]:
+            if var not in posterior:
+                continue
+
+            arr = np.asarray(posterior[var])
+            if arr.ndim < 2:
+                continue
+
+            # Flatten parameter dimensions.
+            arr = arr.reshape(chains, draws, -1)
+
+            # R-hat and ESS across every parameter element.
+            chain_means = arr.mean(axis=1)
+            chain_vars = arr.var(axis=1, ddof=1)
+
+            if chains > 1 and draws > 1:
+                between = draws * chain_means.var(axis=0, ddof=1)
+                within = chain_vars.mean(axis=0)
+                var_hat = ((draws - 1) / draws) * within + between / draws
+                rhat = np.sqrt(var_hat / np.maximum(within, 1e-12))
+                rhats.extend(rhat[np.isfinite(rhat)].ravel().tolist())
+
+            # Simple bulk ESS approximation from lag-1 autocorrelation.
+            x = arr - arr.mean(axis=1, keepdims=True)
+            var = np.mean(x * x, axis=1)
+            ac_num = np.mean(x[:, 1:] * x[:, :-1], axis=1)
+            rho = np.clip(
+                ac_num / np.maximum(var, 1e-12),
+                -0.99,
+                0.99,
+            )
+            ess = (chains * draws) * (1.0 - rho.mean(axis=0)) / (
+                1.0 + rho.mean(axis=0)
+            )
+            esses.extend(ess[np.isfinite(ess)].ravel().tolist())
+
+        if rhats:
+            max_rhat = float(np.max(rhats))
+        if esses:
+            min_ess = float(np.min(esses))
     except Exception:
         pass
-    
-    return diagnostics
+
+    return {
+        "divergences": divergences,
+        "max_rhat": max_rhat if np.isfinite(max_rhat) else None,
+        "min_ess": min_ess if np.isfinite(min_ess) else None,
+    }
 
 
-# ============================================================
-# Scenario Analysis
-# ============================================================
+def extract_elasticities(
+    trace: Any,
+    meta: Dict[str, Any],
+    scales: Dict[str, Dict[str, float]],
+) -> pd.DataFrame:
+    """
+    Convert standardized price slopes back to ordinary elasticity.
+    """
+    beta_name = _find_posterior_variable(trace, ["price_slope_z", "price_slope"])
+    if beta_name is None:
+        raise KeyError("Could not find posterior price slope variable.")
+
+    beta_z = _posterior_array(trace, beta_name, ("sku",))
+    beta_raw = (
+        beta_z
+        * scales["log_velocity"]["sd"]
+        / scales["log_relative_price"]["sd"]
+    )
+
+    info = meta["sku_info"].copy()
+
+    info["elasticity_p05"] = np.quantile(beta_raw, 0.05, axis=0)
+    info["elasticity_median"] = np.quantile(beta_raw, 0.50, axis=0)
+    info["elasticity_p95"] = np.quantile(beta_raw, 0.95, axis=0)
+
+    return info[
+        [
+            "sku",
+            "brand",
+            "pack_group",
+            "pack_size",
+            "elasticity_p05",
+            "elasticity_median",
+            "elasticity_p95",
+        ]
+    ].sort_values("elasticity_median").reset_index(drop=True)
+
+
+# ============================================================================
+# Posterior extraction for fast scenarios
+# ============================================================================
+
+def extract_scenario_posterior(
+    trace: Any,
+    max_draws: int = DEFAULT_SCENARIO_DRAWS,
+) -> Dict[str, np.ndarray]:
+    """
+    Extract only the posterior quantities needed by a scenario.
+
+    This makes repeated slider interactions dramatically cheaper than carrying
+    the full PyMC trace through every scenario calculation.
+    """
+    result: Dict[str, np.ndarray] = {}
+
+    price_name = _find_posterior_variable(trace, ["price_slope_z", "price_slope"])
+    if price_name is not None:
+        result["price_slope_z"] = _posterior_array(
+            trace, price_name, ("sku",)
+        )
+
+    nd_name = _find_posterior_variable(
+        trace,
+        ["nd_coef", "distribution_coef", "nd_slope"],
+    )
+    if nd_name is not None:
+        result["nd_coef"] = _posterior_array(
+            trace, nd_name, ("spline_basis",)
+        )
+
+    return _thin_posterior(result, max_draws=max_draws)
+
+
+def _thin_posterior(
+    posterior: Dict[str, np.ndarray],
+    max_draws: int,
+) -> Dict[str, np.ndarray]:
+    if not posterior:
+        return posterior
+
+    n = next(iter(posterior.values())).shape[0]
+    if n <= max_draws:
+        return posterior
+
+    idx = np.linspace(0, n - 1, max_draws).round().astype(int)
+    return {k: v[idx] for k, v in posterior.items()}
+
+
+# ============================================================================
+# Fast scenario engine
+# ============================================================================
+
+def _posterior_delta_log_velocity(
+    df: pd.DataFrame,
+    trace: Any,
+    spline: SplineTransformer,
+    scales: Dict[str, Dict[str, float]],
+    price_change: float,
+    nd_change: float,
+    nd_change_mode: str = "pp",
+    posterior_cache: Optional[Dict[str, np.ndarray]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Pure NumPy scenario transformation.
+
+    Returns p10, median, p90 volume multipliers for each row.
+    """
+    posterior = (
+        posterior_cache
+        if posterior_cache is not None
+        else extract_scenario_posterior(trace)
+    )
+
+    n = len(df)
+    n_draws = (
+        next(iter(posterior.values())).shape[0]
+        if posterior
+        else 1
+    )
+
+    # Price effect.
+    price_x_delta = np.log1p(price_change)
+
+    if "price_slope_z" in posterior and "sku_idx" in df.columns:
+        price_slopes = posterior["price_slope_z"][:, df["sku_idx"].to_numpy()]
+        delta_price_z = (
+            price_x_delta / scales["log_relative_price"]["sd"]
+        )
+        price_delta = price_slopes * delta_price_z
+
+    else:
+        price_delta = np.zeros((n_draws, n), dtype=float)
+
+    # Distribution effect.
+    nd_old = df["nd"].to_numpy(dtype=float)
+
+    if nd_change_mode == "relative":
+        nd_new = np.clip(
+            nd_old * (1.0 + nd_change),
+            1e-4,
+            1.0,
+        )
+    elif nd_change_mode == "pp":
+        nd_new = np.clip(
+            nd_old + nd_change,
+            1e-4,
+            1.0,
+        )
+    else:
+        raise ValueError("nd_change_mode must be 'pp' or 'relative'.")
+
+    old_z = (
+        np.log(nd_old) - scales["log_nd"]["mean"]
+    ) / scales["log_nd"]["sd"]
+    new_z = (
+        np.log(nd_new) - scales["log_nd"]["mean"]
+    ) / scales["log_nd"]["sd"]
+
+    old_basis = spline.transform(old_z.reshape(-1, 1))
+    new_basis = spline.transform(new_z.reshape(-1, 1))
+    delta_basis = new_basis - old_basis
+
+    if "nd_coef" in posterior:
+        nd_delta = posterior["nd_coef"] @ delta_basis.T
+    else:
+        nd_delta = np.zeros((n_draws, n), dtype=float)
+
+    # Back to log velocity.
+    delta_log_velocity = (
+        price_delta + nd_delta
+    ) * scales["log_velocity"]["sd"]
+
+    velocity_ratio = np.exp(delta_log_velocity)
+
+    # Wider distribution also creates more listed stores.
+    distribution_ratio = nd_new / nd_old
+
+    total_volume_ratio = velocity_ratio * distribution_ratio[None, :]
+
+    p10 = np.quantile(total_volume_ratio, 0.10, axis=0)
+    median = np.quantile(total_volume_ratio, 0.50, axis=0)
+    p90 = np.quantile(total_volume_ratio, 0.90, axis=0)
+
+    return p10, median, p90
+
 
 def create_price_distribution_scenario(
-    trace: xr.DataTree,
+    trace: Any,
     df: pd.DataFrame,
     spline: SplineTransformer,
     scales: Dict[str, Dict[str, float]],
     price_change: float,
     nd_change: float,
+    nd_change_mode: str = "pp",
+    posterior_cache: Optional[Dict[str, np.ndarray]] = None,
 ) -> pd.DataFrame:
     """
-    Create price and/or distribution change scenario.
-    
-    Parameters
-    ----------
-    trace : xr.DataTree
-        Fitted model trace.
-    df : pd.DataFrame
-        Prepared data (filtered to scenario universe).
-    spline : SplineTransformer
-        Fitted spline for ND effect.
-    scales : dict
-        Standardization scales.
-    price_change : float
-        Relative price change (e.g., 0.05 for +5%).
-    nd_change : float
-        Relative ND change (e.g., 0.10 for +10%).
-        
-    Returns
-    -------
-    pd.DataFrame
-        Scenario results with p10, median, p90 multipliers.
+    Fast scenario function.
+
+    `nd_change` is percentage-point change by default:
+        0.10 means +10 percentage points.
+
+    For backward compatibility, callers can set nd_change_mode='relative'
+    where 0.10 means +10% relative.
     """
-    price_slope_z = _get_posterior_array(trace, "price_slope_z", ("sku",))
-    nd_weights = _get_posterior_array(trace, "nd_weights", ("sku", "nd_basis"))
-    
-    sku_idx = df["sku_idx"].to_numpy()
-    nd_old = df["nd"].to_numpy()
-    nd_new = np.clip(nd_old * (1 + nd_change), 1e-4, 1.0)
-    
-    # Standardized ND
-    nd_old_z = (np.log(nd_old) - scales["log_nd"]["mean"]) / scales["log_nd"]["sd"]
-    nd_new_z = (np.log(nd_new) - scales["log_nd"]["mean"]) / scales["log_nd"]["sd"]
-    
-    # Spline basis difference
-    delta_basis = spline.transform(nd_new_z.reshape(-1, 1)) - spline.transform(nd_old_z.reshape(-1, 1))
-    
-    # ND effect change (on z-scale)
-    nd_delta_z = np.einsum("ok,oks->os", delta_basis, nd_weights[sku_idx])
-    
-    # Price effect change (on z-scale)
-    price_delta_z = price_slope_z[sku_idx] * np.log1p(price_change) / scales["log_relative_price"]["sd"]
-    
-    # Combined effect on log velocity
-    delta_log_velocity = (nd_delta_z + price_delta_z) * scales["log_velocity"]["sd"]
-    
-    # Volume multiplier = velocity ratio * ND ratio
-    velocity_ratio = np.exp(delta_log_velocity)
-    total_volume_ratio = velocity_ratio * (nd_new / nd_old)[:, None]
-    
-    out = df[["month", "retailer", "category", "brand", "sku", "pack_size", 
-              "units", "revenue", "sku_stores", "retailer_stores", "nd", "price_std"]].copy()
+    out = df.copy()
+    nd_old = out["nd"].to_numpy(dtype=float)
+
+    if nd_change_mode == "relative":
+        nd_new = np.clip(nd_old * (1 + nd_change), 1e-4, 1.0)
+    else:
+        nd_new = np.clip(nd_old + nd_change, 1e-4, 1.0)
+
+    p10, median, p90 = _posterior_delta_log_velocity(
+        out,
+        trace,
+        spline,
+        scales,
+        price_change,
+        nd_change,
+        nd_change_mode=nd_change_mode,
+        posterior_cache=posterior_cache,
+    )
+
     out["scenario_price_change"] = price_change
     out["scenario_nd_change"] = nd_change
     out["scenario_nd"] = nd_new
-    out["volume_multiplier_p10"] = np.quantile(total_volume_ratio, 0.10, axis=1)
-    out["volume_multiplier_median"] = np.median(total_volume_ratio, axis=1)
-    out["volume_multiplier_p90"] = np.quantile(total_volume_ratio, 0.90, axis=1)
-    out["expected_units_median"] = out["units"] * out["volume_multiplier_median"]
-    out["expected_revenue_median"] = out["revenue"] * (1 + price_change) * out["volume_multiplier_median"]
-    
+    out["volume_multiplier_p10"] = p10
+    out["volume_multiplier_median"] = median
+    out["volume_multiplier_p90"] = p90
+
+    out["expected_units_p10"] = out["units"].to_numpy() * p10
+    out["expected_units_median"] = out["units"].to_numpy() * median
+    out["expected_units_p90"] = out["units"].to_numpy() * p90
+
+    # Price change affects revenue directly; volume effect is multiplicative.
+    price_factor = 1.0 + price_change
+    out["expected_revenue_p10"] = (
+        out["revenue"].to_numpy() * price_factor * p10
+    )
+    out["expected_revenue_median"] = (
+        out["revenue"].to_numpy() * price_factor * median
+    )
+    out["expected_revenue_p90"] = (
+        out["revenue"].to_numpy() * price_factor * p90
+    )
+
+    # Convenience fields.
+    out["unit_change_pct_median"] = median - 1.0
+    out["revenue_change_pct_median"] = (
+        price_factor * median
+    ) - 1.0
+
     return out
 
 
-def aggregate_scenario(scenario_df: pd.DataFrame, by: List[str]) -> pd.DataFrame:
-    """Aggregate scenario results by specified columns."""
-    agg = scenario_df.groupby(by, as_index=False).agg(
-        baseline_units=("units", "sum"),
-        expected_units_p10=("expected_units_median", lambda x: np.quantile(x, 0.10)),
-        expected_units_median=("expected_units_median", "median"),
-        expected_units_p90=("expected_units_median", lambda x: np.quantile(x, 0.90)),
-        baseline_revenue=("revenue", "sum"),
-        expected_revenue_median=("expected_revenue_median", "sum"),
+# ============================================================================
+# Market share helpers
+# ============================================================================
+
+def calculate_shares(
+    df: pd.DataFrame,
+) -> Dict[str, pd.Series]:
+    """
+    Add / return common share metrics.
+
+    The important principle is that shares use all competitors present in the
+    supplied market frame.
+    """
+    work = df.copy()
+
+    market_revenue = work.groupby(
+        ["month", "category"],
+        observed=True,
+    )["revenue"].transform("sum")
+
+    retailer_revenue = work.groupby(
+        ["month", "retailer", "category"],
+        observed=True,
+    )["revenue"].transform("sum")
+
+    brand_revenue = work.groupby(
+        ["month", "category", "brand"],
+        observed=True,
+    )["revenue"].transform("sum")
+
+    work["market_revenue"] = market_revenue
+    work["retailer_market_revenue"] = retailer_revenue
+    work["brand_revenue"] = brand_revenue
+
+    work["market_revenue_share"] = (
+        work["revenue"] / market_revenue.replace(0, np.nan)
     )
-    agg["volume_change_pct"] = 100 * (agg["expected_units_median"] / agg["baseline_units"] - 1)
-    agg["revenue_change_pct"] = 100 * (agg["expected_revenue_median"] / agg["baseline_revenue"] - 1)
+    work["retailer_revenue_share"] = (
+        work["revenue"] / retailer_revenue.replace(0, np.nan)
+    )
+    work["brand_revenue_share_total"] = (
+        work["brand_revenue"]
+        / market_revenue.replace(0, np.nan)
+    )
+    work["category_revenue_share_total"] = 1.0
+
+    # Return Series aligned to the original frame.
+    return {
+        "market_revenue_share": work["market_revenue_share"],
+        "retailer_revenue_share": work["retailer_revenue_share"],
+        "brand_revenue_share": work["brand_revenue"],
+        "brand_revenue_share_total": work["brand_revenue_share_total"],
+        "category_revenue_share_total": work["category_revenue_share_total"],
+    }
+
+
+def calculate_period_market_share(
+    baseline_df: pd.DataFrame,
+    scenario_df: pd.DataFrame,
+    level: str = "brand",
+) -> pd.DataFrame:
+    """
+    Calculate baseline vs scenario market shares for a selected period.
+
+    Baseline and scenario are normalized independently so that share always sums
+    to 100% across the complete competitive set.
+    """
+    if level == "brand":
+        groups = ["brand"]
+    elif level == "sku":
+        groups = ["brand", "sku"]
+    elif level in {"sku_pack", "pack"}:
+        groups = ["brand", "sku", "pack_size"]
+    else:
+        raise ValueError("level must be 'brand', 'sku', or 'sku_pack'.")
+
+    base = (
+        baseline_df.groupby(groups, observed=True)["revenue"]
+        .sum()
+        .rename("baseline_value")
+        .reset_index()
+    )
+
+    scen = (
+        scenario_df.groupby(groups, observed=True)["expected_revenue_median"]
+        .sum()
+        .rename("scenario_value")
+        .reset_index()
+    )
+
+    out = base.merge(scen, on=groups, how="outer").fillna(0.0)
+
+    base_total = float(out["baseline_value"].sum())
+    scen_total = float(out["scenario_value"].sum())
+
+    out["baseline_share"] = (
+        out["baseline_value"] / base_total
+        if base_total > 0
+        else np.nan
+    )
+    out["scenario_share"] = (
+        out["scenario_value"] / scen_total
+        if scen_total > 0
+        else np.nan
+    )
+    out["share_change_pp"] = (
+        out["scenario_share"] - out["baseline_share"]
+    )
+    out["share_change_pct"] = (
+        out["scenario_share"] / out["baseline_share"].replace(0, np.nan)
+    ) - 1.0
+
+    return out.sort_values(
+        "scenario_share",
+        ascending=False,
+    ).reset_index(drop=True)
+
+
+# ============================================================================
+# Aggregation / compatibility
+# ============================================================================
+
+def aggregate_scenario(
+    scenario_df: pd.DataFrame,
+    by: List[str],
+) -> pd.DataFrame:
+    if by:
+        grouped = scenario_df.groupby(by, observed=True)
+    else:
+        # One synthetic market row.
+        tmp = scenario_df.copy()
+        tmp["_all"] = "Total market"
+        grouped = tmp.groupby(["_all"], observed=True)
+
+    agg = grouped.agg(
+        baseline_units=("units", "sum"),
+        expected_units_p10=("expected_units_p10", "sum"),
+        expected_units_median=("expected_units_median", "sum"),
+        expected_units_p90=("expected_units_p90", "sum"),
+        baseline_revenue=("revenue", "sum"),
+        expected_revenue_p10=("expected_revenue_p10", "sum"),
+        expected_revenue_median=("expected_revenue_median", "sum"),
+        expected_revenue_p90=("expected_revenue_p90", "sum"),
+    ).reset_index()
+
+    base_u = agg["baseline_units"].replace(0, np.nan)
+    base_r = agg["baseline_revenue"].replace(0, np.nan)
+
+    agg["volume_change_pct"] = (
+        agg["expected_units_median"] / base_u
+    ) - 1.0
+    agg["revenue_change_pct"] = (
+        agg["expected_revenue_median"] / base_r
+    ) - 1.0
+
+    if not by:
+        agg = agg.rename(columns={"_all": "total_market"})
+
     return agg
 
 
+# ============================================================================
+# Posterior predictive diagnostics (opt-in)
+# ============================================================================
 
-
-
-# ============================================================
-# Distribution-Velocity Classification
-# ============================================================
-
-def classify_distribution_velocity(df: pd.DataFrame, benchmark_level: str = "retailer_category") -> pd.DataFrame:
+def get_posterior_predictive_check(
+    trace: Any,
+    df: pd.DataFrame,
+    max_points: int = 3000,
+) -> pd.DataFrame:
     """
-    Classify SKUs into distribution-velocity quadrants.
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Prepared data with nd, velocity_std, brand, pack_size.
-    benchmark_level : str
-        Level for velocity benchmark: 'retailer_category', 'category', or 'total'.
-        
-    Returns
-    -------
-    pd.DataFrame
-        Data with relative_velocity and quadrant classification.
+    Generate a compact PPC diagnostic on demand.
+
+    This is deliberately NOT part of fit_model() by default.
     """
-    df = df.copy()
-    
-    if benchmark_level == "retailer_category":
-        bench = df.groupby(["retailer", "category", "month"])["velocity_std"].transform("median")
-    elif benchmark_level == "category":
-        bench = df.groupby(["category", "month"])["velocity_std"].transform("median")
+    var_name = _find_posterior_variable(
+        trace,
+        ["log_velocity_z_obs"],
+    )
+    if var_name is None:
+        return pd.DataFrame()
+
+    posterior = _posterior_group(trace)
+
+    try:
+        pred = _posterior_array(trace, var_name, ("obs",))
+    except Exception:
+        return pd.DataFrame()
+
+    pred = pred.reshape(-1, pred.shape[-1])
+
+    if pred.shape[1] != len(df):
+        return pd.DataFrame()
+
+    observed = df["log_velocity_z"].to_numpy(dtype=float)
+    pred_mean = np.mean(pred, axis=0)
+
+    if len(df) > max_points:
+        idx = np.linspace(0, len(df) - 1, max_points).round().astype(int)
     else:
-        bench = df.groupby("month")["velocity_std"].transform("median")
-    
-    df["relative_velocity"] = df["velocity_std"] / bench
-    
-    # Medians for quadrant boundaries
-    nd_median = df["nd"].median()
-    rv_median = df["relative_velocity"].median()
-    
-    def classify(row):
-        if row["nd"] < nd_median and row["relative_velocity"] > rv_median:
-            return "Expansion candidate"
-        elif row["nd"] >= nd_median and row["relative_velocity"] > rv_median:
-            return "Scale efficiently"
-        elif row["nd"] < nd_median and row["relative_velocity"] <= rv_median:
-            return "Diagnose"
-        else:
-            return "Rationalise/review"
-    
-    df["dv_quadrant"] = df.apply(classify, axis=1)
-    return df
+        idx = np.arange(len(df))
+
+    result = pd.DataFrame(
+        {
+            "observed_z": observed[idx],
+            "predicted_z": pred_mean[idx],
+        }
+    )
+    result["residual_z"] = (
+        result["observed_z"] - result["predicted_z"]
+    )
+    return result
+
+
+# ============================================================================
+# Compatibility aliases / small analytical summaries
+# ============================================================================
+
+def create_market_summary(df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        df.groupby("month", observed=True)
+        .agg(
+            revenue=("revenue", "sum"),
+            units=("units", "sum"),
+            standard_volume=("standard_volume", "sum"),
+            price_per_standard_unit=("price_std", "mean"),
+            nd=("nd", "mean"),
+            velocity_std=("velocity_std", "mean"),
+        )
+        .reset_index()
+        .sort_values("month")
+    )
+
+
+def create_category_summary(df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        df.groupby(["month", "category"], observed=True)
+        .agg(
+            revenue=("revenue", "sum"),
+            units=("units", "sum"),
+            standard_volume=("standard_volume", "sum"),
+            price_per_standard_unit=("price_std", "mean"),
+            nd=("nd", "mean"),
+            velocity_std=("velocity_std", "mean"),
+        )
+        .reset_index()
+        .sort_values(["month", "category"])
+    )
+
+
+def create_retailer_summary(df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        df.groupby(["month", "retailer"], observed=True)
+        .agg(
+            revenue=("revenue", "sum"),
+            units=("units", "sum"),
+            standard_volume=("standard_volume", "sum"),
+            price_per_standard_unit=("price_std", "mean"),
+            nd=("nd", "mean"),
+            velocity_std=("velocity_std", "mean"),
+        )
+        .reset_index()
+        .sort_values(["month", "retailer"])
+    )
+
+
+def create_brand_summary(df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        df.groupby(["month", "brand"], observed=True)
+        .agg(
+            revenue=("revenue", "sum"),
+            units=("units", "sum"),
+            standard_volume=("standard_volume", "sum"),
+            price_per_standard_unit=("price_std", "mean"),
+            nd=("nd", "mean"),
+            velocity_std=("velocity_std", "mean"),
+        )
+        .reset_index()
+        .sort_values(["month", "brand"])
+    )
+
+
+def create_sku_summary(df: pd.DataFrame) -> pd.DataFrame:
+    grouped = (
+        df.groupby(
+            ["category", "retailer", "brand", "sku", "pack_size"],
+            observed=True,
+        )
+        .agg(
+            units=("units", "sum"),
+            revenue=("revenue", "sum"),
+            standard_volume=("standard_volume", "sum"),
+            price_per_standard_unit=("price_std", "mean"),
+            competitor_price_std=("competitor_price_std", "mean"),
+            relative_price=("relative_price", "mean"),
+            nd=("nd", "mean"),
+            velocity_std=("velocity_std", "mean"),
+        )
+        .reset_index()
+    )
+
+    total_units = grouped["units"].sum()
+    total_revenue = grouped["revenue"].sum()
+
+    grouped["unit_share"] = (
+        grouped["units"] / total_units if total_units > 0 else np.nan
+    )
+    grouped["revenue_share"] = (
+        grouped["revenue"] / total_revenue if total_revenue > 0 else np.nan
+    )
+    return grouped
+
+
+def classify_distribution_velocity(
+    df: pd.DataFrame,
+    benchmark_level: str = "retailer_category",
+) -> pd.DataFrame:
+    out = df.copy()
+
+    if benchmark_level == "retailer_category":
+        grp = ["retailer", "category"]
+    else:
+        grp = ["category"]
+
+    benchmark = (
+        out.groupby(grp, observed=True)["velocity_std"]
+        .transform("mean")
+    )
+    out["relative_velocity"] = (
+        out["velocity_std"] / benchmark.replace(0, np.nan)
+    )
+    return out
 
 
 def get_expansion_candidates(df: pd.DataFrame) -> pd.DataFrame:
-    """Get SKUs classified as expansion candidates (low ND, high velocity)."""
     classified = classify_distribution_velocity(df)
-    return classified[classified["dv_quadrant"] == "Expansion candidate"].copy()
+    return classified[
+        (classified["nd"] < classified.groupby(
+            ["retailer", "category"],
+            observed=True,
+        )["nd"].transform("median"))
+        & (classified["relative_velocity"] > 1.0)
+    ].copy()
 
 
-# ============================================================
-# Utility: Convert trace to netcdf-compatible format
-# ============================================================
+def create_growth_decomposition(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    months = sorted(df["month"].unique())
+    if len(months) < 2:
+        return pd.DataFrame()
 
-def save_trace(trace: xr.DataTree, path: Path) -> None:
-    """Save trace using native xarray/netcdf method."""
-    trace.to_netcdf(path)
+    start_month, end_month = months[0], months[-1]
+    return _growth_decomposition(df, start_month, end_month)
 
 
-def load_trace(path: Path) -> xr.DataTree:
-    """Load trace from netcdf."""
-    return xr.open_datatree(path)
+def _growth_decomposition(
+    df: pd.DataFrame,
+    start_month: pd.Timestamp,
+    end_month: pd.Timestamp,
+) -> pd.DataFrame:
+    start = df[df["month"] == start_month].set_index(
+        ["retailer", "sku"]
+    )
+    end = df[df["month"] == end_month].set_index(
+        ["retailer", "sku"]
+    )
+    common = start.index.intersection(end.index)
+    if len(common) == 0:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(index=common).reset_index()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out["network"] = (
+            np.log(
+                end.loc[common, "retailer_stores"].to_numpy()
+                / start.loc[common, "retailer_stores"].to_numpy()
+            )
+            * 100
+        )
+        out["distribution"] = (
+            np.log(
+                end.loc[common, "nd"].to_numpy()
+                / start.loc[common, "nd"].to_numpy()
+            )
+            * 100
+        )
+        out["velocity"] = (
+            np.log(
+                end.loc[common, "velocity_std"].to_numpy()
+                / start.loc[common, "velocity_std"].to_numpy()
+            )
+            * 100
+        )
+        out["total_standard_volume"] = (
+            np.log(
+                end.loc[common, "standard_volume"].to_numpy()
+                / start.loc[common, "standard_volume"].to_numpy()
+            )
+            * 100
+        )
+
+    out["label"] = (
+        out["retailer"].astype(str)
+        + " | "
+        + out["sku"].astype(str)
+    )
+    return out
+
+
+# ============================================================================
+# Optional helpers for the improved UI
+# ============================================================================
+
+def prepare_market(
+    raw: pd.DataFrame,
+    n_knots: int = DEFAULT_N_SPLINE_KNOTS,
+) -> PreparedData:
+    validation = validate_input_data(raw)
+    if not validation.is_valid:
+        raise ValueError(
+            "Input data is not valid: "
+            + "; ".join(validation.warnings)
+        )
+    prepared, scales = prepare_data(raw)
+    indexed, meta = add_indices(prepared)
+    spline, basis = fit_spline(
+        indexed,
+        n_knots=n_knots,
+        degree=DEFAULT_SPLINE_DEGREE,
+    )
+    return PreparedData(
+        df=indexed,
+        scales=scales,
+        meta=meta,
+        spline=spline,
+        nd_basis=basis,
+    )
+
+
+def run_fast_share_scenario(
+    trace: Any,
+    df: pd.DataFrame,
+    spline: SplineTransformer,
+    scales: Dict[str, Dict[str, float]],
+    target_mask: np.ndarray,
+    price_change: float = 0.0,
+    nd_change: float = 0.0,
+    nd_change_mode: str = "pp",
+    level: str = "brand",
+    posterior_cache: Optional[Dict[str, np.ndarray]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Recommended high-level scenario API.
+
+    Keeps every competitor in the denominator and changes only target rows.
+    """
+    work = df.copy()
+    work["_target"] = np.asarray(target_mask, dtype=bool)
+
+    baseline = work.drop(columns=["_target"])
+
+    scenario_target = work.loc[work["_target"]].drop(columns=["_target"])
+    scenario_other = work.loc[~work["_target"]].drop(columns=["_target"])
+
+    if len(scenario_target):
+        changed = create_price_distribution_scenario(
+            trace,
+            scenario_target,
+            spline,
+            scales,
+            price_change,
+            nd_change,
+            nd_change_mode=nd_change_mode,
+            posterior_cache=posterior_cache,
+        )
+    else:
+        changed = scenario_target.copy()
+        changed["expected_units_p10"] = changed["units"]
+        changed["expected_units_median"] = changed["units"]
+        changed["expected_units_p90"] = changed["units"]
+        changed["expected_revenue_p10"] = changed["revenue"]
+        changed["expected_revenue_median"] = changed["revenue"]
+        changed["expected_revenue_p90"] = changed["revenue"]
+
+    unchanged = scenario_other.copy()
+    unchanged["scenario_price_change"] = 0.0
+    unchanged["scenario_nd_change"] = 0.0
+    unchanged["scenario_nd"] = unchanged["nd"]
+    for q in ["p10", "median", "p90"]:
+        unchanged[f"volume_multiplier_{q}"] = 1.0
+        unchanged[f"expected_units_{q}"] = unchanged["units"]
+        unchanged[f"expected_revenue_{q}"] = unchanged["revenue"]
+
+    scenario = pd.concat(
+        [changed, unchanged],
+        ignore_index=True,
+    )
+
+    shares = calculate_period_market_share(
+        baseline,
+        scenario,
+        level=level,
+    )
+    return scenario, shares
