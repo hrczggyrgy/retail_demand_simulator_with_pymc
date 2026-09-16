@@ -2949,3 +2949,179 @@ def build_nd_velocity_quadrant_data(
     Build data for ND/Velocity quadrant chart.
     """
     return compute_distribution_opportunity(df)
+
+
+def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Central feature engineering function - adds all derived retail analytics columns.
+    
+    Creates: unit_price, price_per_size_unit, nd, velocity, log_velocity,
+    category_units, brand_units, shares, price indices, pack_group, month_num, lag features.
+    Also adds data_quality_status flags.
+    
+    Run once after data loading, before model fitting and all descriptive tabs.
+    """
+    df = df.copy()
+    
+    # --- Data quality flags ---
+    valid_units = df["units"] > 0
+    valid_revenue = df["revenue"] > 0
+    valid_pack_size = df["pack_size"] > 0
+    valid_store_counts = (
+        (df["sku_stores"] > 0)
+        & (df["retailer_stores"] > 0)
+        & (df["sku_stores"] <= df["retailer_stores"])
+    )
+    
+    conditions = [
+        ~valid_units,
+        ~valid_revenue,
+        ~valid_pack_size,
+        ~valid_store_counts,
+        df["category"].isna() | df["brand"].isna() | df["sku"].isna() | df["retailer"].isna(),
+    ]
+    choices = [
+        "zero_or_negative_units",
+        "zero_or_negative_revenue",
+        "invalid_pack_size",
+        "invalid_store_counts",
+        "missing_hierarchy",
+    ]
+    df["data_quality_status"] = np.select(conditions, choices, default="valid")
+    
+    # --- Core derived columns ---
+    df["unit_price"] = np.where(
+        df["units"] > 0,
+        df["revenue"] / df["units"],
+        np.nan
+    )
+    
+    df["price_per_size_unit"] = np.where(
+        df["pack_size"] > 0,
+        df["unit_price"] / df["pack_size"],
+        np.nan
+    )
+    
+    df["nd"] = np.where(
+        df["retailer_stores"] > 0,
+        df["sku_stores"] / df["retailer_stores"],
+        np.nan
+    )
+    
+    df["velocity"] = np.where(
+        df["sku_stores"] > 0,
+        df["units"] / df["sku_stores"],
+        np.nan
+    )
+    
+    df["velocity_std"] = df["velocity"]  # alias for model compatibility
+    df["log_velocity"] = np.log1p(df["velocity"])
+    
+    # --- Market context columns ---
+    # Category units (total demand per month × retailer × category)
+    cat_units = df.groupby(["month", "retailer", "category"])["units"].transform("sum")
+    df["category_units"] = cat_units
+    
+    # Brand units (total demand per month × retailer × category × brand)
+    brand_units = df.groupby(["month", "retailer", "category", "brand"])["units"].transform("sum")
+    df["brand_units"] = brand_units
+    
+    # Shares
+    df["brand_share"] = np.where(
+        df["category_units"] > 0,
+        df["brand_units"] / df["category_units"],
+        np.nan
+    )
+    
+    df["sku_share_of_brand"] = np.where(
+        df["brand_units"] > 0,
+        df["units"] / df["brand_units"],
+        np.nan
+    )
+    
+    df["sku_share_of_category"] = np.where(
+        df["category_units"] > 0,
+        df["units"] / df["category_units"],
+        np.nan
+    )
+    
+    # --- Price indices ---
+    # Category price median
+    cat_price_median = df.groupby(["month", "retailer", "category"])["unit_price"].transform("median")
+    df["category_price_median"] = cat_price_median
+    
+    # Relative price index (vs category median)
+    df["relative_price_index"] = np.where(
+        df["category_price_median"] > 0,
+        df["unit_price"] / df["category_price_median"],
+        np.nan
+    )
+    
+    # Own brand price index (weighted avg of other own-brand SKUs)
+    def weighted_price_index(group, exclude_sku=None):
+        if exclude_sku is not None:
+            mask = group["sku"] != exclude_sku
+            group = group[mask]
+        if len(group) == 0:
+            return np.nan
+        return np.average(group["unit_price"], weights=group["units"])
+    
+    own_brand_price_idx = df.groupby(["month", "retailer", "category", "brand"]).apply(
+        lambda g: pd.Series({
+            sku: weighted_price_index(g, sku) for sku in g["sku"]
+        })
+    ).reset_index()
+    own_brand_price_idx = own_brand_price_idx.rename(columns={0: "own_brand_price_index"})
+    own_brand_price_idx = own_brand_price_idx.melt(
+        id_vars=["month", "retailer", "category", "brand"],
+        var_name="sku", value_name="own_brand_price_index"
+    )
+    df = df.merge(own_brand_price_idx, on=["month", "retailer", "category", "brand", "sku"], how="left")
+    
+    # Competitor price index (weighted avg of rival brands)
+    def competitor_price_index(group):
+        brands = group["brand"].unique()
+        if len(brands) <= 1:
+            return pd.Series(index=group.index, dtype=float)
+        results = {}
+        for brand in brands:
+            others = group[group["brand"] != brand]
+            if len(others) == 0:
+                results.update({sku: np.nan for sku in group[group["brand"] == brand]["sku"]})
+            else:
+                idx = np.average(others["unit_price"], weights=others["units"])
+                results.update({sku: idx for sku in group[group["brand"] == brand]["sku"]})
+        return pd.Series(results)
+    
+    comp_price_idx = df.groupby(["month", "retailer", "category"]).apply(competitor_price_index).reset_index()
+    comp_price_idx = comp_price_idx.melt(
+        id_vars=["month", "retailer", "category"],
+        var_name="sku", value_name="competitor_price_index"
+    )
+    df = df.merge(comp_price_idx, on=["month", "retailer", "category", "sku"], how="left")
+    
+    # --- Pack group ---
+    df["pack_group"] = make_pack_group(df["pack_size"])
+    
+    # --- Month number ---
+    df["month_num"] = df["month"].dt.month
+    
+    # --- Lag features ---
+    df = df.sort_values(["retailer", "category", "brand", "sku", "month"])
+    df["lag_units"] = df.groupby(["retailer", "category", "brand", "sku"])["units"].shift(1)
+    df["lag_share"] = df.groupby(["retailer", "category", "brand", "sku"])["sku_share_of_category"].shift(1)
+    df["lag_price"] = df.groupby(["retailer", "category", "brand", "sku"])["unit_price"].shift(1)
+    
+    # --- Extreme price flag ---
+    valid_price = df["unit_price"].replace([np.inf, -np.inf], np.nan).dropna()
+    if len(valid_price) > 0:
+        q1, q3 = valid_price.quantile([0.25, 0.75])
+        iqr = q3 - q1
+        lower = q1 - 3 * iqr
+        upper = q3 + 3 * iqr
+        df["extreme_price"] = (df["unit_price"] < lower) | (df["unit_price"] > upper)
+        df.loc[df["extreme_price"], "data_quality_status"] = "extreme_price"
+    else:
+        df["extreme_price"] = False
+    
+    return df
