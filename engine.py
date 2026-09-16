@@ -1025,6 +1025,240 @@ def get_posterior_predictive_check(
     return result
 
 
+# ============================================================================
+# ArviZ plotting helpers (compatible with ArviZ >= 0.20)
+# ============================================================================
+
+def make_trace_figure(
+    idata,
+    var_names: Optional[List[str]] = None,
+    max_skus: int = 8,
+):
+    """
+    Return an ArviZ trace plot as a Matplotlib figure.
+
+    Select a limited number of SKU-level parameters; plotting every SKU
+    can create an unreadable and slow dashboard.
+    """
+    import matplotlib.pyplot as plt
+    import arviz_plots as azp
+    import arviz_base as azb
+
+    # Increase max subplots limit
+    azb.rcParams["plot.max_subplots"] = 1000
+
+    if var_names is None:
+        var_names = [
+            "alpha",
+            "sigma_entity",
+            "sigma_month",
+            "sigma_price_sku",
+            "sigma_nd",
+            "sigma",
+            "price_mean_brand_pack",
+            "price_slope_z",
+        ]
+
+    available = [name for name in var_names if name in idata.posterior]
+
+    coords = {}
+    if "price_slope_z" in available and "sku" in idata.posterior.coords:
+        sku_values = idata.posterior.coords["sku"].values[:max_skus]
+        coords["sku"] = sku_values
+    if "price_mean_brand_pack" in available:
+        # Limit brand/pack combinations to avoid too many subplots
+        coords["brand"] = idata.posterior.coords["brand"].values[:3]
+        coords["pack_group"] = idata.posterior.coords["pack_group"].values[:2]
+
+    pc = azp.plot_trace(
+        idata,
+        var_names=available,
+        coords=coords or None,
+        backend="matplotlib",
+    )
+
+    fig = pc.viz["figure"].item()
+    fig.tight_layout()
+    return fig
+
+
+def make_rank_figure(
+    idata,
+    var_names: Optional[List[str]] = None,
+    max_skus: int = 8,
+):
+    import matplotlib.pyplot as plt
+    import arviz_plots as azp
+
+    if var_names is None:
+        var_names = [
+            "alpha",
+            "sigma_entity",
+            "sigma_month",
+            "sigma_price_sku",
+            "sigma_nd",
+        ]
+
+        if "price_slope_z" in idata.posterior:
+            var_names.append("price_slope_z")
+
+    available = [name for name in var_names if name in idata.posterior]
+
+    coords = {}
+    if "price_slope_z" in available and "sku" in idata.posterior.coords:
+        coords["sku"] = idata.posterior.coords["sku"].values[:max_skus]
+
+    pc = azp.plot_rank(
+        idata,
+        var_names=available,
+        coords=coords or None,
+        backend="matplotlib",
+        visuals={"ecdf_lines": {}, "credible_interval": {}},
+    )
+
+    fig = pc.viz["figure"].item()
+    fig.tight_layout()
+    return fig
+
+
+def make_energy_figure(idata):
+    import matplotlib.pyplot as plt
+    import arviz_plots as azp
+
+    pc = azp.plot_energy(
+        idata,
+        backend="matplotlib",
+    )
+
+    fig = pc.viz["figure"].item()
+    fig.tight_layout()
+    return fig
+
+
+def make_ppc_figure(
+    idata,
+    observed_var: str = "log_velocity_z_obs",
+):
+    """
+    Compare observed standardized log velocity with posterior predictions.
+    """
+    import matplotlib.pyplot as plt
+    import arviz_plots as azp
+
+    if observed_var not in idata.observed_data:
+        raise KeyError(
+            f"'{observed_var}' is not available in idata.observed_data. "
+            "Check the observed variable name in the PyMC model."
+        )
+
+    pc = azp.plot_ppc_dist(
+        idata,
+        var_names=[observed_var],
+        group="posterior_predictive",
+        backend="matplotlib",
+    )
+
+    fig = pc.viz["figure"].item()
+    fig.tight_layout()
+    return fig
+
+
+def make_elasticity_forest_figure(
+    idata,
+    selected_skus: List[str],
+    hdi_prob: float = 0.90,
+):
+    """
+    Compare posterior standardized price slopes for selected SKUs.
+
+    If price is standardized in the model, label this clearly as a
+    standardized coefficient. Use your existing elasticity extraction
+    function separately for commercial raw-scale elasticities.
+    """
+    import matplotlib.pyplot as plt
+    import arviz_plots as azp
+
+    if "price_slope_z" not in idata.posterior:
+        raise KeyError("The posterior has no 'price_slope_z' variable.")
+
+    pc = azp.plot_forest(
+        idata,
+        var_names=["price_slope_z"],
+        coords={"sku": selected_skus},
+        backend="matplotlib",
+        ci_probs=(0.05, hdi_prob),
+        visuals={"trunk": {}, "twig": {}, "point_estimate": {}, "labels": {}},
+    )
+
+    fig = pc.viz["figure"].item()
+    fig.tight_layout()
+    return fig
+
+
+def build_nd_response_curve(
+    idata,
+    spline,
+    sku_index: int,
+    nd_grid: Optional[np.ndarray] = None,
+    n_draws: int = 300,
+):
+    """
+    Return posterior p10 / median / p90 volume effects across ND values.
+
+    Output is relative to the first ND grid value.
+    Handles both shared and SKU-specific ND curves.
+    """
+    if nd_grid is None:
+        nd_grid = np.linspace(0.05, 0.95, 50)
+
+    nd_log = np.log(np.clip(nd_grid, 1e-4, 1.0))
+    basis = spline.transform(nd_log.reshape(-1, 1))
+
+    nd_coef = idata.posterior["nd_coef"].stack(sample=("chain", "draw"))
+
+    if "sku" in nd_coef.dims:
+        # SKU-specific curve
+        nd_coef = nd_coef.isel(sku=sku_index).values
+    else:
+        # Shared curve
+        nd_coef = nd_coef.values
+
+    rng = np.random.default_rng(42)
+    draw_idx = rng.choice(
+        nd_coef.shape[-1],
+        size=min(n_draws, nd_coef.shape[-1]),
+        replace=False,
+    )
+
+    coef_draws = nd_coef[:, draw_idx].T
+    log_effect = coef_draws @ basis.T
+
+    # Relative response against first grid point
+    log_delta = log_effect - log_effect[:, [0]]
+    multiplier = np.exp(log_delta)
+
+    return pd.DataFrame(
+        {
+            "nd": nd_grid,
+            "nd_p10": np.quantile(multiplier, 0.10, axis=0),
+            "nd_median": np.quantile(multiplier, 0.50, axis=0),
+            "nd_p90": np.quantile(multiplier, 0.90, axis=0),
+        }
+    )
+
+
+def add_posterior_predictive(model, idata, random_seed: int = 42):
+    with model:
+        ppc = pm.sample_posterior_predictive(
+            idata,
+            var_names=["log_velocity_z_obs"],
+            random_seed=random_seed,
+            progressbar=False,
+            extend_inferencedata=True,
+        )
+    return ppc
+
+
 def extract_elasticities(
     trace: Any,
     meta: Dict[str, Any],
@@ -1068,13 +1302,26 @@ def extract_elasticities(
 # ============================================================================
 
 def extract_scenario_posterior(
-    idata: az.InferenceData,
+    idata,
     max_draws: int = DEFAULT_SCENARIO_DRAWS,
     random_seed: int = 42,
 ) -> dict:
     rng = np.random.default_rng(random_seed)
 
-    posterior = idata.posterior.stack(sample=("chain", "draw"))
+    # Use arviz_base.extract to get posterior with stacked sample dimension
+    try:
+        import arviz_base as azb
+        posterior = azb.extract(idata, group="posterior", combined=True, random_seed=random_seed)
+    except ImportError:
+        # Fallback for older ArviZ
+        if hasattr(idata, "posterior"):
+            posterior = idata.posterior
+        elif hasattr(idata, "groups"):
+            posterior = idata["posterior"]
+        else:
+            raise ValueError("Cannot extract posterior from object")
+        posterior = posterior.stack(sample=("chain", "draw"))
+
     n_all = posterior.sizes["sample"]
 
     chosen = np.sort(

@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import matplotlib.pyplot as plt
 
 import demo_data
 import engine
@@ -565,7 +566,11 @@ def fit_model_if_needed() -> None:
 
         idata = engine.fit_model(model, config)
 
+        # Add posterior predictive samples for PPC plots
+        idata = engine.add_posterior_predictive(model, idata)
+
     st.session_state.model_result = idata
+    st.session_state.fitted_model = model
     st.session_state.model_settings = {"config": config}
     st.session_state.model_diagnostics = engine.get_model_diagnostics(idata)
     st.session_state.elasticities = engine.extract_elasticities(
@@ -832,66 +837,63 @@ def main() -> None:
 
         st.divider()
 
-        if st.button("Run posterior predictive check", type="secondary"):
-            with st.spinner("Running posterior predictive check..."):
-                ppc_df = engine.get_posterior_predictive_check(
-                    engine.build_pymc_model_v2(df, meta, spline.transform(df["log_nd_z"].to_numpy().reshape(-1, 1)), _model_config_from_mode(st.session_state.get("model_mode", "Default (4 chains)"))),
-                    idata,
-                    df,
-                )
-            st.session_state.ppc_result = ppc_df
+        # Parameter group selector for trace/rank plots
+        param_group = st.selectbox(
+            "Diagnostic parameter group",
+            [
+                "Global parameters",
+                "Price elasticities",
+                "Distribution parameters",
+            ],
+            key="diag_param_group",
+        )
 
-        if "ppc_result" in st.session_state:
-            ppc_df = st.session_state.ppc_result
-            st.subheader("Posterior predictive check")
+        param_groups = {
+            "Global parameters": [
+                "alpha",
+                "sigma_entity",
+                "sigma_month",
+                "sigma_price_sku",
+                "sigma_nd",
+                "sigma",
+            ],
+            "Price elasticities": ["price_slope_z"],
+            "Distribution parameters": ["nd_coef"],
+        }
 
-            col1, col2 = st.columns(2)
-            with col1:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=ppc_df["log_velocity_z"],
-                    y=ppc_df["predicted_z_median"],
-                    mode="markers",
-                    marker=dict(size=4, opacity=0.5),
-                    name="Observed vs Predicted",
-                ))
-                # 45-degree line
-                min_val = min(ppc_df["log_velocity_z"].min(), ppc_df["predicted_z_median"].min())
-                max_val = max(ppc_df["log_velocity_z"].max(), ppc_df["predicted_z_median"].max())
-                fig.add_trace(go.Scatter(
-                    x=[min_val, max_val],
-                    y=[min_val, max_val],
-                    mode="lines",
-                    line=dict(color="red", dash="dash"),
-                    name="Perfect fit",
-                ))
-                fig.update_layout(
-                    xaxis_title="Observed log velocity (z)",
-                    yaxis_title="Predicted log velocity (z)",
-                    height=400,
-                )
-                st.plotly_chart(fig, use_container_width=True)
+        selected_var_names = param_groups[param_group]
 
-            with col2:
-                coverage = ppc_df["inside_p10_p90"].mean()
-                rmse = np.sqrt((ppc_df["residual_z"] ** 2).mean())
-                mae = np.abs(ppc_df["residual_z"]).mean()
-                st.metric("80% CI coverage", f"{coverage:.1%}")
-                st.metric("RMSE (z)", f"{rmse:.3f}")
-                st.metric("MAE (z)", f"{mae:.3f}")
+        with st.expander("Trace plots", expanded=(param_group == "Global parameters")):
+            try:
+                fig = engine.make_trace_figure(idata, var_names=selected_var_names)
+                st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
+            except Exception as e:
+                st.error(f"Trace plot failed: {e}")
 
-                fig2 = go.Figure()
-                fig2.add_trace(go.Histogram(
-                    x=ppc_df["residual_z"],
-                    nbinsx=30,
-                    name="Residuals",
-                ))
-                fig2.update_layout(
-                    xaxis_title="Residual (z)",
-                    yaxis_title="Count",
-                    height=300,
-                )
-                st.plotly_chart(fig2, use_container_width=True)
+        with st.expander("Rank plots", expanded=False):
+            try:
+                fig = engine.make_rank_figure(idata, var_names=selected_var_names)
+                st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
+            except Exception as e:
+                st.error(f"Rank plot failed: {e}")
+
+        with st.expander("Sampler energy", expanded=False):
+            try:
+                fig = engine.make_energy_figure(idata)
+                st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
+            except Exception as e:
+                st.error(f"Energy plot failed: {e}")
+
+        with st.expander("Posterior predictive check", expanded=True):
+            try:
+                fig = engine.make_ppc_figure(idata)
+                st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
+            except Exception as e:
+                st.error(f"PPC plot failed: {e}. Run posterior predictive sampling first.")
 
     with tab_explorer:
         if elasticity_df is not None and posterior_cache is not None:
@@ -912,10 +914,49 @@ def main() -> None:
                     "sku",
                 ].dropna().unique()
             )
-            selected_sku = sku_col.selectbox("SKU", skus_in_brand, key="explorer_sku")
 
-            # Elasticity table
-            st.subheader("Price elasticity")
+            # Elasticity forest plot (ArviZ)
+            st.subheader("Price elasticity (posterior forest plot)")
+
+            brand_skus = [
+                s for s in skus_in_brand if s in idata.posterior.coords.get("sku", {}).values
+            ]
+
+            if brand_skus:
+                selected_skus_forest = st.multiselect(
+                    "SKUs to compare",
+                    options=brand_skus,
+                    default=brand_skus[:min(8, len(brand_skus))],
+                    key="explorer_skus_forest",
+                )
+
+                if selected_skus_forest:
+                    try:
+                        fig = engine.make_elasticity_forest_figure(
+                            idata,
+                            selected_skus=selected_skus_forest,
+                            hdi_prob=0.90,
+                        )
+                        st.pyplot(fig, clear_figure=True)
+                        plt.close(fig)
+                    except Exception as e:
+                        st.error(f"Elasticity forest plot failed: {e}")
+
+                st.caption(
+                    "Intervals show 90% posterior credible intervals. "
+                    "More negative own-price elasticities imply greater expected "
+                    "volume sensitivity to relative price changes."
+                )
+            else:
+                st.info("No SKUs available for forest plot in selected brand.")
+
+            st.divider()
+
+            # SKU-level elasticity table
+            st.subheader("Price elasticity (raw scale)")
+            sku_options = skus_in_brand
+            selected_sku = sku_col.selectbox("SKU", sku_options, key="explorer_sku")
+
             sku_elasticity = elasticity_df[elasticity_df["sku"] == selected_sku]
             if not sku_elasticity.empty:
                 st.dataframe(
@@ -930,45 +971,51 @@ def main() -> None:
                     hide_index=True,
                 )
 
-            # ND response curve
+            # ND response curve (using engine's build_nd_response_curve)
             st.divider()
             st.subheader("Distribution response curve")
 
             sku_index = meta["sku_levels"].tolist().index(selected_sku)
-            nd_curve = engine.get_nd_response_curve(
-                posterior_cache,
-                sku_index=sku_index,
-                spline=spline,
-                scales=scales,
-            )
 
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=nd_curve["nd"],
-                y=nd_curve["velocity_multiplier_median"],
-                mode="lines",
-                name="Median velocity multiplier",
-                line=dict(width=3),
-            ))
-            fig.add_trace(go.Scatter(
-                x=np.concatenate([nd_curve["nd"], nd_curve["nd"][::-1]]),
-                y=np.concatenate([
-                    nd_curve["velocity_multiplier_p90"],
-                    nd_curve["velocity_multiplier_p10"][::-1],
-                ]),
-                fill="toself",
-                fillcolor="rgba(31,119,180,0.15)",
-                line=dict(width=0),
-                name="80% posterior interval",
-            ))
-            fig.add_vline(x=0.5, line_dash="dash", line_color="gray", annotation_text="50% ND (ref)")
-            fig.update_layout(
-                xaxis_title="Numeric distribution",
-                yaxis_title="Velocity multiplier (vs 50% ND)",
-                height=450,
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            try:
+                nd_curve = engine.build_nd_response_curve(idata, spline, sku_index=sku_index)
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=nd_curve["nd"],
+                    y=nd_curve["nd_p90"],
+                    mode="lines",
+                    line={"width": 0},
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
+                fig.add_trace(go.Scatter(
+                    x=nd_curve["nd"],
+                    y=nd_curve["nd_p10"],
+                    mode="lines",
+                    line={"width": 0},
+                    fill="tonexty",
+                    fillcolor="rgba(30, 136, 229, 0.18)",
+                    name="80% credible interval",
+                ))
+                fig.add_trace(go.Scatter(
+                    x=nd_curve["nd"],
+                    y=nd_curve["nd_median"],
+                    mode="lines",
+                    line={"color": "#1E88E5", "width": 3},
+                    name="Median expected multiplier",
+                ))
+                fig.add_vline(x=0.5, line_dash="dash", line_color="gray", annotation_text="50% ND (ref)")
+                fig.update_layout(
+                    title=f"Distribution response: {selected_sku}",
+                    xaxis_title="Numeric distribution",
+                    yaxis_title="Volume multiplier vs minimum ND",
+                    template="plotly_white",
+                    height=450,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.error(f"ND response curve failed: {e}")
 
             st.caption(
                 "Shows how estimated velocity changes with distribution, holding price constant. "
