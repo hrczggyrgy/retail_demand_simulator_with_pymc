@@ -52,9 +52,9 @@ NUMERIC_COLUMNS = [
 
 KEY_COLUMNS = ["month", "retailer", "category", "brand", "sku"]
 
-DEFAULT_DRAWS = 400
-DEFAULT_TUNE = 400
-DEFAULT_CHAINS = 2
+DEFAULT_DRAWS = 800
+DEFAULT_TUNE = 800
+DEFAULT_CHAINS = 1
 DEFAULT_TARGET_ACCEPT = 0.90
 DEFAULT_N_SPLINE_KNOTS = 4
 DEFAULT_SPLINE_DEGREE = 3
@@ -670,6 +670,7 @@ def fit_model(
             random_seed=random_seed,
             return_inferencedata=True,
             progressbar=False,
+            cores=1,
             idata_kwargs={"log_likelihood": False},
         )
 
