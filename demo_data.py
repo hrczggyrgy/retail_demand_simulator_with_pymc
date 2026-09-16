@@ -108,6 +108,13 @@ def generate_demo_data(months_count: int = 24, seed: int = 42) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df = df.dropna()
     df = df[(df["units"] > 0) & (df["revenue"] > 0) & (df["sku_stores"] <= df["retailer_stores"])]
+    df = df[REQUIRED_COLUMNS].copy()
+    unexpected = set(df.columns) - set(REQUIRED_COLUMNS)
+    missing = set(REQUIRED_COLUMNS) - set(df.columns)
+    if missing or unexpected:
+        raise ValueError(
+            f"Demo data schema violation. Missing: {sorted(missing)}, unexpected: {sorted(unexpected)}"
+        )
     return df
 
 

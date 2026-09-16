@@ -1044,7 +1044,7 @@ def render_scenario_tab(df, view_df, view_enriched, idata, meta, scales, spline,
         ["Conservative (0%)", "Central (5%)", "High (15%)"],
         horizontal=True,
         index=1,
-        help="Conservative: no cross-category substitution. Central: 5% volume reallocates to same-pack competitors. High: 15% substitution."
+        help="Conservative: no cross-category substitution. Central: 5% volume reallocates to other brands in the same pack group. High: 15% substitution."
     )
     sensitivity_map = {
         "Conservative (0%)": 0.0,

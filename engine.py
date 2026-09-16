@@ -430,19 +430,19 @@ def prepare_data(
     )
     df = df.merge(cell_totals, on=cell, how="left", sort=False)
 
-    df["competitor_revenue"] = df["category_revenue"] - df["revenue"]
-    df["competitor_std_volume"] = (
+    df["other_skus_revenue"] = df["category_revenue"] - df["revenue"]
+    df["other_skus_std_volume"] = (
         df["category_std_volume"] - df["standard_volume"]
     )
 
-    df["competitor_price_std"] = (
-        df["competitor_revenue"] / df["competitor_std_volume"]
+    df["other_skus_price_std"] = (
+        df["other_skus_revenue"] / df["other_skus_std_volume"]
     )
-    df["relative_price"] = df["price_std"] / df["competitor_price_std"]
+    df["relative_price"] = df["price_std"] / df["other_skus_price_std"]
 
     usable = (
         df["price_std"].gt(0)
-        & df["competitor_price_std"].gt(0)
+        & df["other_skus_price_std"].gt(0)
         & df["nd"].gt(0)
         & df["nd"].le(1)
         & df["velocity_std"].gt(0)
@@ -452,7 +452,7 @@ def prepare_data(
     dropped = int((~usable).sum())
     if dropped:
         warnings.warn(
-            f"Dropping {dropped:,} rows without usable competitor price, "
+            f"Dropping {dropped:,} rows without usable market-competitive price, "
             "distribution, or velocity.",
             RuntimeWarning,
             stacklevel=2,
@@ -2230,7 +2230,7 @@ def create_sku_summary(df: pd.DataFrame) -> pd.DataFrame:
             revenue=("revenue", "sum"),
             standard_volume=("standard_volume", "sum"),
             price_per_standard_unit=("price_std", "mean"),
-            competitor_price_std=("competitor_price_std", "mean"),
+            other_skus_price_std=("other_skus_price_std", "mean"),
             relative_price=("relative_price", "mean"),
             nd=("nd", "mean"),
             velocity_std=("velocity_std", "mean"),
@@ -3086,11 +3086,11 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
     cat_price_median = df.groupby(["month", "retailer", "category"])["unit_price"].transform("median")
     df["category_price_median"] = cat_price_median
     
-    # Category price index (volume-weighted average price per unit)
-    cat_price_idx = df.groupby(["month", "retailer", "category"]).apply(
-        lambda g: np.average(g["price_per_size_unit"], weights=g["units"]) if g["price_per_size_unit"].notna().any() else np.nan
-    ).reset_index(name="category_price_index")
-    df = df.merge(cat_price_idx, on=["month", "retailer", "category"], how="left")
+    # Category price index (volume-weighted average price per size unit)
+    _w = df["price_per_size_unit"].fillna(0) * df["units"]
+    _wsum = _w.groupby([df["month"], df["retailer"], df["category"]]).transform("sum")
+    _usum = df["units"].groupby([df["month"], df["retailer"], df["category"]]).transform("sum")
+    df["category_price_index"] = np.where(_usum > 0, _wsum / _usum, np.nan)
     
     # Relative price index (vs category median)
     df["relative_price_index"] = np.where(
@@ -3106,71 +3106,35 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
         np.nan
     )
     
-    # Own brand price index (weighted avg of other own-brand SKUs)
-    def weighted_price_index(group, exclude_sku=None):
-        if exclude_sku is not None:
-            mask = group["sku"] != exclude_sku
-            group = group[mask]
-        if len(group) == 0:
-            return np.nan
-        return np.average(group["unit_price"], weights=group["units"])
+    # Same-brand other-SKU price index: volume-weighted avg price of other SKUs sharing the brand identifier.
+    # Computed as (brand weighted total - selected SKU contribution) / (brand units - selected SKU units).
+    df["_pxu"] = df["unit_price"] * df["units"]
     
-    # Compute per-SKU own-brand price index
-    def compute_own_brand_idx(group):
-        m = group["month"].iloc[0]
-        r = group["retailer"].iloc[0]
-        c = group["category"].iloc[0]
-        b = group["brand"].iloc[0]
-        s = group["sku"].iloc[0]
-        
-        same_brand = df[
-            (df["month"] == m) & 
-            (df["retailer"] == r) & 
-            (df["category"] == c) & 
-            (df["brand"] == b) & 
-            (df["sku"] != s)
-        ]
-        if len(same_brand) == 0:
-            return np.nan
-        return np.average(same_brand["unit_price"], weights=same_brand["units"])
+    brand_grp = ["month", "retailer", "category", "brand"]
+    brand_pu = df.groupby(brand_grp)["_pxu"].transform("sum")
+    brand_u = df.groupby(brand_grp)["units"].transform("sum")
     
-    own_brand_idx = df.groupby(["month", "retailer", "category", "brand", "sku"], as_index=False).apply(
-        compute_own_brand_idx
-    ).rename(columns={None: "own_brand_price_index"})
-    
-    df = df.merge(
-        own_brand_idx[["month", "retailer", "category", "brand", "sku", "own_brand_price_index"]],
-        on=["month", "retailer", "category", "brand", "sku"],
-        how="left"
+    own_denom = brand_u - df["units"]
+    df["same_brand_other_sku_price_index"] = np.where(
+        own_denom > 0,
+        (brand_pu - df["_pxu"]) / own_denom,
+        np.nan,
     )
     
-    # Competitor price index (weighted avg of rival brands)
-    def compute_comp_idx(group):
-        m = group["month"].iloc[0]
-        r = group["retailer"].iloc[0]
-        c = group["category"].iloc[0]
-        b = group["brand"].iloc[0]
-        s = group["sku"].iloc[0]
-        
-        rivals = df[
-            (df["month"] == m) & 
-            (df["retailer"] == r) & 
-            (df["category"] == c) & 
-            (df["brand"] != b)
-        ]
-        if len(rivals) == 0:
-            return np.nan
-        return np.average(rivals["unit_price"], weights=rivals["units"])
+    # Other-brand price index: volume-weighted avg price of all other brands
+    # = (category weighted total - brand weighted total) / (category units - brand units).
+    cat_grp = ["month", "retailer", "category"]
+    cat_pu = df.groupby(cat_grp)["_pxu"].transform("sum")
+    cat_u = df.groupby(cat_grp)["units"].transform("sum")
     
-    comp_price_idx = df.groupby(["month", "retailer", "category", "brand", "sku"], as_index=False).apply(
-        compute_comp_idx
-    ).rename(columns={None: "competitor_price_index"})
-    
-    df = df.merge(
-        comp_price_idx[["month", "retailer", "category", "brand", "sku", "competitor_price_index"]],
-        on=["month", "retailer", "category", "brand", "sku"],
-        how="left"
+    comp_denom = cat_u - brand_u
+    df["other_brand_price_index"] = np.where(
+        comp_denom > 0,
+        (cat_pu - brand_pu) / comp_denom,
+        np.nan,
     )
+    
+    df = df.drop(columns=["_pxu"])
     
     # --- Pack group (category-relative) ---
     df["pack_group"] = _add_category_relative_pack_groups(df)
@@ -3301,10 +3265,12 @@ def _simulate_scenario_core(
     out["baseline_units"] = df["units"]
     out["baseline_revenue"] = df["revenue"]
     out["baseline_nd"] = df["nd"]
-    out["baseline_price"] = df["unit_price"]
+    if "unit_price" not in out.columns:
+        out["unit_price"] = np.where(df["units"] > 0, df["revenue"] / df["units"], np.nan)
+    out["baseline_price"] = out["unit_price"]
     
     out["scenario_nd"] = resolved_nd
-    out["scenario_price"] = df["unit_price"] * (1.0 + price_change)
+    out["scenario_price"] = out["unit_price"] * (1.0 + price_change)
     
     return out
 
@@ -3603,7 +3569,7 @@ def compute_parameter_attribution(
     
     return pd.DataFrame({
         "component": [
-            "Own-price effect",
+            "Selected-SKU price effect",
             "Numeric distribution effect",
             "Price × Distribution interaction",
             "Combined total",
