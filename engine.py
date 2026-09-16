@@ -47,6 +47,39 @@ def make_pack_group(pack_size: pd.Series) -> pd.Series:
     ).astype(str)
 
 
+def _add_category_relative_pack_groups(df: pd.DataFrame) -> pd.Series:
+    """
+    Add category-relative pack-size groups using quantile-based binning.
+    
+    Within each category, splits pack sizes into tertiles (Small/Medium/Large).
+    If fewer than 3 distinct sizes exist, uses available number of groups.
+    """
+    def _qcut_category(group: pd.Series) -> pd.Series:
+        n_unique = group.nunique()
+        if n_unique < 2:
+            return pd.Series(["Single"] * len(group), index=group.index)
+        n_bins = min(3, n_unique)
+        labels = {2: ["Small", "Large"], 3: ["Small", "Medium", "Large"]}[n_bins]
+        try:
+            return pd.qcut(
+                group.rank(method="first"),
+                q=n_bins,
+                labels=labels,
+                duplicates="drop"
+            )
+        except ValueError:
+            # Fallback if qcut fails
+            return pd.cut(
+                group,
+                bins=n_bins,
+                labels=labels,
+                include_lowest=True
+            )
+    
+    result = df.groupby("category")["pack_size"].transform(_qcut_category)
+    return result.astype(str)
+
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -3026,6 +3059,9 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
     brand_units = df.groupby(["month", "retailer", "category", "brand"])["units"].transform("sum")
     df["brand_units"] = brand_units
     
+    # Pack-group units (total demand per month × retailer × category × brand × pack_group)
+    # Pack group computed later, so we'll add this after pack_group
+    
     # Shares
     df["brand_share"] = np.where(
         df["category_units"] > 0,
@@ -3050,10 +3086,23 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
     cat_price_median = df.groupby(["month", "retailer", "category"])["unit_price"].transform("median")
     df["category_price_median"] = cat_price_median
     
+    # Category price index (volume-weighted average price per unit)
+    cat_price_idx = df.groupby(["month", "retailer", "category"]).apply(
+        lambda g: np.average(g["price_per_size_unit"], weights=g["units"]) if g["price_per_size_unit"].notna().any() else np.nan
+    ).reset_index(name="category_price_index")
+    df = df.merge(cat_price_idx, on=["month", "retailer", "category"], how="left")
+    
     # Relative price index (vs category median)
     df["relative_price_index"] = np.where(
         df["category_price_median"] > 0,
         df["unit_price"] / df["category_price_median"],
+        np.nan
+    )
+    
+    # Relative price index vs volume-weighted category price index
+    df["relative_price_index_vw"] = np.where(
+        df["category_price_index"] > 0,
+        df["price_per_size_unit"] / df["category_price_index"],
         np.nan
     )
     
@@ -3086,21 +3135,6 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
     )
     
     # Competitor price index (weighted avg of rival brands)
-    def competitor_price_index(group):
-        brands = group["brand"].unique()
-        if len(brands) <= 1:
-            return pd.Series(index=group.index, dtype=float)
-        results = {}
-        for brand in brands:
-            others = group[group["brand"] != brand]
-            if len(others) == 0:
-                results.update({sku: np.nan for sku in group[group["brand"] == brand]["sku"]})
-            else:
-                idx = np.average(others["unit_price"], weights=others["units"])
-                results.update({sku: idx for sku in group[group["brand"] == brand]["sku"]})
-        return pd.Series(results)
-    
-    # Compute per-SKU competitor price index using apply
     comp_price_idx = df.groupby(["month", "retailer", "category", "sku"]).apply(
         lambda row: np.average(
             df[
@@ -3129,8 +3163,24 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
         how="left"
     )
     
-    # --- Pack group ---
-    df["pack_group"] = make_pack_group(df["pack_size"])
+    # --- Pack group (category-relative) ---
+    df["pack_group"] = _add_category_relative_pack_groups(df)
+    
+    # --- Pack-group units and shares (after pack_group is created) ---
+    pack_units = df.groupby(["month", "retailer", "category", "brand", "pack_group"])["units"].transform("sum")
+    df["pack_group_units"] = pack_units
+    
+    df["brand_pack_share"] = np.where(
+        df["brand_units"] > 0,
+        df["pack_group_units"] / df["brand_units"],
+        np.nan
+    )
+    
+    df["pack_group_share_of_category"] = np.where(
+        df["category_units"] > 0,
+        df["pack_group_units"] / df["category_units"],
+        np.nan
+    )
     
     # --- Month number ---
     df["month_num"] = df["month"].dt.month
@@ -3154,3 +3204,672 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
         df["extreme_price"] = False
     
     return df
+
+
+# ============================================================================
+# Market Impact Comparison Module
+# ============================================================================
+
+MARKET_LEVELS = {
+    "market": ["month"],
+    "retailer": ["month", "retailer"],
+    "retailer_category": ["month", "retailer", "category"],
+    "brand": ["month", "retailer", "category", "brand"],
+    "brand_pack": ["month", "retailer", "category", "brand", "pack_group"],
+    "sku": ["month", "retailer", "category", "brand", "pack_group", "sku"],
+}
+
+SEGMENT_RELATIONSHIP_LABELS = {
+    "selected_sku": "Selected SKU",
+    "same_brand_other_pack": "Same brand, other pack",
+    "same_category_same_pack": "Same category, same pack group (other brands)",
+    "same_category_other_pack": "Same category, other pack groups (other brands)",
+    "other_category": "Other categories (cross-category)",
+    "other_retailer": "Other retailers",
+}
+
+
+def _simulate_scenario_core(
+    df: pd.DataFrame,
+    posterior_cache: dict,
+    spline,
+    scales: dict,
+    price_change: float,
+    nd_change: float,
+    nd_mode: str,
+    target_level: str,
+    target_value: str,
+) -> pd.DataFrame:
+    """Core scenario simulation returning DataFrame with predicted units/revenue."""
+    nd_base = df["nd"].to_numpy()
+    
+    if nd_change != 0.0:
+        if nd_mode == "pp":
+            resolved_nd = resolve_target_nd(nd_base, nd_change, "pp")
+        elif nd_mode == "relative":
+            resolved_nd = resolve_target_nd(nd_base, nd_change, "relative")
+        else:
+            resolved_nd = resolve_target_nd(nd_base, nd_change, "absolute")
+    else:
+        resolved_nd = nd_base
+    
+    target_mask = apply_target_scope(df, target_level, target_value)
+    
+    price_effect = np.zeros((posterior_cache["price_slope_z"].shape[0], len(df)))
+    if price_change != 0.0:
+        price_effect = price_delta_log_volume(
+            posterior_cache["price_slope_z"],
+            df["sku_idx"].to_numpy(dtype="int32"),
+            price_change,
+            target_mask.to_numpy(),
+        )
+    
+    nd_effect = np.zeros((posterior_cache["price_slope_z"].shape[0], len(df)))
+    if nd_change != 0.0:
+        nd_effect = nd_delta_log_volume(
+            posterior_cache,
+            spline,
+            scales,
+            df["sku_idx"].to_numpy(dtype="int32"),
+            nd_base,
+            resolved_nd,
+            target_mask.to_numpy(),
+        )
+    
+    total_effect = combined_delta_log_volume(price_effect, nd_effect)
+    
+    result = summarise_scenario_draws(
+        df["units"].to_numpy(),
+        df["revenue"].to_numpy(),
+        price_change,
+        total_effect,
+    )
+    
+    out = df.copy()
+    for col in result.columns:
+        out[col] = result[col]
+    
+    out["baseline_units"] = df["units"]
+    out["baseline_revenue"] = df["revenue"]
+    out["baseline_nd"] = df["nd"]
+    out["baseline_price"] = df["unit_price"]
+    
+    out["scenario_nd"] = resolved_nd
+    out["scenario_price"] = df["unit_price"] * (1.0 + price_change)
+    
+    return out
+
+
+def run_scenario_suite(
+    df: pd.DataFrame,
+    posterior_cache: dict,
+    spline,
+    scales: dict,
+    price_change: float,
+    nd_change: float,
+    nd_mode: str,
+    target_level: str,
+    target_value: str,
+) -> dict:
+    """
+    Run four standard scenarios for comparison.
+    
+    Returns dict with keys: baseline, price_only, distribution_only, combined
+    """
+    scenarios = {}
+    
+    # Baseline
+    scenarios["baseline"] = _simulate_scenario_core(
+        df, posterior_cache, spline, scales,
+        price_change=0.0, nd_change=0.0, nd_mode=nd_mode,
+        target_level=target_level, target_value=target_value
+    )
+    
+    # Price-only
+    scenarios["price_only"] = _simulate_scenario_core(
+        df, posterior_cache, spline, scales,
+        price_change=price_change, nd_change=0.0, nd_mode=nd_mode,
+        target_level=target_level, target_value=target_value
+    )
+    
+    # Distribution-only
+    scenarios["distribution_only"] = _simulate_scenario_core(
+        df, posterior_cache, spline, scales,
+        price_change=0.0, nd_change=nd_change, nd_mode=nd_mode,
+        target_level=target_level, target_value=target_value
+    )
+    
+    # Combined
+    scenarios["combined"] = _simulate_scenario_core(
+        df, posterior_cache, spline, scales,
+        price_change=price_change, nd_change=nd_change, nd_mode=nd_mode,
+        target_level=target_level, target_value=target_value
+    )
+    
+    return scenarios
+
+
+def classify_segment_relationship(
+    row: pd.Series,
+    selected_sku: str,
+    selected_brand: str,
+    selected_category: str,
+    selected_pack_group: str,
+    selected_retailer: str,
+) -> str:
+    """
+    Classify a row's relationship to the selected SKU.
+    
+    Returns one of:
+    - selected_sku
+    - same_brand_other_pack
+    - same_category_same_pack
+    - same_category_other_pack
+    - other_category
+    - other_retailer
+    """
+    if row["sku"] == selected_sku:
+        return "selected_sku"
+    
+    if row["brand"] == selected_brand:
+        if row["category"] == selected_category:
+            if row["pack_group"] != selected_pack_group:
+                return "same_brand_other_pack"
+        return "same_category_other_pack"  # same brand, different category (edge case)
+    
+    if row["category"] == selected_category:
+        if row["pack_group"] == selected_pack_group:
+            return "same_category_same_pack"
+        return "same_category_other_pack"
+    
+    if row["retailer"] == selected_retailer:
+        return "other_category"
+    
+    return "other_retailer"
+
+
+def add_segment_classification(
+    df: pd.DataFrame,
+    selected_sku: str,
+    selected_brand: str,
+    selected_category: str,
+    selected_pack_group: str,
+    selected_retailer: str,
+) -> pd.DataFrame:
+    """Add segment relationship classification to a DataFrame."""
+    df = df.copy()
+    df["segment_relationship"] = df.apply(
+        lambda row: classify_segment_relationship(
+            row, selected_sku, selected_brand, selected_category,
+            selected_pack_group, selected_retailer
+        ),
+        axis=1
+    )
+    return df
+
+
+def aggregate_market_impact(
+    baseline_df: pd.DataFrame,
+    scenario_df: pd.DataFrame,
+    level: str,
+) -> pd.DataFrame:
+    """
+    Aggregate baseline and scenario to specified market level and compute deltas.
+    
+    Levels: market, retailer, retailer_category, brand, brand_pack, sku
+    """
+    if level not in MARKET_LEVELS:
+        raise ValueError(f"Unknown level: {level}. Valid: {list(MARKET_LEVELS.keys())}")
+    
+    group_cols = MARKET_LEVELS[level]
+    
+    baseline = (
+        baseline_df
+        .groupby(group_cols, as_index=False)
+        .agg(
+            baseline_units=("baseline_units", "sum"),
+            baseline_revenue=("baseline_revenue", "sum"),
+        )
+    )
+    
+    scenario = (
+        scenario_df
+        .groupby(group_cols, as_index=False)
+        .agg(
+            scenario_units=("units_median", "sum"),
+            scenario_revenue=("revenue_median", "sum"),
+        )
+    )
+    
+    result = baseline.merge(scenario, on=group_cols, how="outer").fillna(0)
+    
+    result["delta_units"] = result["scenario_units"] - result["baseline_units"]
+    result["delta_revenue"] = result["scenario_revenue"] - result["baseline_revenue"]
+    
+    result["delta_units_pct"] = np.where(
+        result["baseline_units"] > 0,
+        result["delta_units"] / result["baseline_units"],
+        np.nan,
+    )
+    result["delta_revenue_pct"] = np.where(
+        result["baseline_revenue"] > 0,
+        result["delta_revenue"] / result["baseline_revenue"],
+        np.nan,
+    )
+    
+    if "retailer" in result.columns:
+        market_cols = ["retailer"] if "retailer" in group_cols else []
+        if "category" in group_cols:
+            market_cols.append("category")
+        if "month" in group_cols:
+            market_cols.append("month")
+        
+        if market_cols:
+            market_total = result.groupby(market_cols, as_index=False).agg(
+                market_scenario_units=("scenario_units", "sum"),
+                market_baseline_units=("baseline_units", "sum"),
+            )
+            result = result.merge(market_total, on=market_cols, how="left")
+            result["scenario_share"] = np.where(
+                result["market_scenario_units"] > 0,
+                result["scenario_units"] / result["market_scenario_units"],
+                np.nan,
+            )
+            result["baseline_share"] = np.where(
+                result["market_baseline_units"] > 0,
+                result["baseline_units"] / result["market_baseline_units"],
+                np.nan,
+            )
+            result["share_change_pp"] = result["scenario_share"] - result["baseline_share"]
+    
+    return result
+
+
+def compute_reallocation_breakdown(
+    baseline_df: pd.DataFrame,
+    scenario_df: pd.DataFrame,
+    selected_sku: str,
+    selected_brand: str,
+    selected_category: str,
+    selected_pack_group: str,
+    selected_retailer: str,
+) -> pd.DataFrame:
+    """
+    Compute reallocation breakdown by segment relationship.
+    
+    Returns DataFrame with one row per segment relationship showing
+    baseline, scenario, delta units, delta %, and share of total change.
+    """
+    baseline_classified = add_segment_classification(
+        baseline_df, selected_sku, selected_brand, selected_category,
+        selected_pack_group, selected_retailer
+    )
+    scenario_classified = add_segment_classification(
+        scenario_df, selected_sku, selected_brand, selected_category,
+        selected_pack_group, selected_retailer
+    )
+    
+    baseline_agg = baseline_classified.groupby("segment_relationship").agg(
+        baseline_units=("baseline_units", "sum"),
+        baseline_revenue=("baseline_revenue", "sum"),
+    )
+    
+    scenario_agg = scenario_classified.groupby("segment_relationship").agg(
+        scenario_units=("units_median", "sum"),
+        scenario_revenue=("revenue_median", "sum"),
+    )
+    
+    result = baseline_agg.join(scenario_agg, how="outer").fillna(0)
+    
+    result["delta_units"] = result["scenario_units"] - result["baseline_units"]
+    result["delta_revenue"] = result["scenario_revenue"] - result["baseline_revenue"]
+    
+    result["delta_units_pct"] = np.where(
+        result["baseline_units"] > 0,
+        result["delta_units"] / result["baseline_units"],
+        np.nan,
+    )
+    
+    total_delta = result["delta_units"].sum()
+    result["share_of_total_delta"] = np.where(
+        total_delta != 0,
+        result["delta_units"] / total_delta,
+        0,
+    )
+    
+    result["segment_label"] = result.index.map(SEGMENT_RELATIONSHIP_LABELS)
+    
+    return result.reset_index()
+
+
+def compute_parameter_attribution(
+    posterior_cache: dict,
+    spline,
+    scales: dict,
+    sku_idx: int,
+    price_change: float,
+    nd_base: float,
+    nd_new: float,
+    selected_sku_name: str,
+    meta: dict,
+) -> pd.DataFrame:
+    """
+    Compute parameter-level attribution for the selected SKU.
+    
+    Returns DataFrame with PyMC component contributions.
+    """
+    price_slope_draws = posterior_cache["price_slope_z"][:, sku_idx]
+    price_delta = np.log1p(price_change)
+    price_log_vol_delta = price_slope_draws * price_delta
+    price_multiplier = np.exp(price_log_vol_delta)
+    
+    nd_old = np.clip(nd_base, 1e-4, 1.0)
+    nd_future = np.clip(nd_new, 1e-4, 1.0)
+    
+    nd_old_z = (np.log(nd_old) - scales["log_nd"]["mean"]) / scales["log_nd"]["sd"]
+    nd_new_z = (np.log(nd_future) - scales["log_nd"]["mean"]) / scales["log_nd"]["sd"]
+    
+    basis_old = spline.transform(nd_old_z.reshape(-1, 1))
+    basis_new = spline.transform(nd_new_z.reshape(-1, 1))
+    
+    coef = posterior_cache["nd_coef"]
+    
+    if posterior_cache["nd_coef_type"] == "sku_specific":
+        coef_by_sku = coef[:, sku_idx, :]
+        f_old = coef_by_sku @ basis_old.T
+        f_new = coef_by_sku @ basis_new.T
+    else:
+        f_old = coef @ basis_old.T
+        f_new = coef @ basis_new.T
+    
+    mechanical_listing_effect = np.log(nd_future / nd_old)
+    fitted_velocity_effect = f_new - f_old
+    nd_log_vol_delta = mechanical_listing_effect + fitted_velocity_effect
+    nd_multiplier = np.exp(nd_log_vol_delta)
+    
+    combined_log_vol = price_log_vol_delta + nd_log_vol_delta
+    combined_multiplier = np.exp(combined_log_vol)
+    
+    interaction_multiplier = combined_multiplier / (price_multiplier * nd_multiplier)
+    
+    return pd.DataFrame({
+        "component": [
+            "Own-price effect",
+            "Numeric distribution effect",
+            "Price × Distribution interaction",
+            "Combined total",
+        ],
+        "log_vol_delta_median": [
+            float(np.median(price_log_vol_delta)),
+            float(np.median(nd_log_vol_delta)),
+            float(np.median(np.log(interaction_multiplier))),
+            float(np.median(combined_log_vol)),
+        ],
+        "multiplier_median": [
+            float(np.median(price_multiplier)),
+            float(np.median(nd_multiplier)),
+            float(np.median(interaction_multiplier)),
+            float(np.median(combined_multiplier)),
+        ],
+        "multiplier_p10": [
+            float(np.quantile(price_multiplier, 0.10)),
+            float(np.quantile(nd_multiplier, 0.10)),
+            float(np.quantile(interaction_multiplier, 0.10)),
+            float(np.quantile(combined_multiplier, 0.10)),
+        ],
+        "multiplier_p90": [
+            float(np.quantile(price_multiplier, 0.90)),
+            float(np.quantile(nd_multiplier, 0.90)),
+            float(np.quantile(interaction_multiplier, 0.90)),
+            float(np.quantile(combined_multiplier, 0.90)),
+        ],
+        "elasticity_median": [
+            float(np.median(price_slope_draws)),
+            np.nan, np.nan, np.nan,
+        ],
+        "nd_mechanical_effect": [
+            np.nan,
+            float(mechanical_listing_effect),
+            np.nan, np.nan,
+        ],
+        "nd_fitted_effect": [
+            np.nan,
+            float(np.median(fitted_velocity_effect)),
+            np.nan, np.nan,
+        ],
+    })
+
+
+def create_parameter_waterfall(attribution_df: pd.DataFrame) -> go.Figure:
+    """Create a waterfall chart showing parameter-level attribution."""
+    components = attribution_df["component"].tolist()
+    multipliers = attribution_df["multiplier_median"].tolist()
+    p10 = attribution_df["multiplier_p10"].tolist()
+    p90 = attribution_df["multiplier_p90"].tolist()
+    
+    values = [1.0]
+    for m in multipliers[:-1]:
+        values.append(values[-1] * m)
+    
+    fig = go.Figure()
+    
+    colors = ["gray", "blue", "green", "orange", "darkblue"]
+    for i, (comp, val, m, low, high) in enumerate(zip(components, values, multipliers, p10, p90)):
+        if i == 0:
+            fig.add_trace(go.Bar(
+                x=[comp], y=[val], name=comp,
+                marker_color=colors[i % len(colors)],
+                showlegend=False,
+                text=[f"{val:.2f}x"],
+                textposition="outside"
+            ))
+        elif i == len(components) - 1:
+            fig.add_trace(go.Bar(
+                x=[comp], y=[val], name=comp,
+                marker_color=colors[i % len(colors)],
+                showlegend=False,
+                text=[f"{val:.2f}x"],
+                textposition="outside"
+            ))
+        else:
+            delta = val - values[i-1]
+            fig.add_trace(go.Bar(
+                x=[comp], y=[delta], name=comp,
+                base=[values[i-1]],
+                marker_color=colors[i % len(colors)],
+                showlegend=False,
+                text=[f"{m:.2f}x"],
+                textposition="outside"
+            ))
+            fig.add_trace(go.Bar(
+                x=[comp], y=[values[i-1] * high - values[i-1] * low],
+                base=[values[i-1] * low],
+                marker_color="rgba(0,0,0,0)",
+                showlegend=False,
+                error_y=dict(
+                    type="data",
+                    symmetric=False,
+                    array=[values[i-1] * high - values[i-1] * m],
+                    arrayminus=[values[i-1] * m - values[i-1] * low],
+                    color="gray",
+                    thickness=2
+                )
+            ))
+    
+    fig.update_layout(
+        title="Parameter Attribution Waterfall",
+        yaxis_title="Volume Multiplier",
+        height=400,
+        showlegend=False,
+        barmode="relative",
+    )
+    return fig
+
+
+def create_reallocation_waterfall(realloc_df: pd.DataFrame) -> go.Figure:
+    """Create a waterfall chart showing reallocation by segment relationship."""
+    df = realloc_df.sort_values("delta_units", ascending=False).copy()
+    
+    baseline_total = df["baseline_units"].sum()
+    scenario_total = df["scenario_units"].sum()
+    
+    segments = df["segment_label"].tolist()
+    deltas = df["delta_units"].tolist()
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Bar(
+        x=["Baseline"], y=[baseline_total],
+        marker_color="gray", name="Baseline",
+        text=[f"{baseline_total:,.0f}"], textposition="outside"
+    ))
+    
+    running = baseline_total
+    colors = []
+    for delta in deltas:
+        if delta >= 0:
+            colors.append("green")
+        else:
+            colors.append("red")
+        running += delta
+        fig.add_trace(go.Bar(
+            x=[segments[len([c for c in colors if c == "green"] + [c for c in colors if c == "red"]) - 1]],
+            y=[delta],
+            base=[running - delta],
+            marker_color=colors[-1],
+            name=segments[len(colors)-1],
+            text=[f"{delta:+,.0f}"],
+            textposition="outside",
+            showlegend=False
+        ))
+    
+    fig.add_trace(go.Bar(
+        x=["Scenario"], y=[scenario_total],
+        marker_color="darkblue", name="Scenario",
+        text=[f"{scenario_total:,.0f}"], textposition="outside"
+    ))
+    
+    fig.update_layout(
+        title="Reallocation Waterfall by Segment",
+        yaxis_title="Units",
+        height=400,
+        showlegend=False,
+        barmode="relative",
+    )
+    return fig
+
+
+def create_dumbbell_chart(realloc_df: pd.DataFrame) -> go.Figure:
+    """Create a dumbbell chart comparing baseline vs scenario by segment."""
+    df = realloc_df.sort_values("baseline_units", ascending=True).copy()
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=df["baseline_units"],
+        y=df["segment_label"],
+        mode="markers",
+        marker=dict(size=12, color="gray", symbol="circle"),
+        name="Baseline",
+        showlegend=True
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=df["scenario_units"],
+        y=df["segment_label"],
+        mode="markers",
+        marker=dict(size=12, color="blue", symbol="circle"),
+        name="Scenario",
+        showlegend=True
+    ))
+    
+    for _, row in df.iterrows():
+        fig.add_trace(go.Scatter(
+            x=[row["baseline_units"], row["scenario_units"]],
+            y=[row["segment_label"], row["segment_label"]],
+            mode="lines",
+            line=dict(color="lightgray", width=2),
+            showlegend=False,
+            hoverinfo="skip"
+        ))
+    
+    fig.update_layout(
+        title="Winner-Loser Dumbbell: Baseline vs Scenario by Segment",
+        xaxis_title="Units",
+        height=400,
+        showlegend=True
+    )
+    return fig
+
+
+def create_category_bubble_map(market_impact_df: pd.DataFrame) -> go.Figure:
+    """Create a category bubble map: x=volume share, y=share change, size=revenue, color=category."""
+    df = market_impact_df.copy()
+    
+    if "category" not in df.columns:
+        return go.Figure().update_layout(title="Category data not available")
+    
+    fig = px.scatter(
+        df,
+        x="scenario_share",
+        y="share_change_pp",
+        size="scenario_revenue",
+        color="category",
+        hover_data=["category", "baseline_share", "scenario_share", "share_change_pp", "delta_revenue_pct"],
+        title="Category Market Map: Share vs Share Change",
+        labels={
+            "scenario_share": "Scenario Volume Share",
+            "share_change_pp": "Share Change (pp)",
+            "scenario_revenue": "Scenario Revenue"
+        }
+    )
+    
+    fig.update_layout(height=500)
+    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+    return fig
+
+
+def create_brand_pack_heatmap(market_impact_df: pd.DataFrame) -> go.Figure:
+    """Create a brand × pack-group heatmap of share change (pp)."""
+    df = market_impact_df.copy()
+    
+    if "brand" not in df.columns or "pack_group" not in df.columns:
+        return go.Figure().update_layout(title="Brand×Pack data not available")
+    
+    pivot = df.pivot_table(
+        values="share_change_pp",
+        index="brand",
+        columns="pack_group",
+        aggfunc="mean"
+    )
+    
+    fig = px.imshow(
+        pivot,
+        color_continuous_scale="RdBu",
+        color_continuous_midpoint=0,
+        title="Brand × Pack Group: Share Change (pp)",
+        labels={"color": "Share Change (pp)", "x": "Pack Group", "y": "Brand"}
+    )
+    
+    fig.update_layout(height=400)
+    return fig
+
+
+def create_cross_category_sensitivity_chart(
+    scenarios: dict,
+    sensitivity: float
+) -> go.Figure:
+    """Create a chart showing how cross-category sensitivity affects results."""
+    fig = go.Figure()
+    fig.add_annotation(
+        text=f"Cross-category sensitivity: {sensitivity:.0%} substitution",
+        x=0.5, y=0.5, showarrow=False,
+        font=dict(size=16)
+    )
+    fig.update_layout(
+        title="Cross-Category Sensitivity Analysis",
+        height=300,
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False)
+    )
+    return fig
