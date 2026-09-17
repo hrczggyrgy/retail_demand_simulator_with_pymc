@@ -23,6 +23,8 @@ import pandas as pd
 import pymc as pm
 import xarray as xr
 import arviz as az
+import plotly.graph_objects as go
+import plotly.express as px
 from sklearn.preprocessing import SplineTransformer
 
 
