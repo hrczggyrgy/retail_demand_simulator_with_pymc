@@ -2880,12 +2880,12 @@ def get_posterior_predictive_check(
     with model:
         ppc = pm.sample_posterior_predictive(
             idata,
-            var_names=["log_velocity_z_obs"],
+            var_names=["log_velocity_std_z_obs"],
             random_seed=random_seed,
             progressbar=False,
         )
 
-    draws = ppc.posterior_predictive["log_velocity_z_obs"]
+    draws = ppc.posterior_predictive["log_velocity_std_z_obs"]
     pred_median = draws.median(dim=("chain", "draw")).values
     pred_p10 = draws.quantile(0.10, dim=("chain", "draw")).values
     pred_p90 = draws.quantile(0.90, dim=("chain", "draw")).values
@@ -3015,7 +3015,7 @@ def make_energy_figure(idata):
 
 def make_ppc_figure(
     idata,
-    observed_var: str = "log_velocity_z_obs",
+    observed_var: str = "log_velocity_std_z_obs",
 ):
     """
     Compare observed standardized log velocity with posterior predictions.
@@ -3432,7 +3432,7 @@ def add_posterior_predictive(model, idata, random_seed: int = 42):
     with model:
         ppc = pm.sample_posterior_predictive(
             idata,
-            var_names=["log_velocity_z_obs"],
+            var_names=["log_velocity_std_z_obs"],
             random_seed=random_seed,
             progressbar=False,
             extend_inferencedata=True,
@@ -4264,7 +4264,7 @@ def get_posterior_predictive_check(
     """
     var_name = _find_posterior_variable(
         trace,
-        ["log_velocity_z_obs"],
+        ["log_velocity_std_z_obs"],
     )
     if var_name is None:
         return pd.DataFrame()
@@ -5044,7 +5044,7 @@ def generate_data_health_report(
 def compute_model_validation_metrics(
     idata,
     prepared_df: pd.DataFrame,
-    observed_var: str = "log_velocity_z_obs",
+    observed_var: str = "log_velocity_std_z_obs",
 ) -> dict[str, Any]:
     """
     Compute model validation metrics: backtest coverage, residual patterns, calibration.
@@ -5107,7 +5107,7 @@ def compute_model_validation_metrics(
 def build_observed_vs_predicted_data(
     idata,
     prepared_df: pd.DataFrame,
-    observed_var: str = "log_velocity_z_obs",
+    observed_var: str = "log_velocity_std_z_obs",
 ) -> pd.DataFrame:
     """
     Build DataFrame for observed vs predicted scatter plot.
