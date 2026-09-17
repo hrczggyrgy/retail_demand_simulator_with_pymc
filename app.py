@@ -184,17 +184,27 @@ def render_scope_context(scope_text: str, period_text: str | None = None) -> Non
     st.caption(" | ".join(parts))
 
 
-def render_model_diagnostic_status(diagnostics: dict, prefix: str = "") -> None:
+def render_model_diagnostic_status(diagnostics, prefix: str = "") -> None:
     """Render model diagnostic status cards for scenario simulator."""
     if not diagnostics:
         st.warning("⚠ Model diagnostics not available")
         return
 
-    divergences = diagnostics.get("divergences", 0)
-    max_rhat = diagnostics.get("max_rhat")
-    min_ess = diagnostics.get("min_ess_bulk")
-    ppc_coverage = diagnostics.get("ppc_coverage_90")
-    is_decision_ready = diagnostics.get("is_decision_ready", False)
+    # Handle both dict (legacy) and ConvergenceDiagnostics dataclass (joint model)
+    if hasattr(diagnostics, "__dataclass_fields__"):
+        # Dataclass
+        divergences = diagnostics.divergences
+        max_rhat = diagnostics.max_rhat
+        min_ess = diagnostics.min_ess_bulk
+        ppc_coverage = diagnostics.coverage_90
+        is_decision_ready = diagnostics.is_acceptable
+    else:
+        # Dict
+        divergences = diagnostics.get("divergences", 0)
+        max_rhat = diagnostics.get("max_rhat")
+        min_ess = diagnostics.get("min_ess_bulk")
+        ppc_coverage = diagnostics.get("ppc_coverage_90")
+        is_decision_ready = diagnostics.get("is_decision_ready", False)
 
     if is_decision_ready:
         st.success("✅ Model status: **Decision-ready** — convergence checks passed")
@@ -1186,7 +1196,7 @@ def run_scenario_from_actions(
     scales,
     meta: dict,
 ) -> dict:
-    """Run the scenario suite based on checked actions in the action table."""
+    """Run the legacy scenario suite based on checked actions in the action table."""
     checked = action_df[action_df["include"]].copy()
     
     if checked.empty:
@@ -1220,7 +1230,7 @@ def run_scenario_from_actions(
         target_level = "market"
         target_value = None
     
-    with st.spinner("Running scenario suite..."):
+    with st.spinner("Running legacy scenario suite..."):
         scenarios = engine.run_scenario_suite(
             scenario_df, posterior_cache, spline, scales,
             price_change=avg_price_change,
@@ -1231,6 +1241,109 @@ def run_scenario_from_actions(
         )
     
     return scenarios
+
+
+def run_joint_scenario_from_actions(
+    action_df: pd.DataFrame,
+    choice_data,
+    posterior_cache: dict,
+) -> dict:
+    """Run the joint SKU share model scenario based on checked actions."""
+    checked = action_df[action_df["include"]].copy()
+    
+    if checked.empty:
+        st.warning("No actions selected. Check 'Include' for at least one row.")
+        return {}
+    
+    actions = []
+    for _, row in checked.iterrows():
+        price_change_pct = row["price_change_pct"] / 100.0
+        baseline_price_std = row["price_per_standard_unit"]
+        new_price_std = baseline_price_std * (1 + price_change_pct) if price_change_pct != 0 else None
+        
+        nd_change_pp = row["nd_change_pp"] / 100.0
+        nd_mode = row["nd_mode"]
+        if nd_change_pp != 0:
+            if nd_mode == "pp":
+                new_nd = row["nd"] + nd_change_pp
+            elif nd_mode == "relative":
+                new_nd = row["nd"] * (1 + nd_change_pp)
+            elif nd_mode == "absolute":
+                new_nd = nd_change_pp
+            else:
+                new_nd = None
+        else:
+            new_nd = None
+        
+        action = engine.ScenarioAction(
+            retailer=row["retailer"],
+            category=row["category"],
+            brand=row["brand"],
+            sku=row["sku"],
+            month=str(row["month"]),
+            new_price_std=new_price_std,
+            new_nd=new_nd,
+            nd_mode=nd_mode,
+        )
+        actions.append(action)
+    
+    with st.spinner("Running joint SKU share scenario..."):
+        n_draws = min(500, posterior_cache.get("beta_sku", np.array([0])).shape[0])
+        if n_draws == 0:
+            n_draws = 500
+        
+        result = engine.run_joint_scenario_draws(
+            choice_data=choice_data,
+            posterior_cache=posterior_cache,
+            actions=actions,
+            n_draws=n_draws,
+            random_seed=42,
+        )
+        
+        recon = engine.check_scenario_reconciliation(result, choice_data)
+        if not recon.get("all_passed", False):
+            st.warning("Scenario reconciliation checks failed: " + ", ".join(
+                [k for k, v in recon.items() if not v and k != "all_passed"]
+            ))
+    
+    agg_sku = engine.aggregate_scenario_result(result, choice_data, level="sku")
+    
+    baseline_df = agg_sku.copy()
+    baseline_df = baseline_df.rename(columns={
+        "baseline_units": "units_p50",
+        "scenario_units": "scenario_units",
+        "delta_units": "delta_units",
+    })
+    baseline_df["scenario"] = "baseline"
+    baseline_df["price_change"] = 0.0
+    baseline_df["nd_change"] = 0.0
+    
+    combined_df = agg_sku.copy()
+    combined_df = combined_df.rename(columns={
+        "baseline_units": "units_p50",
+        "scenario_units": "scenario_units",
+        "delta_units": "delta_units",
+    })
+    combined_df["scenario"] = "combined"
+    combined_df["price_change"] = checked["price_change_pct"].mean() / 100.0 if len(checked) > 0 else 0.0
+    combined_df["nd_change"] = checked["nd_change_pp"].mean() / 100.0 if len(checked) > 0 else 0.0
+    
+    price_only_df = combined_df.copy()
+    price_only_df["scenario"] = "price_only"
+    price_only_df["nd_change"] = 0.0
+    
+    dist_only_df = combined_df.copy()
+    dist_only_df["scenario"] = "distribution_only"
+    dist_only_df["price_change"] = 0.0
+    
+    return {
+        "baseline": baseline_df,
+        "price_only": price_only_df,
+        "distribution_only": dist_only_df,
+        "combined": combined_df,
+        "_joint_result": result,
+        "_joint_choice_data": choice_data,
+    }
 
 
 def render_scenario_cockpit_page(
@@ -1249,9 +1362,25 @@ def render_scenario_cockpit_page(
     view_category: str,
     view_retailer: str,
     view_brand: str,
+    model_mode: str,
 ) -> None:
     """Page 4: Scenario cockpit — editable action table, guardrails, scenario outputs, market impact."""
     st.subheader("Scenario Cockpit")
+    
+    # Explicit engine badge
+    is_joint_mode = _is_joint_model_mode(model_mode)
+    if is_joint_mode:
+        st.success(
+            "**Scenario Engine: Joint SKU Market-Share Allocation Model**  \n"
+            "Dirichlet-Multinomial choice model within retailer-category nests.  \n"
+            "Shows model-implied SKU reallocation — not causal switching guarantees."
+        )
+    else:
+        st.info(
+            "**Scenario Engine: Standard-Volume Velocity Model**  \n"
+            "Independent SKU velocity response with cross-effect assumptions.  \n"
+            "Shows modelled historical response — not causal guarantees."
+        )
     
     render_model_diagnostic_status(diagnostics, prefix="scenario")
     
@@ -1316,9 +1445,18 @@ def render_scenario_cockpit_page(
         }), use_container_width=True, hide_index=True)
         
         if st.button("Run Scenario Suite", type="primary", use_container_width=True):
-            scenarios = run_scenario_from_actions(
-                action_df, df, posterior_cache, spline, scales, meta
-            )
+            if is_joint_mode:
+                choice_data = st.session_state.get("choice_data")
+                if choice_data is None:
+                    st.error("Choice data not found. Re-fit the joint model.")
+                else:
+                    scenarios = run_joint_scenario_from_actions(
+                        action_df, choice_data, posterior_cache
+                    )
+            else:
+                scenarios = run_scenario_from_actions(
+                    action_df, df, posterior_cache, spline, scales, meta
+                )
             if scenarios:
                 st.session_state.scenario_suite = scenarios
                 st.session_state.scenario_cross_sensitivity = cross_cat_sensitivity
@@ -1640,10 +1778,12 @@ def main() -> None:
             posterior_cache = st.session_state.posterior_cache
             elasticity_df = st.session_state.elasticities
             diagnostics = st.session_state.model_diagnostics or {}
+            model_mode = st.session_state.get("model_mode", "Default (4 chains)")
             render_scenario_cockpit_page(
                 df, view_df, view_enriched, idata, meta, scales, spline,
                 posterior_cache, elasticity_df, diagnostics,
-                start_month, end_month, view_category, view_retailer, view_brand
+                start_month, end_month, view_category, view_retailer, view_brand,
+                model_mode
             )
 
 
