@@ -3088,9 +3088,18 @@ class ConvergenceDiagnostics:
     is_acceptable: bool
 
 
-def summarize_convergence_diagnostics(idata) -> ConvergenceDiagnostics:
+def summarize_convergence_diagnostics(
+    idata,
+    observed_var: str = "log_velocity_std_z_obs",
+    predictive_var: str = "log_velocity_std_z_obs",
+) -> ConvergenceDiagnostics:
     """
     Extract convergence diagnostics from InferenceData.
+    
+    Args:
+        idata: ArviZ InferenceData object
+        observed_var: Name of observed variable in idata.observed_data
+        predictive_var: Name of posterior predictive variable in idata.posterior_predictive
     
     Returns a ConvergenceDiagnostics object with typed fields.
     """
@@ -3117,11 +3126,11 @@ def summarize_convergence_diagnostics(idata) -> ConvergenceDiagnostics:
         pass
 
     # Posterior predictive coverage
-    if (hasattr(idata, "posterior_predictive") and "y" in idata.posterior_predictive
-        and hasattr(idata, "observed_data") and "y" in idata.observed_data):
+    if (hasattr(idata, "posterior_predictive") and predictive_var in idata.posterior_predictive
+        and hasattr(idata, "observed_data") and observed_var in idata.observed_data):
         try:
-            y_obs = idata.observed_data["y"].values.flatten()
-            y_pred = idata.posterior_predictive["y"].values
+            y_obs = idata.observed_data[observed_var].values.flatten()
+            y_pred = idata.posterior_predictive[predictive_var].values
             pred_p05 = np.percentile(y_pred, 5, axis=(0, 1))
             pred_p95 = np.percentile(y_pred, 95, axis=(0, 1))
             coverage_90 = float(np.mean((y_obs >= pred_p05) & (y_obs <= pred_p95)))

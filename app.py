@@ -470,7 +470,11 @@ def fit_model_explicitly() -> None:
     st.session_state.model_settings = {"config": config, "mode": mode}
     
     if _is_joint_model_mode(mode):
-        st.session_state.model_diagnostics = engine.summarize_convergence_diagnostics(idata)
+        st.session_state.model_diagnostics = engine.summarize_convergence_diagnostics(
+            idata,
+            observed_var="observed_units",
+            predictive_var="sku_units_obs",
+        )
         # Extract elasticities from joint model (beta_sku)
         # TODO: implement joint model elasticity extraction
     else:
@@ -952,9 +956,18 @@ def render_fit_validate_page(
     posterior_cache = st.session_state.posterior_cache
     elasticity_df = st.session_state.elasticities
     diagnostics = st.session_state.model_diagnostics or {}
+    model_settings = st.session_state.model_settings or {}
+    model_mode = model_settings.get("mode", "Default (4 chains)")
     
-    # Get typed convergence diagnostics
-    conv_diag = engine.summarize_convergence_diagnostics(idata)
+    # Get typed convergence diagnostics with correct variable names for joint model
+    if _is_joint_model_mode(model_mode):
+        conv_diag = engine.summarize_convergence_diagnostics(
+            idata,
+            observed_var="observed_units",
+            predictive_var="sku_units_obs",
+        )
+    else:
+        conv_diag = engine.summarize_convergence_diagnostics(idata)
     
     # Divergence warning banner
     if conv_diag.divergences > 0:
@@ -2066,32 +2079,46 @@ def render_scenario_audit_export(
     checked: pd.DataFrame,
     action_df: pd.DataFrame,
     cross_cat_sensitivity: float,
+    is_joint_mode: bool,
 ) -> None:
     """Scenario audit and export."""
+    settings = [
+        "Target level", "Target value(s)", "Avg Price change", "ND mode", "Avg ND change",
+    ]
+    values = [
+        "Multiple SKUs" if len(checked) > 1 else "Single SKU",
+        f"{len(checked)} SKU-months selected",
+        f"{checked['price_change_pct'].mean():+.1f}%",
+        checked["nd_mode"].iloc[0] if len(checked) > 0 else "pp",
+        f"{checked['nd_change_pp'].mean():+.1f}pp",
+    ]
+    provenance = [
+        "User input", "User input", "User input", "User input", "User input",
+    ]
+    confidence = [
+        "High", "High", "High", "High", "High",
+    ]
+    
+    if not is_joint_mode:
+        settings.append("Cross-category sensitivity")
+        values.append(f"{cross_cat_sensitivity:.0%}")
+        provenance.append("Assumption-led")
+        confidence.append("Assumption")
+    
+    settings.extend(["Model config", "Chains", "Draws"])
+    values.extend([
+        st.session_state.model_settings["config"].__class__.__name__,
+        st.session_state.model_settings["config"].chains,
+        st.session_state.model_settings["config"].draws,
+    ])
+    provenance.extend(["Model config", "Model config", "Model config"])
+    confidence.extend(["High", "High", "High"])
+    
     audit_df = pd.DataFrame({
-        "Setting": [
-            "Target level", "Target value(s)", "Avg Price change", "ND mode", "Avg ND change",
-            "Cross-category sensitivity", "Model config", "Chains", "Draws"
-        ],
-        "Value": [
-            "Multiple SKUs" if len(checked) > 1 else "Single SKU",
-            f"{len(checked)} SKU-months selected",
-            f"{checked['price_change_pct'].mean():+.1f}%",
-            checked["nd_mode"].iloc[0] if len(checked) > 0 else "pp",
-            f"{checked['nd_change_pp'].mean():+.1f}pp",
-            f"{cross_cat_sensitivity:.0%}",
-            st.session_state.model_settings["config"].__class__.__name__,
-            st.session_state.model_settings["config"].chains,
-            st.session_state.model_settings["config"].draws,
-        ],
-        "Provenance": [
-            "User input", "User input", "User input", "User input", "User input",
-            "Assumption-led", "Model config", "Model config", "Model config"
-        ],
-        "Confidence": [
-            "High", "High", "High", "High", "High",
-            "Assumption", "High", "High", "High"
-        ]
+        "Setting": settings,
+        "Value": values,
+        "Provenance": provenance,
+        "Confidence": confidence,
     })
     st.dataframe(audit_df, use_container_width=True, hide_index=True)
     
@@ -2165,48 +2192,59 @@ def render_scenario_cockpit_page(
     
     st.divider()
     
-    with st.expander("⚙️ Cross-Effect Multipliers (Assumption-Led)", expanded=False):
-        st.markdown("""
-        These multipliers approximate substitution effects **not estimated by the model**.
-        They are scenario assumptions, not statistically discovered relationships.
+    if not is_joint_mode:
+        with st.expander("⚙️ Cross-Effect Multipliers (Assumption-Led)", expanded=False):
+            st.markdown("""
+            These multipliers approximate substitution effects **not estimated by the model**.
+            They are scenario assumptions, not statistically discovered relationships.
 
-        | Relationship | Multiplier | Status |
-        |---|---|---|
-        | Same brand, adjacent pack | 0.35 | Assumption |
-        | Same brand, other pack | 0.15 | Assumption |
-        | Other brand, same pack | 0.25 | Assumption |
-        | Other brand, other pack | 0.08 | Assumption |
-        """)
-    
-    with st.expander("📊 Confidence Flags", expanded=False):
-        st.markdown("""
-        | Status | Meaning |
-        |---|---|
-        | **Estimated** | Posterior interval excludes zero, sufficient data |
-        | **Shrunk** | Group prior dominates, limited SKU-level evidence |
-        | **Assumption-Led** | User-specified rule, not data-supported |
-        | **Not Available** | Sparse/missing competitive set |
-        """)
-    
-    st.divider()
-    
-    sensitivity_preset = st.radio(
-        "Substitution assumption",
-        ["Conservative (0%)", "Central (5%)", "High (15%)"],
-        horizontal=True,
-        index=1,
-        help="Conservative: no cross-category substitution. Central: 5% volume reallocates to other brands in the same pack group. High: 15% substitution."
-    )
-    sensitivity_map = {
-        "Conservative (0%)": 0.0,
-        "Central (5%)": 0.05,
-        "High (15%)": 0.15,
-    }
-    cross_cat_sensitivity = sensitivity_map[sensitivity_preset]
-    st.caption("Applied to: Other brands in same pack group within same category. "
-               "These are assumption-led multipliers, not model-estimated.")
-    
-    st.divider()
+            | Relationship | Multiplier | Status |
+            |---|---|---|
+            | Same brand, adjacent pack | 0.35 | Assumption |
+            | Same brand, other pack | 0.15 | Assumption |
+            | Other brand, same pack | 0.25 | Assumption |
+            | Other brand, other pack | 0.08 | Assumption |
+            """)
+        
+        with st.expander("📊 Confidence Flags", expanded=False):
+            st.markdown("""
+            | Status | Meaning |
+            |---|---|
+            | **Estimated** | Posterior interval excludes zero, sufficient data |
+            | **Shrunk** | Group prior dominates, limited SKU-level evidence |
+            | **Assumption-Led** | User-specified rule, not data-supported |
+            | **Not Available** | Sparse/missing competitive set |
+            """)
+        
+        st.divider()
+        
+        sensitivity_preset = st.radio(
+            "Substitution assumption",
+            ["Conservative (0%)", "Central (5%)", "High (15%)"],
+            horizontal=True,
+            index=1,
+            help="Conservative: no cross-category substitution. Central: 5% volume reallocates to other brands in the same pack group. High: 15% substitution."
+        )
+        sensitivity_map = {
+            "Conservative (0%)": 0.0,
+            "Central (5%)": 0.05,
+            "High (15%)": 0.15,
+        }
+        cross_cat_sensitivity = sensitivity_map[sensitivity_preset]
+        st.caption("Applied to: Other brands in same pack group within same category. "
+                   "These are assumption-led multipliers, not model-estimated.")
+        
+        st.divider()
+    else:
+        st.info(
+            "**Cross-SKU responses are estimated from posterior market-share reallocation.**  \n"
+            "No fixed substitution multipliers are applied.  \n"
+            "The joint model calculates competitor effects by re-solving the fitted "
+            "retailer-category choice set under baseline and scenario prices/distribution."
+        )
+        cross_cat_sensitivity = 0.0
+        
+        st.divider()
     
     action_df = render_scenario_action_editor(df)
     
@@ -2312,7 +2350,7 @@ def render_scenario_cockpit_page(
             render_parameter_attribution(checked, meta, posterior_cache, spline, scales)
         
         with st.expander("📋 Scenario Audit & Export", expanded=False):
-            render_scenario_audit_export(scenarios, checked, action_df, cross_cat_sensitivity)
+            render_scenario_audit_export(scenarios, checked, action_df, cross_cat_sensitivity, is_joint_mode)
 
 
 # ---------------------------------------------------------------------------
