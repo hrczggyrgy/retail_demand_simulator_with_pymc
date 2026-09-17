@@ -1530,6 +1530,11 @@ def render_scenario_cockpit_page(
 
 def main() -> None:
     init_state()
+
+    # Prepare data BEFORE rendering sidebar so sidebar can show model config
+    if st.session_state.raw_data is not None:
+        prepare_data_if_needed()
+
     render_sidebar()
 
     st.title("Retail Demand & Scenario Cockpit")
@@ -1551,7 +1556,10 @@ def main() -> None:
         render_market_data_page()
         return
 
-    prepare_data_if_needed()
+    if st.session_state.prepared_data is None:
+        st.error("Data preparation failed. Check the data quality report.")
+        render_market_data_page()
+        return
 
     if st.session_state.prepared_data is None:
         render_market_data_page()
