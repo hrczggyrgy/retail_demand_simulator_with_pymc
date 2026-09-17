@@ -1512,13 +1512,8 @@ def render_scenario_builder() -> None:
             nd_change_val = nd_target
 
     if st.button("Run scenario", type="primary", use_container_width=True):
-        market_scope_df = df[
-            df["month"].between(pd.Timestamp(start_month), pd.Timestamp(end_month))
-        ].copy()
-        if view_category != "All":
-            market_scope_df = market_scope_df[
-                market_scope_df["category"].eq(view_category)
-            ]
+        # Always analyze the full market; view filters only affect display tabs.
+        market_scope_df = df.copy()
 
         if market_scope_df.empty:
             st.warning("No market rows remain for the selected scope.")
@@ -1568,7 +1563,11 @@ def render_scenario_builder() -> None:
                 )
 
                 for col in result.columns:
-                    market_scope_df[col] = result[col]
+                    market_scope_df[col] = result[col].to_numpy()
+
+                # Alias for legacy helpers that expect expected_*_median names
+                market_scope_df["expected_units_median"] = market_scope_df["units_median"]
+                market_scope_df["expected_revenue_median"] = market_scope_df["revenue_median"]
 
                 share_df = engine.calculate_market_shares(market_scope_df, market_scope_df, "brand")
                 sku_share_df = engine.calculate_market_shares(market_scope_df, market_scope_df, "sku")

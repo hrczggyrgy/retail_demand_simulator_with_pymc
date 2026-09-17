@@ -1297,17 +1297,18 @@ def apply_target_scope(
     target_level: str,
     target_value,
 ) -> pd.Series:
-    if target_level == "Market":
+    level = str(target_level).strip().lower()
+    if level == "market":
         return pd.Series(True, index=df.index)
-    if target_level == "Retailer":
+    if level == "retailer":
         return df["retailer"].eq(target_value)
-    if target_level == "Brand":
+    if level == "brand":
         return df["brand"].eq(target_value)
-    if target_level == "SKU":
+    if level == "sku":
         return df["sku"].eq(target_value)
-    if target_level == "Pack size":
+    if level in ("pack_size", "pack size"):
         return df["pack_size"].eq(target_value)
-    return pd.Series(False, index=df.index)
+    raise ValueError(f"Unknown target_level: {target_level!r}")
 
 
 def calculate_market_shares(
@@ -3259,6 +3260,7 @@ def _simulate_scenario_core(
     )
     
     out = df.copy()
+    result.index = out.index
     for col in result.columns:
         out[col] = result[col]
     
