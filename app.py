@@ -188,11 +188,11 @@ def run_targeted_scenario(
         "scenario_price_change",
         "scenario_nd_change",
         "scenario_nd",
-        "volume_multiplier_p10",
-        "volume_multiplier_median",
-        "volume_multiplier_p90",
-        "expected_units_median",
-        "expected_revenue_median",
+        "volume_multiplier_p05",
+        "volume_multiplier_p50",
+        "volume_multiplier_p95",
+        "units_p50",
+        "revenue_p50",
     ]
     replace_cols = [c for c in replace_cols if c in baseline_by_id.columns and c in target_by_id.columns]
 
@@ -684,7 +684,7 @@ def main() -> None:
         )
 
     with tab_model:
-        render_model_health_tab(idata, df, diagnostics, meta, scales, spline, posterior_cache)
+        render_model_health_tab(idata, df, diagnostics, meta, scales, spline, posterior_cache, elasticity_df)
 
 
 def show_descriptive_tabs(df: pd.DataFrame, view_df: pd.DataFrame, start_month, end_month) -> None:
@@ -1081,40 +1081,54 @@ def render_scenario_tab(df, view_df, view_enriched, idata, meta, scales, spline,
         )
 
 
-def render_model_health_tab(idata, df, diagnostics, meta, scales, spline, posterior_cache) -> None:
+def render_model_health_tab(idata, df, diagnostics, meta, scales, spline, posterior_cache, elasticity_df=None) -> None:
     st.subheader("Model Health & Validation")
 
     if idata is None:
         st.warning("No model fitted yet.")
         return
 
+    # Get typed convergence diagnostics
+    conv_diag = engine.summarize_convergence_diagnostics(idata)
+
+    # Divergence warning banner (P0)
+    if conv_diag.divergences > 0:
+        st.warning(
+            f"⚠️ {conv_diag.divergences} divergent transitions detected. "
+            "Elasticity and scenario estimates should be treated as provisional. "
+            "Re-fit with a higher target acceptance rate (e.g., 0.95) and inspect parameterisation."
+        )
+    else:
+        st.success("✅ No divergent transitions detected.")
+
     col1, col2 = st.columns(2)
 
     with col1:
         st.markdown("### Convergence Diagnostics")
-        if "divergences" in diagnostics:
-            st.metric("Divergences", diagnostics["divergences"])
-        if "rhat_max" in diagnostics:
-            st.metric("Max R-hat", f"{diagnostics['rhat_max']:.3f}")
-        if "ess_bulk_min" in diagnostics:
-            st.metric("Min ESS (bulk)", f"{diagnostics['ess_bulk_min']:.0f}")
-        if "ess_tail_min" in diagnostics:
-            st.metric("Min ESS (tail)", f"{diagnostics['ess_tail_min']:.0f}")
+        st.metric("Divergences", conv_diag.divergences)
+        if conv_diag.max_rhat is not None:
+            st.metric("Max R-hat", f"{conv_diag.max_rhat:.3f}")
+        if conv_diag.min_ess_bulk is not None:
+            st.metric("Min ESS (bulk)", f"{conv_diag.min_ess_bulk:.0f}")
+        if conv_diag.min_ess_tail is not None:
+            st.metric("Min ESS (tail)", f"{conv_diag.min_ess_tail:.0f}")
 
         st.caption("Target: R-hat < 1.01, ESS > 400, Divergences = 0")
 
     with col2:
         st.markdown("### Posterior Predictive Coverage")
-        if "coverage_90" in diagnostics:
+        if conv_diag.coverage_90 is not None:
             c1, c2 = st.columns(2)
-            c1.metric("90% Interval Coverage", f"{diagnostics['coverage_90']:.1%}")
+            c1.metric("90% Interval Coverage", f"{conv_diag.coverage_90:.1%}")
             c2.metric("Target", "90%")
-            if diagnostics['coverage_90'] < 0.85:
+            if conv_diag.coverage_90 < 0.85:
                 st.warning("Coverage below 85% — intervals may be too narrow")
-            elif diagnostics['coverage_90'] > 0.95:
+            elif conv_diag.coverage_90 > 0.95:
                 st.info("Coverage above 95% — intervals may be conservative")
             else:
                 st.success("Coverage well-calibrated")
+        else:
+            st.info("Posterior predictive samples not available for coverage calculation.")
 
     st.divider()
 
@@ -1163,20 +1177,22 @@ def render_model_health_tab(idata, df, diagnostics, meta, scales, spline, poster
             st.info(f"Residual heatmap unavailable: {e}")
 
     st.divider()
-    st.markdown("### Elasticity Forest Plot")
-    if posterior_cache is not None:
-        try:
-            from engine import plot_elasticity_forest
-            pc = plot_elasticity_forest(posterior_cache)
-            if hasattr(pc, "viz") and "figure" in pc.viz:
-                fig = pc.viz["figure"].item()
-                st.plotly_chart(fig, use_container_width=True)
-        except Exception as e:
-            st.info(f"Elasticity forest plot unavailable: {e}")
 
-    st.divider()
-    st.markdown("### Holdout Validation (Rolling Backtest)")
-    st.info("Rolling holdout validation not yet implemented. Will show WAPE, bias, directional accuracy by horizon.")
+    # Elasticity Forest Plot (P0)
+    st.markdown("### Elasticity Forest Plot")
+    if elasticity_df is not None and not elasticity_df.empty:
+        try:
+            fig = engine.build_elasticity_forest_figure(elasticity_df=elasticity_df)
+            st.plotly_chart(fig, use_container_width=True)
+        except (KeyError, ValueError) as e:
+            st.info(f"Elasticity forest plot unavailable: {e}")
+    else:
+        st.info("Elasticity estimates are unavailable for the current fitted model. Fit the model to view elasticity forest plot.")
+
+    # Holdout Validation (Rolling Backtest) - hidden until implemented (P1)
+    # st.divider()
+    # st.markdown("### Holdout Validation (Rolling Backtest)")
+    # st.info("Rolling holdout validation coming in next release. Will show WAPE, bias, directional accuracy by horizon.")
 
 
 def render_market_impact_comparison(
@@ -1397,9 +1413,9 @@ def render_market_impact_comparison(
                     "sku": row["sku"],
                     "pack_group": row["pack_group"],
                     "baseline_units": row["baseline_units"],
-                    "scenario_units": row.get("units_median", row.get("units", 0)),
+                    "scenario_units": row.get("units_p50", row.get("units", 0)),
                     "baseline_revenue": row["baseline_revenue"],
-                    "scenario_revenue": row.get("revenue_median", row.get("revenue", 0)),
+                    "scenario_revenue": row.get("revenue_p50", row.get("revenue", 0)),
                     "baseline_nd": row["baseline_nd"],
                     "scenario_nd": row.get("scenario_nd", row.get("nd", 0)),
                     "baseline_price": row["baseline_price"],
@@ -1577,10 +1593,6 @@ def render_scenario_builder() -> None:
                 for col in result.columns:
                     market_scope_df[col] = result[col].to_numpy()
 
-                # Alias for legacy helpers that expect expected_*_median names
-                market_scope_df["expected_units_median"] = market_scope_df["units_median"]
-                market_scope_df["expected_revenue_median"] = market_scope_df["revenue_median"]
-
                 share_df = engine.calculate_market_shares(market_scope_df, market_scope_df, "brand")
                 sku_share_df = engine.calculate_market_shares(market_scope_df, market_scope_df, "sku")
 
@@ -1638,12 +1650,12 @@ def render_scenario_builder() -> None:
             target_mask = engine.apply_target_scope(scenario_df, target_level, target_value)
             if target_mask.any():
                 bu = scenario_df.loc[target_mask, "units"].sum()
-                su = scenario_df.loc[target_mask, "units_median"].sum()
+                su = scenario_df.loc[target_mask, "units_p50"].sum()
                 st.metric("Target units change", f"{(su/bu-1)*100:+.1f}%" if bu > 0 else "—")
         with d:
             if target_mask.any():
                 br = scenario_df.loc[target_mask, "revenue"].sum()
-                sr = scenario_df.loc[target_mask, "revenue_median"].sum()
+                sr = scenario_df.loc[target_mask, "revenue_p50"].sum()
                 st.metric("Target revenue change", f"{(sr/br-1)*100:+.1f}%" if br > 0 else "—")
 
         st.divider()

@@ -9,10 +9,23 @@ import pandas as pd
 
 from engine import REQUIRED_COLUMNS
 
+# Exported raw column schema (exactly 10 columns)
+RAW_COLUMNS = REQUIRED_COLUMNS
+
 
 def get_input_template() -> pd.DataFrame:
     """Return empty DataFrame with required columns for template download."""
     return pd.DataFrame(columns=REQUIRED_COLUMNS)
+
+
+def get_minimal_test_fixture() -> pd.DataFrame:
+    """Small deterministic observed-market panel for engine tests."""
+    rows = [
+        {"month": pd.Timestamp("2025-01-01"), "retailer": "R1", "category": "CSD", "brand": "A", "sku": "A_500", "units": 100.0, "revenue": 200.0, "sku_stores": 10.0, "retailer_stores": 20.0, "pack_size": 0.5},
+        {"month": pd.Timestamp("2025-01-01"), "retailer": "R1", "category": "CSD", "brand": "A", "sku": "A_1500", "units": 80.0, "revenue": 240.0, "sku_stores": 8.0, "retailer_stores": 20.0, "pack_size": 1.5},
+        {"month": pd.Timestamp("2025-01-01"), "retailer": "R1", "category": "CSD", "brand": "B", "sku": "B_500", "units": 120.0, "revenue": 240.0, "sku_stores": 12.0, "retailer_stores": 20.0, "pack_size": 0.5},
+    ]
+    return pd.DataFrame(rows, columns=RAW_COLUMNS)
 
 
 def generate_demo_data(months_count: int = 24, seed: int = 42) -> pd.DataFrame:
