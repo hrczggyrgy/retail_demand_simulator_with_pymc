@@ -685,17 +685,21 @@ def main() -> None:
 
 def show_descriptive_tabs(df: pd.DataFrame, view_df: pd.DataFrame, start_month, end_month) -> None:
     st.info("Model not yet fitted. Showing descriptive analytics only.")
+    # Build enriched features for descriptive tabs
+    enriched_df = engine.build_retail_features(df)
+    view_enriched = enriched_df.loc[view_df.index].copy()
+
     tab_overview, tab_health, tab_market, tab_price = st.tabs([
         "📊 Overview", "🔍 Data health", "📈 Market & share", "💰 Price & distribution"
     ])
     with tab_overview:
-        render_overview_tab(view_df, view_df, None, None, None, None, None, start_month, end_month)
+        render_overview_tab(view_df, view_enriched, None, None, None, None, None, start_month, end_month)
     with tab_health:
         render_data_health_tab(df, st.session_state.validation_report, st.session_state.quality_report)
     with tab_market:
-        render_market_share_tab(view_df, view_df, start_month, end_month)
+        render_market_share_tab(view_df, view_enriched, start_month, end_month)
     with tab_price:
-        render_price_distribution_tab(view_df, view_df, None, None, None, None, None, None)
+        render_price_distribution_tab(view_df, view_enriched, None, None, None, None, None, None)
 
 
 def render_overview_tab(view_df, view_enriched, elasticity_df, posterior_cache, meta, scales, spline, start_month, end_month) -> None:
