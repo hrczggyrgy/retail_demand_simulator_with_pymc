@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Comprehensive test of app functionality: data, model, tabs, scenarios, reasonable outputs."""
 import numpy as np
-import pandas as pd
+
 import demo_data
 import engine
 
@@ -76,7 +76,7 @@ def test_build_retail_features():
     print("✓ build_retail_features indices complete (no NaN)")
 
 def test_model_config_presets():
-    for name, cfg in [("FAST", engine.FAST_CONFIG), ("DEFAULT", engine.DEFAULT_CONFIG), 
+    for name, cfg in [("FAST", engine.FAST_CONFIG), ("DEFAULT", engine.DEFAULT_CONFIG),
                        ("ADVANCED", engine.ADVANCED_CONFIG)]:
         assert hasattr(cfg, "chains"), f"{name} missing chains"
         assert hasattr(cfg, "scenario_draws"), f"{name} missing scenario_draws"
@@ -102,7 +102,7 @@ def test_summarise_scenario_draws():
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
-    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)), 
+    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)),
           "nd_coef": np.random.normal(0,0.5,(50,n_basis)), "nd_coef_type":"shared"}
     scope = df.copy()
     res = engine._simulate_scenario_core(scope, pc, spline, scales, 0.05, 0.1, "pp", "brand", scope["brand"].iloc[0])
@@ -130,7 +130,7 @@ def test_calculate_market_shares():
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
-    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)), 
+    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)),
           "nd_coef": np.random.normal(0,0.5,(50,n_basis)), "nd_coef_type":"shared"}
     scope = df.copy()
     res = engine._simulate_scenario_core(scope, pc, spline, scales, 0.05, 0.1, "pp", "brand", scope["brand"].iloc[0])
@@ -156,7 +156,7 @@ def test_scenario_suite():
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
-    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)), 
+    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)),
           "nd_coef": np.random.normal(0,0.5,(50,n_basis)), "nd_coef_type":"shared"}
     scenarios = engine.run_scenario_suite(df, pc, spline, scales, 0.05, 0.1, "pp", "brand", df["brand"].iloc[0])
     assert set(scenarios.keys()) == {"baseline","price_only","distribution_only","combined"}
@@ -184,7 +184,7 @@ def test_aggregate_market_impact():
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
-    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)), 
+    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)),
           "nd_coef": np.random.normal(0,0.5,(50,n_basis)), "nd_coef_type":"shared"}
     scenarios = engine.run_scenario_suite(df, pc, spline, scales, 0.05, 0.1, "pp", "brand", df["brand"].iloc[0])
     for level in ["market","retailer","brand","sku"]:  # using valid MARKET_LEVELS keys
@@ -203,7 +203,7 @@ def test_reallocation_breakdown():
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
-    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)), 
+    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)),
           "nd_coef": np.random.normal(0,0.5,(50,n_basis)), "nd_coef_type":"shared"}
     scenarios = engine.run_scenario_suite(df, pc, spline, scales, 0.05, 0.1, "pp", "brand", df["brand"].iloc[0])
     target_sku = df["sku"].iloc[0]
@@ -230,7 +230,7 @@ def test_parameter_attribution():
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
-    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)), 
+    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)),
           "nd_coef": np.random.normal(0,0.5,(50,n_basis)), "nd_coef_type":"shared"}
     scenarios = engine.run_scenario_suite(df, pc, spline, scales, 0.05, 0.1, "pp", "brand", df["brand"].iloc[0])
     target_sku = df["sku"].iloc[0]
@@ -257,7 +257,7 @@ def test_elasticity_extraction():
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
-    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)), 
+    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)),
           "nd_coef": np.random.normal(0,0.5,(50,n_basis)), "nd_coef_type":"shared"}
     # extract_elasticities expects arviz InferenceData - skip full test, just verify it's callable
     assert callable(engine.extract_elasticities)
@@ -300,13 +300,13 @@ def test_zero_price_and_nd_scenario_equals_baseline() -> None:
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
-    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)), 
+    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)),
           "nd_coef": np.random.normal(0,0.5,(50,n_basis)), "nd_coef_type":"shared"}
-    
+
     # Zero change scenario
     scope = df.copy()
     res = engine._simulate_scenario_core(scope, pc, spline, scales, 0.0, 0.0, "pp", "brand", scope["brand"].iloc[0])
-    
+
     # Units should equal baseline (within floating point)
     np.testing.assert_allclose(res["units_p50"].to_numpy(), scope["units"].to_numpy(), rtol=1e-10)
     np.testing.assert_allclose(res["revenue_p50"].to_numpy(), scope["revenue"].to_numpy(), rtol=1e-10)
@@ -324,12 +324,12 @@ def test_target_scope_case_insensitive_or_raises() -> None:
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
-    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)), 
+    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)),
           "nd_coef": np.random.normal(0,0.5,(50,n_basis)), "nd_coef_type":"shared"}
-    
+
     scope = df.copy()
     target_brand = scope["brand"].iloc[0]
-    
+
 # Should work with lowercase
     res1 = engine._simulate_scenario_core(scope, pc, spline, scales, 0.05, 0.1, "pp", "brand", target_brand)
     assert res1["units_p50"].notna().all()
@@ -337,7 +337,7 @@ def test_target_scope_case_insensitive_or_raises() -> None:
     # Should work with mixed case
     res2 = engine._simulate_scenario_core(scope, pc, spline, scales, 0.05, 0.1, "pp", "Brand", target_brand)
     assert res2["units_p50"].notna().all()
-    
+
     # Invalid scope should raise ValueError
     try:
         engine._simulate_scenario_core(scope, pc, spline, scales, 0.05, 0.1, "pp", "invalid_scope", target_brand)
@@ -358,9 +358,9 @@ def test_filtered_dataframe_non_contiguous_index_no_nans() -> None:
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
-    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)), 
+    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)),
           "nd_coef": np.random.normal(0,0.5,(50,n_basis)), "nd_coef_type":"shared"}
-    
+
     # Create non-contiguous index (e.g., every 3rd row)
     scope = df.iloc[::3].copy()
     res = engine._simulate_scenario_core(scope, pc, spline, scales, 0.05, 0.1, "pp", "brand", scope["brand"].iloc[0])
@@ -381,18 +381,18 @@ def test_scenario_runs_on_full_market_not_filtered() -> None:
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
-    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)), 
+    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)),
           "nd_coef": np.random.normal(0,0.5,(50,n_basis)), "nd_coef_type":"shared"}
-    
+
     # Simulate a filtered view (e.g., one category)
     filtered = df[df["category"] == "CSD"].copy()
-    
+
     # Run scenario on FULL market
     full_res = engine._simulate_scenario_core(df, pc, spline, scales, 0.05, 0.1, "pp", "brand", df["brand"].iloc[0])
-    
+
     # Run scenario on filtered view (this would be wrong behavior)
     filtered_res = engine._simulate_scenario_core(filtered, pc, spline, scales, 0.05, 0.1, "pp", "brand", filtered["brand"].iloc[0])
-    
+
     # Full market should have more rows
     assert len(full_res) > len(filtered_res)
     assert len(full_res) == len(df)
@@ -405,13 +405,13 @@ def test_same_brand_other_sku_price_index_excludes_focal_sku() -> None:
     raw = demo_data.generate_demo_data()
     df, meta = engine.prepare_data(raw)
     enriched = engine.build_retail_features(df)
-    
+
     # For a given brand, the same_brand_other_sku_price_index should not include the SKU's own price
     # Pick a brand with multiple SKUs
     brand_skus = df.groupby("brand")["sku"].nunique()
     multi_sku_brand = brand_skus[brand_skus > 1].index[0]
     brand_rows = enriched[enriched["brand"] == multi_sku_brand]
-    
+
     # The index is computed per month/retailer/category/brand group
     group_cols = ["month", "retailer", "category", "brand"]
     for _, group in brand_rows.groupby(group_cols, observed=True):
@@ -432,7 +432,7 @@ def test_one_sku_brand_produces_nan_for_same_brand_index() -> None:
     # Create minimal fixture with single-SKU brand
     df = demo_data.get_minimal_test_fixture()
     enriched = engine.build_retail_features(df)
-    
+
     # Brand B has only one SKU (B_500)
     b_rows = enriched[enriched["brand"] == "B"]
     assert len(b_rows) == 1
@@ -451,25 +451,25 @@ def test_scenario_segment_deltas_reconcile_to_market_delta() -> None:
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
-    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)), 
+    pc = {"price_slope_z": np.random.normal(-1.5,0.3,(50,n_skus)),
           "nd_coef": np.random.normal(0,0.5,(50,n_basis)), "nd_coef_type":"shared"}
-    
+
     scenarios = engine.run_scenario_suite(df, pc, spline, scales, 0.05, 0.1, "pp", "brand", df["brand"].iloc[0])
     target_sku = df["sku"].iloc[0]
     target_row = df[df["sku"]==target_sku].iloc[0]
-    
+
     rb = engine.compute_reallocation_breakdown(
         scenarios["baseline"], scenarios["combined"],
         target_sku, target_row["brand"], target_row["category"],
         target_row["pack_group"], target_row["retailer"]
     )
-    
+
     # Sum of segment delta_units should equal market delta
     total_segment_delta = rb["delta_units"].sum()
     market_baseline = scenarios["baseline"]["units_p50"].sum()
     market_scenario = scenarios["combined"]["units_p50"].sum()
     market_delta = market_scenario - market_baseline
-    
+
     np.testing.assert_allclose(total_segment_delta, market_delta, rtol=1e-5)
     print("✓ Scenario segment deltas reconcile to market delta")
 
@@ -479,7 +479,7 @@ if __name__ == "__main__":
     test_demo_schema_contains_only_raw_columns()
     test_numeric_distribution_is_bounded()
     test_brand_share_reconciles_within_category()
-    
+
     # Original comprehensive tests
     test_demo_data_schema()
     test_prepare_data()
@@ -494,7 +494,7 @@ if __name__ == "__main__":
     test_parameter_attribution()
     test_elasticity_extraction()
     test_analytics_helpers()
-    
+
     # Issue 2 additional engine contract tests
     test_zero_price_and_nd_scenario_equals_baseline()
     test_target_scope_case_insensitive_or_raises()
@@ -503,5 +503,5 @@ if __name__ == "__main__":
     test_same_brand_other_sku_price_index_excludes_focal_sku()
     test_one_sku_brand_produces_nan_for_same_brand_index()
     test_scenario_segment_deltas_reconcile_to_market_delta()
-    
+
     print("\n=== ALL TESTS PASSED ===")

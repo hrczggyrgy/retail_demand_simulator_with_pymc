@@ -14,19 +14,15 @@ share denominator even when the user targets only one brand/SKU/retailer.
 from __future__ import annotations
 
 import io
-import json
-from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
-import matplotlib.pyplot as plt
 
 import demo_data
 import engine
-
 
 # ---------------------------------------------------------------------------
 # Page setup
@@ -100,7 +96,7 @@ def month_label(value) -> str:
     return pd.Timestamp(value).strftime("%b %Y")
 
 
-def unique_sorted(df: pd.DataFrame, col: str) -> List:
+def unique_sorted(df: pd.DataFrame, col: str) -> list:
     if col not in df.columns:
         return []
     return sorted(df[col].dropna().unique().tolist())
@@ -120,9 +116,9 @@ def fmt_share(value: float) -> str:
 
 def build_filter_mask(
     df: pd.DataFrame,
-    category: Optional[str] = None,
-    retailer: Optional[str] = None,
-    brand: Optional[str] = None,
+    category: str | None = None,
+    retailer: str | None = None,
+    brand: str | None = None,
 ) -> pd.Series:
     mask = pd.Series(True, index=df.index)
     if category and category != "All":
@@ -354,7 +350,7 @@ def init_state() -> None:
 
 
 @st.cache_data
-def read_uploaded_file(file_bytes: bytes, file_type: str, sheet_name: Optional[str]) -> pd.DataFrame:
+def read_uploaded_file(file_bytes: bytes, file_type: str, sheet_name: str | None) -> pd.DataFrame:
     bio = io.BytesIO(file_bytes)
     if file_type == "csv":
         return pd.read_csv(bio)
@@ -1064,8 +1060,8 @@ def render_scenario_tab(df, view_df, view_enriched, idata, meta, scales, spline,
         "High (15%)": 0.15,
     }
     cross_cat_sensitivity = sensitivity_map[sensitivity_preset]
-    st.caption(f"Applied to: Other brands in same pack group within same category. "
-               f"These are assumption-led multipliers, not model-estimated.")
+    st.caption("Applied to: Other brands in same pack group within same category. "
+               "These are assumption-led multipliers, not model-estimated.")
 
     st.divider()
 
@@ -1203,22 +1199,22 @@ def render_market_impact_comparison(
     """Render market impact comparison with scenario suite and visualizations."""
     scenario_settings = st.session_state.scenario_settings or {}
     scenario_df = st.session_state.scenario_df
-    
+
     target_level = scenario_settings.get("target_level", "Market")
     target_value = scenario_settings.get("target_value", None)
     price_change = scenario_settings.get("price_change", 0.0)
     nd_change = scenario_settings.get("nd_change", 0.0)
     nd_mode = scenario_settings.get("nd_mode", "pp")
-    
+
     # Determine selected SKU for segment classification
     selected_sku = target_value if target_level == "SKU" else None
     selected_brand = target_value if target_level == "Brand" else (scenario_df[scenario_df["sku"] == selected_sku]["brand"].iloc[0] if selected_sku else None)
     selected_category = target_value if target_level == "Market" and view_category != "All" else (scenario_df[scenario_df["sku"] == selected_sku]["category"].iloc[0] if selected_sku else (view_category if view_category != "All" else None))
     selected_pack_group = scenario_df[scenario_df["sku"] == selected_sku]["pack_group"].iloc[0] if selected_sku else None
     selected_retailer = target_value if target_level == "Retailer" else (scenario_df[scenario_df["sku"] == selected_sku]["retailer"].iloc[0] if selected_sku else (view_retailer if view_retailer != "All" else None))
-    
+
     st.markdown("#### Scenario Suite Results")
-    
+
     # Run scenario suite
     with st.spinner("Running scenario suite..."):
         scenarios = engine.run_scenario_suite(
@@ -1229,7 +1225,7 @@ def render_market_impact_comparison(
             target_level=target_level.lower(),
             target_value=target_value,
         )
-    
+
     # Market level selector
     level = st.selectbox(
         "Aggregation level",
@@ -1237,7 +1233,7 @@ def render_market_impact_comparison(
         index=3,
         format_func=lambda x: x.replace("_", " ").title()
     )
-    
+
     # Select which scenario to compare against baseline
     compare_scenario = st.selectbox(
         "Compare scenario",
@@ -1245,13 +1241,13 @@ def render_market_impact_comparison(
         index=2,
         format_func=lambda x: x.replace("_", " ").title()
     )
-    
+
     baseline_df = scenarios["baseline"]
     scenario_df_selected = scenarios[compare_scenario]
-    
+
     # Aggregate market impact
     market_impact = engine.aggregate_market_impact(baseline_df, scenario_df_selected, level)
-    
+
     # Display market impact table
     st.markdown(f"#### Market Impact at {level.replace('_', ' ').title()} Level")
     display_cols = [c for c in market_impact.columns if not c.startswith("market_")]
@@ -1272,7 +1268,7 @@ def render_market_impact_comparison(
         use_container_width=True,
         hide_index=True,
     )
-    
+
     # Reallocation breakdown
     if selected_sku and selected_brand and selected_category and selected_pack_group and selected_retailer:
         st.markdown("#### Reallocation Breakdown")
@@ -1281,7 +1277,7 @@ def render_market_impact_comparison(
             selected_sku, selected_brand, selected_category,
             selected_pack_group, selected_retailer
         )
-        
+
         col1, col2 = st.columns(2)
         with col1:
             st.plotly_chart(
@@ -1293,7 +1289,7 @@ def render_market_impact_comparison(
                 engine.create_dumbbell_chart(realloc),
                 use_container_width=True
             )
-        
+
         st.dataframe(
             realloc[["segment_label", "baseline_units", "scenario_units", "delta_units", "delta_units_pct", "share_of_total_delta"]].style.format({
                 "baseline_units": "{:,.0f}",
@@ -1305,24 +1301,24 @@ def render_market_impact_comparison(
             use_container_width=True,
             hide_index=True,
         )
-    
+
     # Visualizations
     st.markdown("#### Market Visualizations")
-    
+
     viz_tabs = st.tabs(["Category Bubble Map", "Brand×Pack Heatmap", "Cross-Category Sensitivity"])
-    
+
     with viz_tabs[0]:
         st.plotly_chart(
             engine.create_category_bubble_map(market_impact),
             use_container_width=True
         )
-    
+
     with viz_tabs[1]:
         st.plotly_chart(
             engine.create_brand_pack_heatmap(market_impact),
             use_container_width=True
         )
-    
+
     with viz_tabs[2]:
         st.plotly_chart(
             engine.create_cross_category_sensitivity_chart(scenarios, cross_cat_sensitivity),
@@ -1330,13 +1326,13 @@ def render_market_impact_comparison(
         )
         st.caption("Cross-category sensitivity is an assumption-led multiplier. "
                    "Conservative: no substitution. Central: 5% of displaced volume reallocates. High: 15%.")
-    
+
     # Parameter Attribution (for SKU-level targets)
     if target_level == "SKU" and target_value:
         st.markdown("#### Parameter Attribution")
         sku_idx = meta["sku_to_idx"][target_value]
         nd_base = scenario_df[scenario_df["sku"] == target_value]["nd"].mean()
-        
+
         # Resolve ND for attribution
         if nd_mode == "pp":
             resolved_nd = engine.resolve_target_nd(np.array([nd_base]), nd_change, "pp")[0]
@@ -1344,18 +1340,18 @@ def render_market_impact_comparison(
             resolved_nd = engine.resolve_target_nd(np.array([nd_base]), nd_change, "relative")[0]
         else:
             resolved_nd = nd_change
-        
+
         attribution = engine.compute_parameter_attribution(
             posterior_cache, spline, scales, sku_idx,
             price_change, nd_base, resolved_nd,
             target_value, meta
         )
-        
+
         st.plotly_chart(
             engine.create_parameter_waterfall(attribution),
             use_container_width=True
         )
-        
+
         st.dataframe(
             attribution.style.format({
                 "log_vol_delta_median": "{:+.3f}",
@@ -1369,7 +1365,7 @@ def render_market_impact_comparison(
             use_container_width=True,
             hide_index=True,
         )
-    
+
     # Scenario Audit / Export
     st.markdown("#### Scenario Audit & Export")
     audit_df = pd.DataFrame({
@@ -1398,7 +1394,7 @@ def render_market_impact_comparison(
         ]
     })
     st.dataframe(audit_df, use_container_width=True, hide_index=True)
-    
+
     # Export button
     if st.button("Export Scenario Suite (CSV)"):
         export_data = []
@@ -1605,8 +1601,8 @@ def render_scenario_builder() -> None:
                     "target_value": target_value,
                     "price_change": price_change,
                     "nd_mode": nd_mode,
-                    "nd_change": nd_change_val if 'nd_change_val' in locals() else 0,
-                    "resolved_nd": resolved_nd if 'resolved_nd' in locals() else None,
+                    "nd_change": nd_change_val if "nd_change_val" in locals() else 0,
+                    "resolved_nd": resolved_nd if "resolved_nd" in locals() else None,
                 }
 
     if "scenario_shares" in st.session_state and st.session_state.scenario_shares is not None:
