@@ -1417,14 +1417,8 @@ def render_market_impact_comparison(
             selected_pack_group, selected_retailer
         )
 
-        # P2: Segment-level selector for winner-loser visuals
-        segment_level = st.selectbox(
-            "Compare segments at",
-            ["segment", "brand", "brand_pack", "retailer", "category"],
-            index=0,
-            format_func=lambda x: x.replace("_", " ").title(),
-            help="Choose the aggregation level for the winner/loser chart. 'Segment' shows the 6 neutral segments (selected SKU, same-brand other SKU, etc.)."
-        )
+        # Segment-level display (only 'segment' is fully supported)
+        st.caption("Showing market reallocation by segment: Selected SKU, Same-brand other SKU, Other brands, Other categories, Other retailers")
 
         # P1: Keep only top 2 decision visuals open (waterfall + dumbbell)
         col1, col2 = st.columns(2)
@@ -1437,7 +1431,7 @@ def render_market_impact_comparison(
         with col2:
             chart_subtitle("Which observed market segments gain or lose under the scenario?")
             st.plotly_chart(
-                engine.create_dumbbell_chart(realloc, level=segment_level),
+                engine.create_dumbbell_chart(realloc),
                 use_container_width=True
             )
 
