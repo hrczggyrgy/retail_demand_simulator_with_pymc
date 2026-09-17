@@ -14,6 +14,7 @@ share denominator even when the user targets only one brand/SKU/retailer.
 from __future__ import annotations
 
 import io
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -215,6 +216,58 @@ def build_filter_mask(
     if brand and brand != "All":
         mask &= df["brand"].eq(brand)
     return mask
+
+
+# ---------------------------------------------------------------------------
+# State and chart helpers
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class AppReadiness:
+    has_raw_data: bool
+    has_prepared_data: bool
+    has_model: bool
+    has_valid_diagnostics: bool
+    has_scenario: bool
+
+
+def get_app_readiness() -> AppReadiness:
+    diagnostics = st.session_state.get("diagnostics")
+    return AppReadiness(
+        has_raw_data="raw_data" in st.session_state,
+        has_prepared_data="prepared_data" in st.session_state,
+        has_model="model_result" in st.session_state,
+        has_valid_diagnostics=(
+            diagnostics is not None
+            and getattr(diagnostics, "is_decision_ready", False)
+        ),
+        has_scenario="scenario_suite" in st.session_state,
+    )
+
+
+def require_columns(
+    df: pd.DataFrame,
+    required_columns: set[str],
+    chart_name: str,
+) -> bool:
+    """Check if required columns exist in dataframe; show info message if not."""
+    missing = required_columns.difference(df.columns)
+
+    if missing:
+        st.info(
+            f"{chart_name} is unavailable because required fields are missing: "
+            f"{', '.join(sorted(missing))}."
+        )
+        return False
+
+    if df.empty:
+        st.info(
+            f"{chart_name} is unavailable because no records match "
+            "the selected filters."
+        )
+        return False
+
+    return True
 
 
 def run_targeted_scenario(
