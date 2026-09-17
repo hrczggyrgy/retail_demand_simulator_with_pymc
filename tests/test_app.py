@@ -80,6 +80,35 @@ def test_build_retail_features():
     assert enriched["other_brand_price_index"].notna().all()
     print("✓ build_retail_features indices complete (no NaN)")
 
+
+def test_scenario_action_table_rejects_raw_data() -> None:
+    """Regression test: create_scenario_action_table should require enriched data."""
+    raw_df = demo_data.generate_demo_data()
+
+    with pytest.raises(
+        KeyError,
+        match="price_std",
+    ):
+        engine.create_scenario_action_table(raw_df)
+
+
+def test_scenario_action_table_accepts_enriched_data() -> None:
+    """Regression test: create_scenario_action_table works with enriched data."""
+    raw_df = demo_data.generate_demo_data()
+    prepared_df, _ = engine.prepare_data(raw_df)
+    enriched_df = engine.build_retail_features(prepared_df)
+
+    action_df = engine.create_scenario_action_table(enriched_df)
+
+    assert not action_df.empty
+    assert "baseline_price_std" in action_df.columns
+    assert "baseline_nd" in action_df.columns
+    assert "new_price_std" in action_df.columns
+    assert "new_nd" in action_df.columns
+    assert "price_change" in action_df.columns
+    assert "nd_change" in action_df.columns
+
+
 def test_model_config_presets():
     for name, cfg in [("FAST", engine.FAST_CONFIG), ("DEFAULT", engine.DEFAULT_CONFIG),
                        ("ADVANCED", engine.ADVANCED_CONFIG)]:
