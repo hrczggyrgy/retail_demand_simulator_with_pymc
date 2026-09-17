@@ -1345,29 +1345,29 @@ def build_pymc_model_v2(
 @dataclass(frozen=True, slots=True)
 class JointModelConfig:
     """Configuration for the joint SKU market-share model."""
-    draws: int = 800
-    tune: int = 800
+    draws: int = 1200
+    tune: int = 1500
     chains: int = 4
-    target_accept: float = 0.95
+    target_accept: float = 0.98
     random_seed: int = 42
     
-    # Hierarchy options
+    # Hierarchy options (simplified for stability)
     use_category_price_pooling: bool = True
     use_sku_nd_effects: bool = True
     use_category_nesting: bool = True
     
-    # Prior scales
+    # Prior scales (tighter for stability)
     beta_category_mu: float = -1.0
-    beta_category_sigma: float = 0.75
-    sigma_beta_brand: float = 0.35
-    sigma_beta_sku: float = 0.25
-    sigma_gamma1: float = 0.5
-    sigma_gamma2: float = 0.5
-    sigma_alpha_retailer_sku: float = 0.7
-    sigma_alpha_sku: float = 0.5
+    beta_category_sigma: float = 0.5
+    sigma_beta_brand: float = 0.25
+    sigma_beta_sku: float = 0.15
+    sigma_gamma1: float = 0.3
+    sigma_gamma2: float = 0.3
+    sigma_alpha_retailer_sku: float = 0.5
+    sigma_alpha_sku: float = 0.3
     
     # Concentration prior for Dirichlet-Multinomial
-    concentration_sigma: float = 1.0
+    concentration_sigma: float = 0.5
 
 
 JOINT_MODEL_DEFAULT_CONFIG = JointModelConfig()
@@ -1439,7 +1439,7 @@ def build_joint_sku_share_model(
         available_data = pm.Data("available", available, dims=("market", "sku"))
         
         # ================================================================
-        # Price sensitivity hierarchy: category -> brand x pack -> SKU
+        # Price sensitivity hierarchy: category -> brand x pack -> SKU (fully non-centered)
         # ================================================================
         if config.use_category_price_pooling:
             # Category-level price sensitivity
@@ -1450,12 +1450,12 @@ def build_joint_sku_share_model(
                 dims="category",
             )
             
-            # Brand x pack_group level
+            # Brand x pack_group level (non-centered)
             sigma_beta_brand_pack = pm.HalfNormal("sigma_beta_brand_pack", sigma=config.sigma_beta_brand)
-            beta_brand_pack = pm.Normal(
+            beta_brand_pack_offset = pm.Normal("beta_brand_pack_offset", 0.0, 1.0, dims=("brand", "pack_group"))
+            beta_brand_pack = pm.Deterministic(
                 "beta_brand_pack",
-                mu=beta_category[brand_category_idx][:, None],
-                sigma=sigma_beta_brand_pack,
+                beta_category[brand_category_idx][:, None] + beta_brand_pack_offset * sigma_beta_brand_pack,
                 dims=("brand", "pack_group"),
             )
         else:
@@ -1466,7 +1466,7 @@ def build_joint_sku_share_model(
                 dims=("brand", "pack_group"),
             )
         
-        # SKU-level price sensitivity
+        # SKU-level price sensitivity (non-centered)
         sigma_beta_sku = pm.HalfNormal("sigma_beta_sku", sigma=config.sigma_beta_sku)
         beta_sku_offset = pm.Normal("beta_sku_offset", 0.0, 1.0, dims="sku")
         
@@ -1477,30 +1477,30 @@ def build_joint_sku_share_model(
         )
         
         # ================================================================
-        # Numeric distribution response: gamma1 * ND + gamma2 * ND^2
+        # Numeric distribution response: gamma1 * ND + gamma2 * ND^2 (fully non-centered)
         # ================================================================
         # Category-level hierarchical priors for ND response
         gamma1_category = pm.Normal("gamma1_category", mu=0.0, sigma=config.sigma_gamma1, dims="category")
         gamma2_category = pm.Normal("gamma2_category", mu=0.0, sigma=config.sigma_gamma2, dims="category")
         
         if config.use_sku_nd_effects:
-            # Brand-level variation
+            # Brand-level variation (non-centered)
             sigma_gamma1_brand = pm.HalfNormal("sigma_gamma1_brand", sigma=0.3)
             sigma_gamma2_brand = pm.HalfNormal("sigma_gamma2_brand", sigma=0.3)
-            gamma1_brand = pm.Normal(
+            gamma1_brand_offset = pm.Normal("gamma1_brand_offset", 0.0, 1.0, dims="brand")
+            gamma2_brand_offset = pm.Normal("gamma2_brand_offset", 0.0, 1.0, dims="brand")
+            gamma1_brand = pm.Deterministic(
                 "gamma1_brand",
-                mu=gamma1_category[brand_category_idx],
-                sigma=sigma_gamma1_brand,
+                gamma1_category[brand_category_idx] + gamma1_brand_offset * sigma_gamma1_brand,
                 dims="brand",
             )
-            gamma2_brand = pm.Normal(
+            gamma2_brand = pm.Deterministic(
                 "gamma2_brand",
-                mu=gamma2_category[brand_category_idx],
-                sigma=sigma_gamma2_brand,
+                gamma2_category[brand_category_idx] + gamma2_brand_offset * sigma_gamma2_brand,
                 dims="brand",
             )
             
-            # SKU-level variation
+            # SKU-level variation (non-centered)
             sigma_gamma1_sku = pm.HalfNormal("sigma_gamma1_sku", sigma=0.2)
             sigma_gamma2_sku = pm.HalfNormal("sigma_gamma2_sku", sigma=0.2)
             gamma1_sku_offset = pm.Normal("gamma1_sku_offset", 0.0, 1.0, dims="sku")
@@ -1522,15 +1522,15 @@ def build_joint_sku_share_model(
             gamma2_sku = pm.Normal("gamma2_sku", mu=gamma2_category[sku_category_idx], sigma=config.sigma_gamma2, dims="sku")
         
         # ================================================================
-        # Baseline SKU attractiveness: retailer x SKU with hierarchy
+        # Baseline SKU attractiveness: retailer x SKU with hierarchy (fully non-centered)
         # ================================================================
         # SKU-level baseline (brand/category hierarchy)
         alpha_category = pm.Normal("alpha_category", 0.0, 1.0, dims="category")
         sigma_alpha_brand = pm.HalfNormal("sigma_alpha_brand", sigma=config.sigma_alpha_sku)
-        alpha_brand = pm.Normal(
+        alpha_brand_offset = pm.Normal("alpha_brand_offset", 0.0, 1.0, dims="brand")
+        alpha_brand = pm.Deterministic(
             "alpha_brand",
-            mu=alpha_category[brand_category_idx],
-            sigma=sigma_alpha_brand,
+            alpha_category[brand_category_idx] + alpha_brand_offset * sigma_alpha_brand,
             dims="brand",
         )
         sigma_alpha_sku = pm.HalfNormal("sigma_alpha_sku", sigma=config.sigma_alpha_sku)
