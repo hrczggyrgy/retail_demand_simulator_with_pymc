@@ -1012,8 +1012,18 @@ def render_fit_validate_page(
                 st.success("Coverage well-calibrated")
         else:
             st.info("Posterior predictive samples not available for coverage calculation.")
-    
+     
     st.divider()
+     
+    # Get model-specific variable names for PPC
+    if _is_joint_model_mode(model_mode):
+        obs_var = "observed_units"
+        pred_var = "sku_units_obs"
+        metric_name = "package units"
+    else:
+        obs_var = "log_velocity_std_z_obs"
+        pred_var = "log_velocity_std_z_obs"
+        metric_name = "standardised log velocity"
     
     # PPC plots
     col3, col4 = st.columns(2)
@@ -1021,36 +1031,37 @@ def render_fit_validate_page(
     with col3:
         st.markdown("### Observed vs Predicted (PPC)")
         try:
-            if hasattr(idata, "posterior_predictive") and "y" in idata.posterior_predictive:
-                y_obs = idata.observed_data["y"].values.flatten() if "y" in idata.observed_data else None
-                y_pred = idata.posterior_predictive["y"].values
-                if y_obs is not None and len(y_obs) > 0:
-                    pred_median = np.median(y_pred, axis=(0, 1))
-                    pred_p05 = np.percentile(y_pred, 5, axis=(0, 1))
-                    pred_p95 = np.percentile(y_pred, 95, axis=(0, 1))
+            if (hasattr(idata, "posterior_predictive") and pred_var in idata.posterior_predictive
+                and hasattr(idata, "observed_data") and obs_var in idata.observed_data):
+                y_obs = idata.observed_data[obs_var].values.flatten()
+                y_pred = idata.posterior_predictive[pred_var].values
+                pred_median = np.median(y_pred, axis=(0, 1))
+                pred_p05 = np.percentile(y_pred, 5, axis=(0, 1))
+                pred_p95 = np.percentile(y_pred, 95, axis=(0, 1))
 
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=y_obs, y=y_obs, mode="lines", name="Perfect fit", 
-                                            line=dict(dash="dash", color="gray")))
-                    fig.add_trace(go.Scatter(
-                        x=y_obs, y=pred_median, mode="markers", name="Posterior median",
-                        marker=dict(color="blue", size=4, opacity=0.6),
-                        error_y=dict(type="data", symmetric=False, array=pred_p95 - pred_median, 
-                                     arrayminus=pred_median - pred_p05, color="lightblue")
-                    ))
-                    fig.update_layout(height=400, xaxis_title="Observed (log velocity_std)", 
-                                     yaxis_title="Predicted (log velocity_std)",
-                                     title="Posterior Predictive Check: Observed vs Predicted")
-                    st.plotly_chart(fig, use_container_width=True)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=y_obs, y=y_obs, mode="lines", name="Perfect fit", 
+                                         line=dict(dash="dash", color="gray")))
+                fig.add_trace(go.Scatter(
+                    x=y_obs, y=pred_median, mode="markers", name="Posterior median",
+                    marker=dict(color="blue", size=4, opacity=0.6),
+                    error_y=dict(type="data", symmetric=False, array=pred_p95 - pred_median, 
+                                 arrayminus=pred_median - pred_p05, color="lightblue")
+                ))
+                fig.update_layout(height=400, xaxis_title=f"Observed ({metric_name})", 
+                                  yaxis_title=f"Predicted ({metric_name})",
+                                  title="Posterior Predictive Check: Observed vs Predicted")
+                st.plotly_chart(fig, use_container_width=True)
         except Exception as e:
             st.info(f"PPC plot unavailable: {e}")
     
     with col4:
         st.markdown("### Residual Heatmap (Retailer × Month)")
         try:
-            if hasattr(idata, "posterior_predictive") and "y" in idata.posterior_predictive:
-                y_obs = idata.observed_data["y"].values.flatten()
-                y_pred = np.median(idata.posterior_predictive["y"].values, axis=(0, 1))
+            if (hasattr(idata, "posterior_predictive") and pred_var in idata.posterior_predictive
+                and hasattr(idata, "observed_data") and obs_var in idata.observed_data):
+                y_obs = idata.observed_data[obs_var].values.flatten()
+                y_pred = np.median(idata.posterior_predictive[pred_var].values, axis=(0, 1))
                 residuals = y_obs - y_pred
 
                 if "retailer" in df.columns and "month" in df.columns:
