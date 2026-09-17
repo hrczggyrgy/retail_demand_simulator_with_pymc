@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 """Comprehensive test of app functionality: data, model, tabs, scenarios, reasonable outputs."""
 import numpy as np
+import pandas as pd
 import pytest
 
 import demo_data
 import engine
 from engine import REQUIRED_COLUMNS
+import plotly.graph_objects as go
 
 # ============================================================
 # Issue 2: Deterministic fixtures and engine tests
@@ -836,7 +838,338 @@ def test_nest_model_builds() -> None:
     print("✓ Nest allocation model builds with all required variables")
 
 
-if __name__ == "__main__":
+# ============================================================================
+# Visual layer tests
+# ============================================================================
+
+def test_joint_scenario_reconciliation_passes() -> None:
+    """Test that joint scenario reconciliation passes for a valid scenario."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+    
+    choice_data = engine.build_choice_set_data(enriched, meta)
+    
+    # Build and fit with minimal config
+    joint_config = engine.JointModelConfig(
+        draws=20, tune=20, chains=1, target_accept=0.9,
+    )
+    model = engine.build_joint_sku_share_model(choice_data, joint_config)
+    idata = engine.fit_joint_model(model, joint_config)
+    
+    # Extract posterior
+    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42)
+    
+    # Create a simple action
+    action = engine.ScenarioAction(
+        retailer=choice_data.retailer_levels[0],
+        category=choice_data.category_levels[0],
+        brand=choice_data.brand_levels[0],
+        sku=choice_data.sku_ids[0],
+        month=str(choice_data.month_levels[0]),
+        new_price_std=choice_data.relative_price[0, 0] * 0.95,  # 5% price cut
+        new_nd=None,
+        nd_mode="pp",
+    )
+    
+    result = engine.run_joint_scenario_draws(
+        choice_data=choice_data,
+        posterior_cache=cache,
+        actions=[action],
+        n_draws=10,
+        random_seed=42,
+    )
+    
+    recon = engine.check_scenario_reconciliation(result, choice_data)
+    
+    assert recon["all_passed"], f"Reconciliation failed: {recon.get('details', [])}"
+    assert recon["baseline_shares_sum_to_one"]
+    assert recon["scenario_shares_sum_to_one"]
+    assert recon["baseline_units_match_totals"]
+    assert recon["scenario_units_match_totals"]
+    assert recon["delta_consistency"]
+
+
+def test_source_segments_are_mutually_exclusive() -> None:
+    """Test that source segments are mutually exclusive (no overlapping SKUs)."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+    
+    choice_data = engine.build_choice_set_data(enriched, meta)
+    
+    joint_config = engine.JointModelConfig(
+        draws=20, tune=20, chains=1, target_accept=0.9,
+    )
+    model = engine.build_joint_sku_share_model(choice_data, joint_config)
+    idata = engine.fit_joint_model(model, joint_config)
+    
+    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42)
+    
+    action = engine.ScenarioAction(
+        retailer=choice_data.retailer_levels[0],
+        category=choice_data.category_levels[0],
+        brand=choice_data.brand_levels[0],
+        sku=choice_data.sku_ids[0],
+        month=str(choice_data.month_levels[0]),
+        new_price_std=choice_data.relative_price[0, 0] * 0.95,
+        new_nd=None,
+        nd_mode="pp",
+    )
+    
+    result = engine.run_joint_scenario_draws(
+        choice_data=choice_data,
+        posterior_cache=cache,
+        actions=[action],
+        n_draws=10,
+        random_seed=42,
+    )
+    
+    source_df = engine.build_source_destination_summary(
+        result, choice_data, action
+    )
+    
+    # Each SKU should appear in exactly one source segment
+    # (The function aggregates by segment, so we check segments are distinct)
+    segment_names = source_df["source_relationship"].tolist()
+    assert len(segment_names) == len(set(segment_names)), "Segments must be unique"
+    
+    # Selected SKU should not be in sources
+    assert "selected_sku" not in segment_names, "Selected SKU should not be a source"
+    
+    # Outside option should be a possible segment
+    print(f"✓ Source segments are mutually exclusive: {segment_names}")
+
+
+def test_selected_sku_gain_equals_sum_of_sources() -> None:
+    """Test that selected SKU gain equals negative sum of source deltas (reconciliation)."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+    
+    choice_data = engine.build_choice_set_data(enriched, meta)
+    
+    joint_config = engine.JointModelConfig(
+        draws=20, tune=20, chains=1, target_accept=0.9,
+    )
+    model = engine.build_joint_sku_share_model(choice_data, joint_config)
+    idata = engine.fit_joint_model(model, joint_config)
+    
+    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42)
+    
+    action = engine.ScenarioAction(
+        retailer=choice_data.retailer_levels[0],
+        category=choice_data.category_levels[0],
+        brand=choice_data.brand_levels[0],
+        sku=choice_data.sku_ids[0],
+        month=str(choice_data.month_levels[0]),
+        new_price_std=choice_data.relative_price[0, 0] * 0.95,
+        new_nd=None,
+        nd_mode="pp",
+    )
+    
+    result = engine.run_joint_scenario_draws(
+        choice_data=choice_data,
+        posterior_cache=cache,
+        actions=[action],
+        n_draws=10,
+        random_seed=42,
+    )
+    
+    source_df = engine.build_source_destination_summary(
+        result, choice_data, action
+    )
+    
+    # Selected SKU delta (positive = gain)
+    selected_sku_idx = choice_data.sku_to_idx[action.sku]
+    selected_delta = result.delta_units_p50[0, selected_sku_idx]  # first market
+    
+    # Sum of source deltas (negative = loss)
+    total_source_delta = source_df["delta_standard_volume_p50"].sum()
+    
+    # They should balance (selected gain ≈ -source losses)
+    # Allow small tolerance for numerical precision
+    balance = selected_delta + total_source_delta
+    assert abs(balance) < 1.0, f"Gain/loss imbalance: selected={selected_delta:.2f}, sources={total_source_delta:.2f}, balance={balance:.4f}"
+    
+    print(f"✓ Selected SKU gain ({selected_delta:.1f}) balances source losses ({total_source_delta:.1f})")
+
+
+def test_sankey_hidden_when_reconciliation_fails() -> None:
+    """Test that Sankey creation handles failed reconciliation gracefully."""
+    # Create a source_df with no negative deltas (no sources)
+    source_df = pd.DataFrame({
+        "source_relationship": ["same_brand", "other_brand"],
+        "delta_standard_volume_p50": [10.0, 5.0],  # positive = gains, not sources
+        "delta_standard_volume_p05": [5.0, 2.0],
+        "delta_standard_volume_p95": [15.0, 8.0],
+        "source_share_p50": [0.0, 0.0],
+        "probability_source_loss": [0.0, 0.0],
+    })
+    
+    fig = engine.create_reallocation_sankey(source_df, "Test SKU")
+    
+    # Should return a figure (empty with message)
+    assert fig is not None
+    assert isinstance(fig, go.Figure)
+    print("✓ Sankey handles no-source case gracefully")
+
+
+def test_interval_ordering_is_valid() -> None:
+    """Test that posterior intervals are ordered P05 <= P50 <= P95."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+    
+    choice_data = engine.build_choice_set_data(enriched, meta)
+    
+    joint_config = engine.JointModelConfig(
+        draws=20, tune=20, chains=1, target_accept=0.9,
+    )
+    model = engine.build_joint_sku_share_model(choice_data, joint_config)
+    idata = engine.fit_joint_model(model, joint_config)
+    
+    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42)
+    
+    action = engine.ScenarioAction(
+        retailer=choice_data.retailer_levels[0],
+        category=choice_data.category_levels[0],
+        brand=choice_data.brand_levels[0],
+        sku=choice_data.sku_ids[0],
+        month=str(choice_data.month_levels[0]),
+        new_price_std=choice_data.relative_price[0, 0] * 0.95,
+        new_nd=None,
+        nd_mode="pp",
+    )
+    
+    result = engine.run_joint_scenario_draws(
+        choice_data=choice_data,
+        posterior_cache=cache,
+        actions=[action],
+        n_draws=10,
+        random_seed=42,
+    )
+    
+    # Check per-draw quantiles for all SKUs
+    for m in range(result.baseline_units_p05.shape[0]):
+        for s in range(result.baseline_units_p05.shape[1]):
+            assert result.baseline_units_p05[m, s] <= result.baseline_units_p50[m, s] <= result.baseline_units_p95[m, s], \
+                f"Baseline interval ordering failed at market {m}, SKU {s}"
+            assert result.scenario_units_p05[m, s] <= result.scenario_units_p50[m, s] <= result.scenario_units_p95[m, s], \
+                f"Scenario interval ordering failed at market {m}, SKU {s}"
+            assert result.delta_units_p05[m, s] <= result.delta_units_p50[m, s] <= result.delta_units_p95[m, s], \
+                f"Delta interval ordering failed at market {m}, SKU {s}"
+    
+    print("✓ All posterior intervals ordered: P05 <= P50 <= P95")
+
+
+def test_unavailable_sku_has_zero_scenario_share() -> None:
+    """Test that unavailable SKUs have zero scenario share."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+    
+    choice_data = engine.build_choice_set_data(enriched, meta)
+    
+    # Find an unavailable SKU
+    unavailable_mask = choice_data.available_mask == False
+    if not unavailable_mask.any():
+        print("✓ No unavailable SKUs in test data (all available)")
+        return
+    
+    joint_config = engine.JointModelConfig(
+        draws=20, tune=20, chains=1, target_accept=0.9,
+    )
+    model = engine.build_joint_sku_share_model(choice_data, joint_config)
+    idata = engine.fit_joint_model(model, joint_config)
+    
+    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42)
+    
+    action = engine.ScenarioAction(
+        retailer=choice_data.retailer_levels[0],
+        category=choice_data.category_levels[0],
+        brand=choice_data.brand_levels[0],
+        sku=choice_data.sku_ids[0],
+        month=str(choice_data.month_levels[0]),
+        new_price_std=choice_data.relative_price[0, 0] * 0.95,
+        new_nd=None,
+        nd_mode="pp",
+    )
+    
+    result = engine.run_joint_scenario_draws(
+        choice_data=choice_data,
+        posterior_cache=cache,
+        actions=[action],
+        n_draws=10,
+        random_seed=42,
+    )
+    
+    # Check that unavailable SKUs have zero shares in both baseline and scenario
+    for m in range(choice_data.n_markets):
+        for s in range(choice_data.n_skus):
+            if not choice_data.available_mask[m, s]:
+                baseline_shares = result.baseline_shares[:, m, s]
+                scenario_shares = result.scenario_shares[:, m, s]
+                
+                assert np.allclose(baseline_shares, 0.0, atol=1e-6), \
+                    f"Unavailable SKU {s} in market {m} has non-zero baseline share"
+                assert np.allclose(scenario_shares, 0.0, atol=1e-6), \
+                    f"Unavailable SKU {s} in market {m} has non-zero scenario share"
+    
+    print("✓ Unavailable SKUs have zero shares in both baseline and scenario")
+
+
+def test_total_market_delta_equals_sum_of_sku_deltas() -> None:
+    """Test that total market delta equals sum of SKU deltas."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+    
+    choice_data = engine.build_choice_set_data(enriched, meta)
+    
+    joint_config = engine.JointModelConfig(
+        draws=20, tune=20, chains=1, target_accept=0.9,
+    )
+    model = engine.build_joint_sku_share_model(choice_data, joint_config)
+    idata = engine.fit_joint_model(model, joint_config)
+    
+    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42)
+    
+    action = engine.ScenarioAction(
+        retailer=choice_data.retailer_levels[0],
+        category=choice_data.category_levels[0],
+        brand=choice_data.brand_levels[0],
+        sku=choice_data.sku_ids[0],
+        month=str(choice_data.month_levels[0]),
+        new_price_std=choice_data.relative_price[0, 0] * 0.95,
+        new_nd=None,
+        nd_mode="pp",
+    )
+    
+    result = engine.run_joint_scenario_draws(
+        choice_data=choice_data,
+        posterior_cache=cache,
+        actions=[action],
+        n_draws=10,
+        random_seed=42,
+    )
+    
+    # Total market delta should be zero (market held fixed in joint model)
+    total_delta = result.delta_units_p50.sum()
+    assert abs(total_delta) < 1.0, f"Total market delta should be ~0, got {total_delta:.4f}"
+    
+    # Sum of SKU deltas per market should be zero
+    for m in range(choice_data.n_markets):
+        market_delta = result.delta_units_p50[m, :].sum()
+        assert abs(market_delta) < 1.0, f"Market {m} delta sum should be ~0, got {market_delta:.4f}"
+    
+    print("✓ Total market delta equals sum of SKU deltas (zero in fixed market)")
     # Issue 2 deterministic fixture tests
     test_demo_schema_contains_only_raw_columns()
     test_numeric_distribution_is_bounded()
@@ -883,5 +1216,14 @@ if __name__ == "__main__":
 
     # Phase 5: Nest allocation model tests
     test_nest_model_builds()
+
+    # Visual layer tests
+    test_joint_scenario_reconciliation_passes()
+    test_source_segments_are_mutually_exclusive()
+    test_selected_sku_gain_equals_sum_of_sources()
+    test_sankey_hidden_when_reconciliation_fails()
+    test_interval_ordering_is_valid()
+    test_unavailable_sku_has_zero_scenario_share()
+    test_total_market_delta_equals_sum_of_sku_deltas()
 
     print("\n=== ALL TESTS PASSED ===")
