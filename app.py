@@ -431,9 +431,7 @@ def _model_config_from_mode(mode: str) -> engine.ModelConfig:
     return engine.DEFAULT_CONFIG
 
 
-def fit_model_if_needed() -> None:
-    if st.session_state.model_result is not None:
-        return
+def fit_model_explicitly() -> None:
     if st.session_state.prepared_data is None:
         return
 
@@ -528,10 +526,27 @@ def render_sidebar() -> None:
                 "Advanced: full hierarchy with robust likelihood (slower)."
             ),
         )
+        # Reset model when mode changes
+        if st.session_state.get("model_mode") != model_mode:
+            st.session_state.model_result = None
+            st.session_state.fitted_model = None
+            st.session_state.model_settings = None
+            st.session_state.model_diagnostics = None
+            st.session_state.elasticities = None
+            st.session_state.posterior_cache = None
         st.session_state.model_mode = model_mode
+
+        if st.button("Fit / Re-fit model", use_container_width=True, type="primary"):
+            fit_model_explicitly()
+            st.rerun()
+
+        if st.session_state.model_result is not None:
+            config = st.session_state.model_settings["config"]
+            st.caption(f"Fitted with: {config.__class__.__name__}")
 
         st.divider()
         st.subheader("3. View filters")
+        st.caption("These filters affect display tabs only; scenarios always use the full market.")
 
         df = st.session_state.prepared_data
 
@@ -621,9 +636,6 @@ def main() -> None:
     if view_df.empty:
         st.warning("No data matches the selected view.")
         return
-
-    # Model should generally fit the full market, not the filtered view.
-    fit_model_if_needed()
 
     if st.session_state.model_result is None:
         # Still show descriptive tabs even without model
