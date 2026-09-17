@@ -70,26 +70,6 @@ st.markdown(
 # Constants & column mapping
 # ---------------------------------------------------------------------------
 
-# Standard column names used throughout the app
-STANDARD_COLUMNS = {
-    "month": "month",
-    "retailer": "retailer",
-    "category": "category",
-    "brand": "brand",
-    "sku": "sku",
-    "units": "units",
-    "revenue": "revenue",
-    "sku_stores": "sku_stores",
-    "retailer_stores": "retailer_stores",
-    "pack_size": "pack_size",
-    # Derived
-    "standard_volume": "standard_volume",
-    "price_std": "price_std",
-    "nd": "nd",
-    "velocity_std": "velocity_std",
-    "relative_price_std": "relative_price_std",
-}
-
 REQUIRED_RAW_COLUMNS = {
     "month", "retailer", "category", "brand", "sku",
     "units", "revenue", "sku_stores", "retailer_stores", "pack_size"
@@ -469,16 +449,8 @@ def fit_model_explicitly() -> None:
     st.session_state.fitted_model = model
     st.session_state.model_settings = {"config": config, "mode": mode}
     
-    if _is_joint_model_mode(mode):
-        st.session_state.model_diagnostics = engine.summarize_convergence_diagnostics(
-            idata,
-            observed_var="observed_units",
-            predictive_var="sku_units_obs",
-        )
-        # Extract elasticities from joint model (beta_sku)
-        # TODO: implement joint model elasticity extraction
-    else:
-        st.session_state.model_diagnostics = engine.get_model_diagnostics(idata)
+    st.session_state.model_diagnostics = engine.get_model_diagnostics(idata, mode)
+    if not _is_joint_model_mode(mode):
         st.session_state.elasticities = engine.extract_elasticities(
             idata,
             st.session_state.meta,
@@ -960,14 +932,12 @@ def render_fit_validate_page(
     model_mode = model_settings.get("mode", "Default (4 chains)")
     
     # Get typed convergence diagnostics with correct variable names for joint model
-    if _is_joint_model_mode(model_mode):
-        conv_diag = engine.summarize_convergence_diagnostics(
-            idata,
-            observed_var="observed_units",
-            predictive_var="sku_units_obs",
-        )
-    else:
-        conv_diag = engine.summarize_convergence_diagnostics(idata)
+    var_names = engine.get_model_variable_names(model_mode)
+    conv_diag = engine.summarize_convergence_diagnostics(
+        idata,
+        observed_var=var_names.observed_name,
+        predictive_var=var_names.predictive_name,
+    )
     
     # Divergence warning banner
     if conv_diag.divergences > 0:
@@ -1111,20 +1081,6 @@ def render_fit_validate_page(
 # Page 4: Scenario cockpit
 # ---------------------------------------------------------------------------
 
-def create_scenario_action_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Create the initial scenario action table from the enriched data."""
-    action_df = df[["month", "retailer", "category", "brand", "sku",
-                    "standard_volume", "price_std", "nd", "velocity_std",
-                    "relative_price_std"]].copy()
-    action_df["include"] = False
-    action_df["price_change_pct"] = 0.0
-    action_df["nd_change_pp"] = 0.0
-    action_df["nd_mode"] = "pp"
-    action_df["baseline_revenue"] = df["revenue"].values
-    action_df["baseline_volume"] = df["standard_volume"].values
-    return action_df
-
-
 def render_scenario_action_editor(df: pd.DataFrame) -> pd.DataFrame:
     """Render the editable scenario action table using st.data_editor."""
     st.markdown("### Define Scenario Actions")
@@ -1134,7 +1090,7 @@ def render_scenario_action_editor(df: pd.DataFrame) -> pd.DataFrame:
     )
     
     if "scenario_actions" not in st.session_state or st.session_state.scenario_actions is None:
-        st.session_state.scenario_actions = create_scenario_action_table(df)
+        st.session_state.scenario_actions = engine.create_scenario_action_table(df)
     
     action_df = st.session_state.scenario_actions.copy()
     
@@ -2320,7 +2276,7 @@ def render_scenario_cockpit_page(
             
             try:
                 waterfall = engine.create_driver_waterfall(
-                    scenarios["baseline"], scenarios[compare_scenario] if "compare_scenario" in locals() else scenarios["combined"],
+                    scenarios["baseline"], scenarios.get("combined", scenarios["baseline"]),
                     posterior_cache, spline, scales, meta
                 )
                 st.plotly_chart(waterfall, use_container_width=True)
@@ -2345,18 +2301,6 @@ def render_scenario_cockpit_page(
         st.divider()
         
         # Legacy detailed views (inside expanders)
-        with st.expander("📊 Detailed Market Impact Tables", expanded=False):
-            render_detailed_market_impact(scenarios, action_df)
-        
-        with st.expander("⚙️ Advanced: Cross-Category Sensitivity", expanded=False):
-            chart_subtitle("How does the substitution assumption affect other categories?")
-            st.plotly_chart(
-                engine.create_cross_category_sensitivity_chart(scenarios, cross_cat_sensitivity),
-                use_container_width=True
-            )
-            st.caption("Cross-category sensitivity is an assumption-led multiplier. "
-                       "Conservative: no substitution. Central: 5% of displaced volume reallocates. High: 15%.")
-        
         with st.expander("🔬 Parameter Attribution (Single SKU)", expanded=False):
             render_parameter_attribution(checked, meta, posterior_cache, spline, scales)
         

@@ -109,17 +109,6 @@ NUMERIC_COLUMNS = [
 
 KEY_COLUMNS = ["month", "retailer", "category", "brand", "sku"]
 
-# Standardized analytical column names (used throughout the engine)
-STANDARD_COLUMNS = {
-    "standard_volume": "standard_volume",
-    "price_per_standard_unit": "price_std",
-    "nd": "nd",
-    "velocity_std": "velocity_std",
-    "log_velocity_std": "log_velocity_std",
-    "relative_price_std": "relative_price_std",
-    "log_relative_price_std": "log_relative_price_std",
-}
-
 DEFAULT_DRAWS = 800
 DEFAULT_TUNE = 800
 DEFAULT_CHAINS = 1
@@ -164,7 +153,7 @@ DEFAULT_SCENARIO_DRAWS = 400
 # Model Configuration
 # ============================================================================
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ModelConfig:
     """Configuration for PyMC model fitting."""
     draws: int = 800
@@ -207,7 +196,7 @@ ADVANCED_CONFIG = ModelConfig(
 # Data classes
 # ============================================================================
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class ValidationReport:
     is_valid: bool
     row_count: int
@@ -219,7 +208,7 @@ class ValidationReport:
     info: dict[str, Any]
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class PreparedData:
     df: pd.DataFrame
     scales: dict[str, dict[str, float]]
@@ -228,7 +217,7 @@ class PreparedData:
     nd_basis: np.ndarray
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class ModelOutput:
     trace: xr.Dataset
     df: pd.DataFrame
@@ -236,14 +225,6 @@ class ModelOutput:
     spline: SplineTransformer
     scales: dict[str, dict[str, float]]
     settings: dict[str, Any]
-
-
-@dataclass
-class ScenarioResult:
-    df: pd.DataFrame
-    price_change: float
-    nd_change: float
-    summary: pd.DataFrame
 
 
 # ============================================================================
@@ -257,11 +238,11 @@ def _posterior_group(trace: Any):
     if hasattr(trace, "groups"):
         try:
             return trace["posterior"]
-        except Exception:
+        except (KeyError, TypeError):
             pass
     try:
         return trace["posterior"]
-    except Exception as exc:
+    except (KeyError, TypeError) as exc:
         raise ValueError("Trace does not contain a posterior group") from exc
 
 
@@ -2853,13 +2834,18 @@ def fit_model(
 # Diagnostics / elasticity
 # ============================================================================
 
-def get_model_diagnostics(idata) -> dict[str, Any]:
+def get_model_diagnostics(idata, model_mode: str = "Default (4 chains)") -> dict[str, Any]:
     """
     Get model diagnostics as a dictionary (backward compatible).
     
     Delegates to summarize_convergence_diagnostics for the actual computation.
     """
-    conv = summarize_convergence_diagnostics(idata)
+    var_names = get_model_variable_names(model_mode)
+    conv = summarize_convergence_diagnostics(
+        idata,
+        observed_var=var_names.observed_name,
+        predictive_var=var_names.predictive_name,
+    )
 
     return {
         "divergences": conv.divergences,
@@ -2869,41 +2855,6 @@ def get_model_diagnostics(idata) -> dict[str, Any]:
         "coverage_90": conv.coverage_90,
         "is_usable": conv.is_acceptable,
     }
-
-
-def get_posterior_predictive_check(
-    model: pm.Model,
-    idata: az.InferenceData,
-    prepared_df: pd.DataFrame,
-    random_seed: int = 42,
-) -> pd.DataFrame:
-    with model:
-        ppc = pm.sample_posterior_predictive(
-            idata,
-            var_names=["log_velocity_std_z_obs"],
-            random_seed=random_seed,
-            progressbar=False,
-        )
-
-    draws = ppc.posterior_predictive["log_velocity_std_z_obs"]
-    pred_median = draws.median(dim=("chain", "draw")).values
-    pred_p10 = draws.quantile(0.10, dim=("chain", "draw")).values
-    pred_p90 = draws.quantile(0.90, dim=("chain", "draw")).values
-
-    result = prepared_df[
-        ["month", "retailer", "category", "brand", "sku", "log_velocity_z"]
-    ].copy()
-
-    result["predicted_z_p10"] = pred_p10
-    result["predicted_z_median"] = pred_median
-    result["predicted_z_p90"] = pred_p90
-    result["residual_z"] = result["log_velocity_z"] - result["predicted_z_median"]
-    result["inside_p10_p90"] = (
-        (result["log_velocity_z"] >= result["predicted_z_p10"])
-        & (result["log_velocity_z"] <= result["predicted_z_p90"])
-    )
-
-    return result
 
 
 # ============================================================================
@@ -3079,6 +3030,14 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
+class ModelVariableNames:
+    """Model-specific variable names for observed and predictive data."""
+    observed_name: str
+    predictive_name: str
+    metric_name: str
+
+
+@dataclass(frozen=True, slots=True)
 class ConvergenceDiagnostics:
     divergences: int
     max_rhat: float | None
@@ -3086,6 +3045,31 @@ class ConvergenceDiagnostics:
     min_ess_tail: float | None
     coverage_90: float | None
     is_acceptable: bool
+
+
+def get_model_variable_names(model_mode: str) -> ModelVariableNames:
+    """
+    Get the correct variable names for a given model mode.
+    
+    Args:
+        model_mode: One of "Fast (2 chains)", "Default (4 chains)", "Advanced (4 chains, Student-t)",
+                   "Joint SKU Share Model (Dirichlet-Multinomial)"
+    
+    Returns:
+        ModelVariableNames with observed_name, predictive_name, and metric_name
+    """
+    if model_mode == "Joint SKU Share Model (Dirichlet-Multinomial)":
+        return ModelVariableNames(
+            observed_name="observed_units",
+            predictive_name="sku_units_obs",
+            metric_name="units"
+        )
+    else:
+        return ModelVariableNames(
+            observed_name="log_velocity_std_z_obs",
+            predictive_name="log_velocity_std_z_obs",
+            metric_name="log_velocity_std_z"
+        )
 
 
 def summarize_convergence_diagnostics(
@@ -3122,7 +3106,7 @@ def summarize_convergence_diagnostics(
             min_ess_bulk = float(summary["ess_bulk"].min())
         if "ess_tail" in summary.columns:
             min_ess_tail = float(summary["ess_tail"].min())
-    except Exception:
+    except (ValueError, KeyError, AttributeError, RuntimeError):
         pass
 
     # Posterior predictive coverage
@@ -3134,7 +3118,7 @@ def summarize_convergence_diagnostics(
             pred_p05 = np.percentile(y_pred, 5, axis=(0, 1))
             pred_p95 = np.percentile(y_pred, 95, axis=(0, 1))
             coverage_90 = float(np.mean((y_obs >= pred_p05) & (y_obs <= pred_p95)))
-        except Exception:
+        except (KeyError, ValueError, AttributeError, IndexError):
             pass
 
     is_acceptable = (
@@ -3338,51 +3322,11 @@ def run_rolling_backtest(
     For each cutoff month, fit on months through cutoff, forecast horizons ahead.
     Returns results at retailer x category x month level.
     """
-    months = sorted(df["month"].unique())
-
-    if len(months) < config.min_train_months + max(config.horizons):
-        return pd.DataFrame()
-
-    results = []
-
-    # Limit number of cutoffs
-    possible_cutoffs = months[config.min_train_months:-max(config.horizons)]
-    cutoffs = possible_cutoffs[-config.max_cutoffs:]
-
-    for cutoff in cutoffs:
-        train_mask = df["month"] <= cutoff
-        train_df = df.loc[train_mask].copy()
-
-        if len(train_df) == 0:
-            continue
-
-        # Build features for training data
-        train_features = build_retail_features(train_df)
-
-        # For each horizon, evaluate
-        for horizon in config.horizons:
-            val_start = cutoff + pd.DateOffset(months=1)
-            val_end = cutoff + pd.DateOffset(months=horizon)
-            val_mask = (df["month"] >= val_start) & (df["month"] <= val_end)
-            val_df = df.loc[val_mask].copy()
-
-            if len(val_df) == 0:
-                continue
-
-            # Aggregate to retailer x category x month for stable evaluation
-            actual = val_df.groupby(["retailer", "category", "month"])["units"].sum().reset_index()
-            actual = actual.rename(columns={"units": "actual_units"})
-
-            # Use posterior mean for prediction
-            # This is a simplified approach - full backtest would re-fit
-            # For now, use the posterior to predict on validation set
-            # In production, you'd re-fit the model on training data
-            # Placeholder for full implementation
-
-    if not results:
-        return pd.DataFrame()
-
-    return pd.DataFrame(results)
+    raise NotImplementedError(
+        "Rolling backtest not yet implemented. "
+        "Requires re-fitting model at each cutoff; use run_rolling_backtest_legacy "
+        "or implement full re-fit pipeline first."
+    )
 
 
 def build_nd_response_curve(
@@ -4258,149 +4202,69 @@ def aggregate_scenario(
 
 
 # ============================================================================
-# Posterior predictive diagnostics (opt-in)
-# ============================================================================
-
-def get_posterior_predictive_check(
-    trace: Any,
-    df: pd.DataFrame,
-    max_points: int = 3000,
-) -> pd.DataFrame:
-    """
-    Generate a compact PPC diagnostic on demand.
-
-    This is deliberately NOT part of fit_model() by default.
-    """
-    var_name = _find_posterior_variable(
-        trace,
-        ["log_velocity_std_z_obs"],
-    )
-    if var_name is None:
-        return pd.DataFrame()
-
-    posterior = _posterior_group(trace)
-
-    try:
-        pred = _posterior_array(trace, var_name, ("obs",))
-    except Exception:
-        return pd.DataFrame()
-
-    pred = pred.reshape(-1, pred.shape[-1])
-
-    if pred.shape[1] != len(df):
-        return pd.DataFrame()
-
-    observed = df["log_velocity_z"].to_numpy(dtype=float)
-    pred_mean = np.mean(pred, axis=0)
-
-    if len(df) > max_points:
-        idx = np.linspace(0, len(df) - 1, max_points).round().astype(int)
-    else:
-        idx = np.arange(len(df))
-
-    result = pd.DataFrame(
-        {
-            "observed_z": observed[idx],
-            "predicted_z": pred_mean[idx],
-        }
-    )
-    result["residual_z"] = (
-        result["observed_z"] - result["predicted_z"]
-    )
-    return result
-
-
-# ============================================================================
 # Compatibility aliases / small analytical summaries
 # ============================================================================
 
+# Common aggregation metrics for descriptive summaries
+_SUMMARY_METRICS = {
+    "revenue": ("revenue", "sum"),
+    "units": ("units", "sum"),
+    "standard_volume": ("standard_volume", "sum"),
+    "price_std": ("price_std", "mean"),
+    "nd": ("nd", "mean"),
+    "velocity_std": ("velocity_std", "mean"),
+    "decomposition_error": ("decomposition_error", "mean"),
+}
+
+
+def _group_and_agg(
+    df: pd.DataFrame,
+    group_cols: list[str],
+    metrics: dict[str, tuple[str, str]] = None,
+    sort_by: list[str] = None,
+) -> pd.DataFrame:
+    """Generic groupby-agg helper for descriptive summaries."""
+    if metrics is None:
+        metrics = _SUMMARY_METRICS
+    agg_df = df.groupby(group_cols, observed=True).agg(**metrics).reset_index()
+    if sort_by:
+        agg_df = agg_df.sort_values(sort_by)
+    return agg_df
+
+
 def create_market_summary(df: pd.DataFrame) -> pd.DataFrame:
-    return (
-        df.groupby("month", observed=True)
-        .agg(
-            revenue=("revenue", "sum"),
-            units=("units", "sum"),
-            standard_volume=("standard_volume", "sum"),
-            price_per_standard_unit=("price_std", "mean"),
-            nd=("nd", "mean"),
-            velocity_std=("velocity_std", "mean"),
-            decomposition_error=("decomposition_error", "mean"),
-        )
-        .reset_index()
-        .sort_values("month")
-    )
+    return _group_and_agg(df, ["month"], sort_by=["month"])
 
 
 def create_category_summary(df: pd.DataFrame) -> pd.DataFrame:
-    return (
-        df.groupby(["month", "category"], observed=True)
-        .agg(
-            revenue=("revenue", "sum"),
-            units=("units", "sum"),
-            standard_volume=("standard_volume", "sum"),
-            price_per_standard_unit=("price_std", "mean"),
-            nd=("nd", "mean"),
-            velocity_std=("velocity_std", "mean"),
-            decomposition_error=("decomposition_error", "mean"),
-        )
-        .reset_index()
-        .sort_values(["month", "category"])
-    )
+    return _group_and_agg(df, ["month", "category"], sort_by=["month", "category"])
 
 
 def create_retailer_summary(df: pd.DataFrame) -> pd.DataFrame:
-    return (
-        df.groupby(["month", "retailer"], observed=True)
-        .agg(
-            revenue=("revenue", "sum"),
-            units=("units", "sum"),
-            standard_volume=("standard_volume", "sum"),
-            price_per_standard_unit=("price_std", "mean"),
-            nd=("nd", "mean"),
-            velocity_std=("velocity_std", "mean"),
-            decomposition_error=("decomposition_error", "mean"),
-        )
-        .reset_index()
-        .sort_values(["month", "retailer"])
-    )
+    return _group_and_agg(df, ["month", "retailer"], sort_by=["month", "retailer"])
 
 
 def create_brand_summary(df: pd.DataFrame) -> pd.DataFrame:
-    return (
-        df.groupby(["month", "brand"], observed=True)
-        .agg(
-            revenue=("revenue", "sum"),
-            units=("units", "sum"),
-            standard_volume=("standard_volume", "sum"),
-            price_per_standard_unit=("price_std", "mean"),
-            nd=("nd", "mean"),
-            velocity_std=("velocity_std", "mean"),
-            decomposition_error=("decomposition_error", "mean"),
-        )
-        .reset_index()
-        .sort_values(["month", "brand"])
-    )
+    return _group_and_agg(df, ["month", "brand"], sort_by=["month", "brand"])
 
 
 def create_sku_summary(df: pd.DataFrame) -> pd.DataFrame:
-    grouped = (
-        df.groupby(
-            ["category", "retailer", "brand", "sku", "pack_size"],
-            observed=True,
-        )
-        .agg(
-            units=("units", "sum"),
-            revenue=("revenue", "sum"),
-            standard_volume=("standard_volume", "sum"),
-            price_per_standard_unit=("price_std", "mean"),
-            other_skus_price_std=("other_skus_price_std", "mean"),
-            relative_price=("relative_price", "mean"),
-            relative_price_std=("relative_price_std", "mean"),
-            nd=("nd", "mean"),
-            velocity_std=("velocity_std", "mean"),
-            decomposition_error=("decomposition_error", "mean"),
-        )
-        .reset_index()
+    sku_metrics = {
+        "units": ("units", "sum"),
+        "revenue": ("revenue", "sum"),
+        "standard_volume": ("standard_volume", "sum"),
+        "price_std": ("price_std", "mean"),
+        "other_skus_price_std": ("other_skus_price_std", "mean"),
+        "relative_price": ("relative_price", "mean"),
+        "relative_price_std": ("relative_price_std", "mean"),
+        "nd": ("nd", "mean"),
+        "velocity_std": ("velocity_std", "mean"),
+        "decomposition_error": ("decomposition_error", "mean"),
+    }
+    grouped = _group_and_agg(
+        df,
+        ["category", "retailer", "brand", "sku", "pack_size"],
+        metrics=sku_metrics,
     )
 
     total_units = grouped["units"].sum()
@@ -6020,26 +5884,6 @@ def create_brand_pack_heatmap(market_impact_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def create_cross_category_sensitivity_chart(
-    scenarios: dict,
-    sensitivity: float
-) -> go.Figure:
-    """Create a chart showing how cross-category sensitivity affects results."""
-    fig = go.Figure()
-    fig.add_annotation(
-        text=f"Cross-category sensitivity: {sensitivity:.0%} substitution",
-        x=0.5, y=0.5, showarrow=False,
-        font=dict(size=16)
-    )
-    fig.update_layout(
-        title="Cross-Category Sensitivity Analysis",
-        height=300,
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False)
-    )
-    return fig
-
-
 # ============================================================================
 # Scenario Action Table Support (New simplified workflow)
 # ============================================================================
@@ -6065,35 +5909,43 @@ def create_scenario_action_table(
     """
     Create the editable scenario action table from the prepared data.
     
-    Returns a DataFrame with one row per unique retailer × category × brand × SKU
+    Returns a DataFrame with one row per unique month × retailer × category × brand × SKU
     containing baseline values and editable new values.
+    
+    Raises:
+        ValueError: If input DataFrame is missing required enriched columns.
     """
-    # Get latest month data for each SKU as baseline
-    latest_month = df["month"].max()
-    latest = df[df["month"] == latest_month].copy()
+    required_cols = {"month", "retailer", "category", "brand", "sku", "pack_size",
+                     "price_std", "nd", "standard_volume", "velocity_std", "revenue"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(
+            "Scenario action table requires enriched market data. "
+            f"Missing columns: {sorted(missing)}"
+        )
     
-    # Group by retailer, category, brand, sku to get latest values
-    action_cols = ["retailer", "category", "brand", "sku", "pack_size"]
-    baseline = latest.groupby(action_cols, as_index=False).agg(
-        baseline_price_std=("price_std", "mean"),
-        baseline_nd=("nd", "mean"),
-    )
+    action_cols = ["month", "retailer", "category", "brand", "sku", "pack_size"]
+    baseline = df[action_cols + ["standard_volume", "price_std", "nd", "velocity_std", 
+                                  "relative_price_std", "revenue"]].copy()
     
-    # Add editable columns
-    baseline["new_price_std"] = baseline["baseline_price_std"]
-    baseline["new_nd"] = baseline["baseline_nd"]
-    baseline["apply"] = False
+    baseline["include"] = False
+    baseline["price_change_pct"] = 0.0
+    baseline["nd_change_pp"] = 0.0
+    baseline["nd_mode"] = "pp"
     
-    # Calculate changes
-    baseline["price_change"] = 0.0
-    baseline["nd_change"] = 0.0
+    if "relative_price_std" not in baseline.columns:
+        cat_mean_price = df.groupby(["month", "category"])["price_std"].transform("mean")
+        baseline["relative_price_std"] = baseline["price_std"] / cat_mean_price
     
-    # Reorder columns for UI
     cols_order = [
-        "apply", "retailer", "category", "brand", "sku", "pack_size",
-        "baseline_price_std", "baseline_nd", "new_price_std", "new_nd",
-        "price_change", "nd_change"
+        "include", "month", "retailer", "category", "brand", "sku", "pack_size",
+        "standard_volume", "price_std", "nd", "velocity_std", "relative_price_std",
+        "price_change_pct", "nd_change_pp", "nd_mode",
+        "baseline_revenue", "baseline_volume",
     ]
+    
+    baseline["baseline_revenue"] = baseline["revenue"]
+    baseline["baseline_volume"] = baseline["standard_volume"]
     
     return baseline[cols_order].reset_index(drop=True)
 

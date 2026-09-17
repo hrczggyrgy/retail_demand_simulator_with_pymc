@@ -86,8 +86,8 @@ def test_scenario_action_table_rejects_raw_data() -> None:
     raw_df = demo_data.generate_demo_data()
 
     with pytest.raises(
-        KeyError,
-        match="price_std",
+        ValueError,
+        match="Scenario action table requires enriched market data",
     ):
         engine.create_scenario_action_table(raw_df)
 
@@ -101,12 +101,20 @@ def test_scenario_action_table_accepts_enriched_data() -> None:
     action_df = engine.create_scenario_action_table(enriched_df)
 
     assert not action_df.empty
-    assert "baseline_price_std" in action_df.columns
-    assert "baseline_nd" in action_df.columns
-    assert "new_price_std" in action_df.columns
-    assert "new_nd" in action_df.columns
-    assert "price_change" in action_df.columns
-    assert "nd_change" in action_df.columns
+    assert "include" in action_df.columns
+    assert "month" in action_df.columns
+    assert "retailer" in action_df.columns
+    assert "category" in action_df.columns
+    assert "brand" in action_df.columns
+    assert "sku" in action_df.columns
+    assert "price_std" in action_df.columns
+    assert "nd" in action_df.columns
+    assert "velocity_std" in action_df.columns
+    assert "price_change_pct" in action_df.columns
+    assert "nd_change_pp" in action_df.columns
+    assert "nd_mode" in action_df.columns
+    assert "baseline_revenue" in action_df.columns
+    assert "baseline_volume" in action_df.columns
 
 
 def test_model_config_presets():
@@ -174,8 +182,6 @@ def test_calculate_market_shares():
     )
     for c in res.columns:
         scope[c] = res[c].to_numpy()
-    scope["expected_units_median"] = scope["units_p50"].to_numpy()
-    scope["expected_revenue_median"] = scope["revenue_p50"].to_numpy()
     for level in ["brand", "category", "retailer", "sku"]:
         sh = engine.calculate_market_shares(scope, scope, level)
         assert "baseline_share" in sh.columns
