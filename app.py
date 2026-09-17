@@ -1101,9 +1101,9 @@ def render_fit_validate_page(
 # ---------------------------------------------------------------------------
 
 def create_scenario_action_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Create the initial scenario action table from the prepared data."""
+    """Create the initial scenario action table from the enriched data."""
     action_df = df[["month", "retailer", "category", "brand", "sku",
-                    "standard_volume", "price_per_standard_unit", "nd", "velocity_std",
+                    "standard_volume", "price_std", "nd", "velocity_std",
                     "relative_price_std"]].copy()
     action_df["include"] = False
     action_df["price_change_pct"] = 0.0
@@ -1139,7 +1139,7 @@ def render_scenario_action_editor(df: pd.DataFrame) -> pd.DataFrame:
         merged["nd_mode"] = merged["nd_mode"].fillna("pp")
         
         merged["standard_volume"] = df["standard_volume"].values
-        merged["price_per_standard_unit"] = df["price_per_standard_unit"].values
+        merged["price_std"] = df["price_std"].values
         merged["nd"] = df["nd"].values
         merged["velocity_std"] = df["velocity_std"].values
         merged["relative_price_std"] = df["relative_price_std"].values
@@ -1160,7 +1160,7 @@ def render_scenario_action_editor(df: pd.DataFrame) -> pd.DataFrame:
         "brand": st.column_config.TextColumn("Brand", disabled=True),
         "sku": st.column_config.TextColumn("SKU", disabled=True),
         "standard_volume": st.column_config.NumberColumn("Std Volume", format="%,.0f", disabled=True),
-        "price_per_standard_unit": st.column_config.NumberColumn("Price/Std Unit", format="%.2f", disabled=True),
+        "price_std": st.column_config.NumberColumn("Price/Std Unit", format="%.2f", disabled=True),
         "nd": st.column_config.NumberColumn("ND", format="%.1%", disabled=True),
         "velocity_std": st.column_config.NumberColumn("Velocity Std", format="%.2f", disabled=True),
         "relative_price_std": st.column_config.NumberColumn("Rel Price Std", format="%.2f", disabled=True),
@@ -1182,7 +1182,7 @@ def render_scenario_action_editor(df: pd.DataFrame) -> pd.DataFrame:
     
     display_cols = [
         "include", "month", "retailer", "category", "brand", "sku",
-        "standard_volume", "price_per_standard_unit", "nd", "velocity_std", "relative_price_std",
+        "standard_volume", "price_std", "nd", "velocity_std", "relative_price_std",
         "price_change_pct", "nd_change_pp", "nd_mode",
         "baseline_revenue", "baseline_volume",
     ]
@@ -2246,7 +2246,7 @@ def render_scenario_cockpit_page(
         
         st.divider()
     
-    action_df = render_scenario_action_editor(df)
+    action_df = render_scenario_action_editor(view_enriched)
     
     checked = action_df[action_df["include"]]
     if not checked.empty:
