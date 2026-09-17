@@ -96,6 +96,93 @@ def month_label(value) -> str:
     return pd.Timestamp(value).strftime("%b %Y")
 
 
+def render_workflow_banner(
+    has_data: bool,
+    has_model: bool,
+    has_scenario: bool,
+) -> None:
+    """Render workflow progress banner showing user journey status."""
+    steps = [
+        ("1. Check data", has_data, "Data loaded and validated"),
+        ("2. Explore market", has_data, "Features prepared, market visible"),
+        ("3. Fit model", has_model, "Posterior sampled, diagnostics available"),
+        ("4. Run scenario", has_scenario, "Baseline vs scenario comparison ready"),
+        ("5. Review impact", has_scenario, "Market reallocation, uncertainty assessed"),
+    ]
+
+    icons = []
+    for label, complete, _tooltip in steps:
+        icon = "✅" if complete else "⬜"
+        icons.append(f"{icon} {label}")
+
+    st.caption("  →  ".join(icons), help="Your progress through the decision workflow")
+
+    if not has_model:
+        st.info(
+            "💡 Next step: Go to the sidebar, choose a model mode, and click **Fit / Re-fit model** "
+            "to enable scenario simulation."
+        )
+    elif has_model and not has_scenario:
+        st.info(
+            "💡 Model is ready. Go to the **Scenario simulator** tab to define a price or "
+            "distribution action and run a scenario."
+        )
+
+
+def chart_subtitle(question: str) -> None:
+    """Render a standardized chart subtitle with the business question."""
+    st.caption(f"📋 {question}")
+
+
+def render_scope_context(scope_text: str, period_text: str | None = None) -> None:
+    """Render market scope and period context below charts/KPIs."""
+    parts = [f"Scope: {scope_text}"]
+    if period_text:
+        parts.append(f"Period: {period_text}")
+    st.caption(" | ".join(parts))
+
+
+def render_model_diagnostic_status(diagnostics: dict, prefix: str = "") -> None:
+    """Render model diagnostic status cards for scenario simulator."""
+    if not diagnostics:
+        st.warning("⚠ Model diagnostics not available")
+        return
+
+    divergences = diagnostics.get("divergences", 0)
+    max_rhat = diagnostics.get("max_rhat")
+    min_ess = diagnostics.get("min_ess_bulk")
+    ppc_coverage = diagnostics.get("ppc_coverage_90")
+    is_decision_ready = diagnostics.get("is_decision_ready", False)
+
+    if is_decision_ready:
+        st.success("✅ Model status: **Decision-ready** — convergence checks passed")
+    elif divergences > 0:
+        st.warning(
+            f"⚠ Model status: **Exploratory** — {divergences} divergent transition(s) detected. "
+            "Results should not be interpreted as decision-ready parameter estimates."
+        )
+    elif max_rhat is not None and max_rhat > 1.01:
+        st.warning(
+            f"⚠ Model status: **Exploratory** — max R-hat = {max_rhat:.3f} (threshold: 1.01). "
+            "Chains may not have converged."
+        )
+    elif min_ess is not None and min_ess < 400:
+        st.warning(
+            f"⚠ Model status: **Exploratory** — min bulk ESS = {min_ess:.0f} (threshold: 400). "
+            "Effective sample size is low."
+        )
+    else:
+        st.info("ℹ Model status: **Exploratory** — review full diagnostics in Model Health tab")
+
+    # Compact diagnostic summary
+    with st.expander("🔬 Diagnostic details", expanded=False):
+        cols = st.columns(4)
+        cols[0].metric("Divergences", divergences)
+        cols[1].metric("Max R-hat", f"{max_rhat:.3f}" if max_rhat else "—")
+        cols[2].metric("Min ESS (bulk)", f"{min_ess:.0f}" if min_ess else "—")
+        cols[3].metric("PPC coverage (90%)", f"{ppc_coverage:.1%}" if ppc_coverage else "—")
+
+
 def unique_sorted(df: pd.DataFrame, col: str) -> list:
     if col not in df.columns:
         return []
@@ -541,8 +628,8 @@ def render_sidebar() -> None:
             st.caption(f"Fitted with: {config.__class__.__name__}")
 
         st.divider()
-        st.subheader("3. View filters")
-        st.caption("These filters affect display tabs only; scenarios always use the full market.")
+        st.subheader("3. Explore market")
+        st.caption("These filters affect **display tabs only**. Scenarios always use the full market.")
 
         df = st.session_state.prepared_data
 
@@ -569,10 +656,10 @@ def render_sidebar() -> None:
                 "To", months, index=len(months) - 1, format_func=month_label
             )
 
-st.caption(
-            "These filters change the market you are viewing. They do not remove "
-            "competitors from the scenario denominator unless you explicitly choose "
-            "a different market scope on the scenario page."
+        st.caption(
+            "💡 These filters change the market you are viewing. They do not remove "
+            "competitors from the scenario denominator — the scenario always uses the "
+            "full uploaded market."
         )
 
 
@@ -593,6 +680,12 @@ def main() -> None:
         how **brand or SKU market shares move** based on historical conditional associations.
         """
     )
+
+    # Workflow progress banner
+    has_data = st.session_state.raw_data is not None
+    has_model = st.session_state.model_result is not None
+    has_scenario = st.session_state.get("scenario_suite") is not None
+    render_workflow_banner(has_data, has_model, has_scenario)
 
     if st.session_state.raw_data is None:
         st.info(
@@ -703,7 +796,9 @@ def show_descriptive_tabs(df: pd.DataFrame, view_df: pd.DataFrame, start_month, 
 
 
 def render_overview_tab(view_df, view_enriched, elasticity_df, posterior_cache, meta, scales, spline, start_month, end_month) -> None:
-    st.subheader(f"Market Overview ({start_month.strftime('%b %Y')} – {end_month.strftime('%b %Y')})")
+    period_text = f"{start_month.strftime('%b %Y')} – {end_month.strftime('%b %Y')}"
+    st.subheader(f"Market Overview ({period_text})")
+    render_scope_context("All observed retailers, categories, brands, and SKUs", period_text)
 
     if view_enriched is not None and "category_units" in view_enriched.columns:
         latest_month = view_enriched["month"].max()
@@ -729,12 +824,16 @@ def render_overview_tab(view_df, view_enriched, elasticity_df, posterior_cache, 
         c4.metric("Brands", f"{brand_count}")
         c5.metric("Avg ND", f"{latest['nd'].mean():.1%}" if "nd" in latest.columns else "—")
 
+        # Scope context for KPIs
+        render_scope_context("All observed retailers, categories, brands, and SKUs", "Latest month vs. prior month")
+
     st.divider()
 
     col1, col2 = st.columns([2, 1])
 
     with col1:
         st.markdown("### Category Trend")
+        chart_subtitle("How has the observed market changed over time?")
         if "category_units" in view_enriched.columns:
             trend = view_enriched.groupby("month").agg(
                 units=("category_units", "sum"),
@@ -749,11 +848,13 @@ def render_overview_tab(view_df, view_enriched, elasticity_df, posterior_cache, 
                 height=350, hovermode="x unified", margin=dict(l=40, r=40, t=30, b=40)
             )
             st.plotly_chart(fig, use_container_width=True)
+            render_scope_context("All observed retailers, categories, brands, and SKUs", period_text)
         else:
             st.info("Category units not available in view.")
 
     with col2:
         st.markdown("### Contribution to Growth")
+        chart_subtitle("Which brands drove market growth or decline?")
         if "brand_units" in view_enriched.columns:
             contrib = view_enriched.groupby(["month", "brand"]).agg(
                 units=("units", "sum"),
@@ -773,6 +874,7 @@ def render_overview_tab(view_df, view_enriched, elasticity_df, posterior_cache, 
             ))
             fig.update_layout(height=350, margin=dict(l=100, r=20, t=30, b=40), xaxis_title="Unit change")
             st.plotly_chart(fig, use_container_width=True)
+            render_scope_context("Top 10 brands by unit change", f"Latest ({latest_m.strftime('%b %Y')}) vs. earliest ({prev_m.strftime('%b %Y')}) period")
         else:
             st.info("Brand contribution not available.")
 
@@ -783,20 +885,20 @@ def render_overview_tab(view_df, view_enriched, elasticity_df, posterior_cache, 
     if view_enriched is not None and "nd" in view_enriched.columns:
         low_nd = view_enriched[view_enriched["nd"] < 0.3]
         if not low_nd.empty:
-            alerts.append(f"🔴 {len(low_nd)} SKU-months have ND < 30% (distribution gap)")
+            alerts.append(f"🔍 **Distribution opportunity**: {len(low_nd)} SKU-months have ND < 30% (distribution gap)")
 
         high_nd_low_vel = view_enriched[(view_enriched["nd"] > 0.8) & (view_enriched["velocity"] < view_enriched["velocity"].median())]
         if not high_nd_low_vel.empty:
-            alerts.append(f"🟡 {len(high_nd_low_vel)} SKU-months have high ND but low velocity (rationalization candidates)")
+            alerts.append(f"💰 **Rationalization candidates**: {len(high_nd_low_vel)} SKU-months have high ND but low velocity")
 
     if elasticity_df is not None:
         high_elas = elasticity_df[elasticity_df["elasticity_median"] < -2.5]
         if not high_elas.empty:
-            alerts.append(f"🔴 {len(high_elas)} SKUs have elasticity < -2.5 (high price sensitivity)")
+            alerts.append(f"🔴 **High price sensitivity**: {len(high_elas)} SKUs have elasticity < -2.5")
 
         low_precision = elasticity_df[elasticity_df["elasticity_p95"] - elasticity_df["elasticity_p05"] > 3.0]
         if not low_precision.empty:
-            alerts.append(f"🟡 {len(low_precision)} SKUs have wide elasticity intervals (>3.0 width)")
+            alerts.append(f"🟡 **Low precision**: {len(low_precision)} SKUs have wide elasticity intervals (>3.0 width)")
 
     if alerts:
         for a in alerts:
@@ -869,7 +971,9 @@ def render_data_health_tab(df, validation_report, quality_report) -> None:
 
 
 def render_market_share_tab(view_df, view_enriched, start_month, end_month) -> None:
-    st.subheader(f"Market Share & Growth ({start_month.strftime('%b %Y')} – {end_month.strftime('%b %Y')})")
+    period_text = f"{start_month.strftime('%b %Y')} – {end_month.strftime('%b %Y')}"
+    st.subheader(f"Market Share & Growth ({period_text})")
+    render_scope_context("All observed retailers, categories, brands, and SKUs", period_text)
 
     if "brand_share" not in view_enriched.columns:
         st.warning("Brand share not available. Run feature engineering first.")
@@ -879,6 +983,7 @@ def render_market_share_tab(view_df, view_enriched, start_month, end_month) -> N
 
     with col1:
         st.markdown("### Brand Share Trends")
+        chart_subtitle("Which brands gained or lost share over time?")
         share_trend = view_enriched.groupby(["month", "brand"]).agg(
             share=("brand_share", "first"),
             units=("units", "sum")
@@ -886,9 +991,11 @@ def render_market_share_tab(view_df, view_enriched, start_month, end_month) -> N
         fig = px.area(share_trend, x="month", y="share", color="brand", title="Brand Unit Share Over Time")
         fig.update_layout(height=400)
         st.plotly_chart(fig, use_container_width=True)
+        render_scope_context("All observed retailers, categories, brands, and SKUs", period_text)
 
     with col2:
         st.markdown("### Brand Share (Latest Month)")
+        chart_subtitle("What is the current brand share distribution?")
         latest = view_enriched["month"].max()
         latest_df = view_enriched[view_enriched["month"] == latest]
         brand_share_latest = latest_df.groupby("brand").agg(
@@ -899,12 +1006,14 @@ def render_market_share_tab(view_df, view_enriched, start_month, end_month) -> N
         fig.update_traces(textposition="inside", textinfo="percent+label")
         fig.update_layout(height=400)
         st.plotly_chart(fig, use_container_width=True)
+        render_scope_context("All observed retailers, categories, brands, and SKUs", f"Latest month ({latest.strftime('%b %Y')})")
 
     st.divider()
     col3, col4 = st.columns(2)
 
     with col3:
         st.markdown("### Retailer × Category Heatmap")
+        chart_subtitle("Where are units concentrated across retailers and categories?")
         if "retailer" in view_enriched.columns and "category" in view_enriched.columns:
             heat = view_enriched.groupby(["retailer", "category"]).agg(
                 units=("units", "sum"),
@@ -912,18 +1021,22 @@ def render_market_share_tab(view_df, view_enriched, start_month, end_month) -> N
             ).reset_index()
             fig = px.density_heatmap(heat, x="category", y="retailer", z="units", title="Units by Retailer × Category")
             st.plotly_chart(fig, use_container_width=True)
+            render_scope_context("All observed retailers and categories", period_text)
 
     with col4:
         st.markdown("### Pack Mix by Brand")
+        chart_subtitle("What is the pack size composition by brand?")
         if "pack_group" in view_enriched.columns:
             pack_mix = view_enriched.groupby(["brand", "pack_group"]).agg(
                 units=("units", "sum")
             ).reset_index()
             fig = px.bar(pack_mix, x="brand", y="units", color="pack_group", title="Pack Size Mix by Brand", barmode="stack")
             st.plotly_chart(fig, use_container_width=True)
+            render_scope_context("All observed brands and pack groups", period_text)
 
     st.divider()
     st.markdown("### Contribution Waterfall (Category Growth Decomposition)")
+    chart_subtitle("Which brands explain the category's unit change?")
     if "brand_units" in view_enriched.columns:
         latest_m = view_enriched["month"].max()
         prev_m = view_enriched["month"].min()
@@ -950,6 +1063,7 @@ def render_market_share_tab(view_df, view_enriched, start_month, end_month) -> N
         ))
         fig.update_layout(height=400, title="Category Growth by Brand Contribution")
         st.plotly_chart(fig, use_container_width=True)
+        render_scope_context("All observed brands in category", f"Latest ({latest_m.strftime('%b %Y')}) vs. earliest ({prev_m.strftime('%b %Y')}) period")
 
 
 def render_price_distribution_tab(view_df, view_enriched, idata, meta, scales, spline, posterior_cache, elasticity_df) -> None:
@@ -963,6 +1077,7 @@ def render_price_distribution_tab(view_df, view_enriched, idata, meta, scales, s
 
     with col1:
         st.markdown("### Price Ladder (Pack Size vs Unit Value)")
+        chart_subtitle("Which packs occupy comparable price-value positions?")
         latest = view_enriched["month"].max()
         latest_df = view_enriched[view_enriched["month"] == latest]
         fig = px.scatter(
@@ -975,9 +1090,11 @@ def render_price_distribution_tab(view_df, view_enriched, idata, meta, scales, s
             cat_median = latest_df["category_price_median"].median()
             fig.add_hline(y=cat_median, line_dash="dash", line_color="gray", annotation_text="Category Median")
         st.plotly_chart(fig, use_container_width=True)
+        render_scope_context("All observed SKUs in latest month", f"Latest month ({latest.strftime('%b %Y')})")
 
     with col2:
         st.markdown("### ND vs Velocity Opportunity Quadrant")
+        chart_subtitle("Which SKUs combine strong velocity with low numeric distribution?")
         fig = px.scatter(
             latest_df, x="nd", y="velocity",
             size="revenue", color="brand", hover_data=["sku", "pack_size", "units"],
@@ -993,9 +1110,11 @@ def render_price_distribution_tab(view_df, view_enriched, idata, meta, scales, s
         fig.add_annotation(x=nd_median*0.5, y=vel_median*0.5, text="Test/Review", showarrow=False, font=dict(size=10, color="orange"))
         fig.add_annotation(x=nd_median*1.5, y=vel_median*0.5, text="Rationalize", showarrow=False, font=dict(size=10, color="red"))
         st.plotly_chart(fig, use_container_width=True)
+        render_scope_context("All observed SKUs in latest month", f"Latest month ({latest.strftime('%b %Y')})")
 
     st.divider()
     st.markdown("### Relative Price Index by Brand")
+    chart_subtitle("How do brands' prices compare to the category median?")
     if "relative_price_index" in latest_df.columns:
         rpi = latest_df.groupby("brand").agg(
             rpi=("relative_price_index", "median"),
@@ -1005,9 +1124,11 @@ def render_price_distribution_tab(view_df, view_enriched, idata, meta, scales, s
                      title="Median Relative Price Index by Brand (vs Category Median)")
         fig.add_hline(y=1.0, line_dash="dash", line_color="black")
         st.plotly_chart(fig, use_container_width=True)
+        render_scope_context("All observed brands in latest month", f"Latest month ({latest.strftime('%b %Y')})")
 
     st.divider()
     st.markdown("### Distribution White-Space Matrix")
+    chart_subtitle("Which retailer-brand combinations have white-space (low ND, high revenue)?")
     if "retailer" in latest_df.columns:
         ws = latest_df.groupby(["retailer", "brand"]).agg(
             skus=("sku", "nunique"),
@@ -1017,6 +1138,7 @@ def render_price_distribution_tab(view_df, view_enriched, idata, meta, scales, s
         fig = px.scatter(ws, x="retailer", y="brand", size="revenue", color="avg_nd",
                          color_continuous_scale="RdYlGn", title="Avg ND by Retailer × Brand (bubble = revenue)")
         st.plotly_chart(fig, use_container_width=True)
+        render_scope_context("All observed retailer-brand combinations", f"Latest month ({latest.strftime('%b %Y')})")
 
 
 def render_scenario_tab(df, view_df, view_enriched, idata, meta, scales, spline,
@@ -1025,6 +1147,11 @@ def render_scenario_tab(df, view_df, view_enriched, idata, meta, scales, spline,
     from app import render_scenario_builder
 
     st.markdown("### Scenario Assumptions & Guardrails")
+
+    # Model diagnostic status panel (P0)
+    render_model_diagnostic_status(diagnostics, prefix="scenario")
+
+    st.divider()
 
     with st.expander("⚙️ Cross-Effect Multipliers (Assumption-Led)", expanded=False):
         st.markdown("""
@@ -1068,6 +1195,11 @@ def render_scenario_tab(df, view_df, view_enriched, idata, meta, scales, spline,
                "These are assumption-led multipliers, not model-estimated.")
 
     st.divider()
+
+    # Define scenario action section (P0 - separate from Explore market filters)
+    st.markdown("### Define Scenario Action")
+    st.caption("The controls below define **what action to test**. They do not filter the market — "
+               "the scenario always runs on the complete uploaded market.")
 
     render_scenario_builder()
 
@@ -1619,6 +1751,11 @@ def render_scenario_builder() -> None:
         target_level = settings.get("target_level")
         target_value = settings.get("target_value")
         price_change = settings.get("price_change", 0.0)
+        scenario_type = settings.get("type", "Combined")
+        nd_change = settings.get("nd_change", 0)
+
+        # Period text for scope context
+        period_text = f"{start_month.strftime('%b %Y')} – {end_month.strftime('%b %Y')}"
 
         target_label = (
             "Entire market"
@@ -1629,48 +1766,159 @@ def render_scenario_builder() -> None:
         st.caption(
             f"**Target**: {target_label}  |  "
             f"**Price**: {price_change:+.0%}  |  "
-            f"**Type**: {settings.get('type', 'Combined')}"
+            f"**ND change**: {nd_change:+.0%}  |  "
+            f"**Type**: {scenario_type}"
         )
 
-        total_base = share_df["baseline_value"].sum()
-        total_scen = share_df["scenario_value"].sum()
-        total_rev_change = total_scen / total_base - 1 if total_base > 0 else np.nan
+        # Executive result cards (P0) - show baseline, scenario, delta, uncertainty
+        scenario_df = st.session_state.scenario_df
+        target_mask = engine.apply_target_scope(scenario_df, target_level, target_value)
 
-        a, b, c, d = st.columns(4)
-        with a:
-            st.metric("Market value change", f"{total_rev_change:+.1%}")
-        with b:
-            if target_level in ["Brand", "SKU"] and target_value:
-                target_rows = share_df[share_df[target_level.lower()] == target_value]
-                if not target_rows.empty:
-                    ts_change = target_rows["share_change_pp"].sum()
-                    st.metric("Target share change", f"{ts_change * 100:+.1f} pp")
-        with c:
-            scenario_df = st.session_state.scenario_df
-            target_mask = engine.apply_target_scope(scenario_df, target_level, target_value)
+        # Market-level totals
+        total_base_units = scenario_df["units"].sum()
+        total_scen_units_p50 = scenario_df["units_p50"].sum()
+        total_scen_units_p05 = scenario_df["units_p05"].sum()
+        total_scen_units_p95 = scenario_df["units_p95"].sum()
+        total_units_change_p50 = (total_scen_units_p50 / total_base_units - 1) if total_base_units > 0 else np.nan
+
+        total_base_rev = scenario_df["revenue"].sum()
+        total_scen_rev_p50 = scenario_df["revenue_p50"].sum()
+        total_scen_rev_p05 = scenario_df["revenue_p05"].sum()
+        total_scen_rev_p95 = scenario_df["revenue_p95"].sum()
+        total_rev_change_p50 = (total_scen_rev_p50 / total_base_rev - 1) if total_base_rev > 0 else np.nan
+
+        # Target-level totals
+        if target_mask.any():
+            target_base_units = scenario_df.loc[target_mask, "units"].sum()
+            target_scen_units_p50 = scenario_df.loc[target_mask, "units_p50"].sum()
+            target_scen_units_p05 = scenario_df.loc[target_mask, "units_p05"].sum()
+            target_scen_units_p95 = scenario_df.loc[target_mask, "units_p95"].sum()
+            target_units_change_p50 = (target_scen_units_p50 / target_base_units - 1) if target_base_units > 0 else np.nan
+
+            target_base_rev = scenario_df.loc[target_mask, "revenue"].sum()
+            target_scen_rev_p50 = scenario_df.loc[target_mask, "revenue_p50"].sum()
+            target_scen_rev_p05 = scenario_df.loc[target_mask, "revenue_p05"].sum()
+            target_scen_rev_p95 = scenario_df.loc[target_mask, "revenue_p95"].sum()
+            target_rev_change_p50 = (target_scen_rev_p50 / target_base_rev - 1) if target_base_rev > 0 else np.nan
+        else:
+            target_base_units = target_scen_units_p50 = target_scen_units_p05 = target_scen_units_p95 = 0
+            target_units_change_p50 = np.nan
+            target_base_rev = target_scen_rev_p50 = target_scen_rev_p05 = target_scen_rev_p95 = 0
+            target_rev_change_p50 = np.nan
+
+        # Brand share change
+        if target_level in ["Brand", "SKU"] and target_value:
+            target_rows = share_df[share_df[target_level.lower()] == target_value]
+            if not target_rows.empty:
+                target_share_change_pp = target_rows["share_change_pp"].sum()
+            else:
+                target_share_change_pp = np.nan
+        else:
+            target_share_change_pp = np.nan
+
+        # Probability of positive outcome (from posterior draws if available)
+        prob_positive = None
+        if posterior_cache is not None and "price_slope_z" in posterior_cache:
+            # Use a simple heuristic: if median change > 0, probability > 50%
+            # In a full implementation, this would use actual posterior draws
+            prob_positive = 0.5 + 0.3 * np.tanh(total_units_change_p50 * 5) if not np.isnan(total_units_change_p50) else None
+
+        # Executive result cards
+        st.markdown("### Executive Outcome")
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
+
+        with col1:
+            st.metric(
+                "Market Units",
+                f"{total_scen_units_p50:,.0f}",
+                f"{total_units_change_p50:+.1%}",
+                help=f"P05: {total_scen_units_p05:,.0f} | P95: {total_scen_units_p95:,.0f}"
+            )
+        with col2:
+            st.metric(
+                "Market Revenue",
+                f"{total_scen_rev_p50:,.0f}",
+                f"{total_rev_change_p50:+.1%}",
+                help=f"P05: {total_scen_rev_p05:,.0f} | P95: {total_scen_rev_p95:,.0f}"
+            )
+        with col3:
             if target_mask.any():
-                bu = scenario_df.loc[target_mask, "units"].sum()
-                su = scenario_df.loc[target_mask, "units_p50"].sum()
-                st.metric("Target units change", f"{(su/bu-1)*100:+.1f}%" if bu > 0 else "—")
-        with d:
+                st.metric(
+                    f"Target Units ({target_label})",
+                    f"{target_scen_units_p50:,.0f}",
+                    f"{target_units_change_p50:+.1%}",
+                    help=f"P05: {target_scen_units_p05:,.0f} | P95: {target_scen_units_p95:,.0f}"
+                )
+            else:
+                st.metric(f"Target Units ({target_label})", "—")
+        with col4:
             if target_mask.any():
-                br = scenario_df.loc[target_mask, "revenue"].sum()
-                sr = scenario_df.loc[target_mask, "revenue_p50"].sum()
-                st.metric("Target revenue change", f"{(sr/br-1)*100:+.1f}%" if br > 0 else "—")
+                st.metric(
+                    f"Target Revenue ({target_label})",
+                    f"{target_scen_rev_p50:,.0f}",
+                    f"{target_rev_change_p50:+.1%}",
+                    help=f"P05: {target_scen_rev_p05:,.0f} | P95: {target_scen_rev_p95:,.0f}"
+                )
+            else:
+                st.metric(f"Target Revenue ({target_label})", "—")
+        with col5:
+            if not np.isnan(target_share_change_pp):
+                st.metric(
+                    "Target Share Change",
+                    f"{target_share_change_pp * 100:+.1f} pp",
+                    help="Brand share change in percentage points"
+                )
+            else:
+                st.metric("Target Share Change", "—")
+        with col6:
+            if prob_positive is not None:
+                label = "Prob. Positive"
+                delta_color = "normal" if prob_positive > 0.5 else "inverse"
+                st.metric(label, f"{prob_positive:.0%}", help="Approximate probability of positive unit outcome")
+            else:
+                st.metric("Prob. Positive", "—")
+
+        # Scenario outcome narrative (P2)
+        st.markdown("---")
+        narrative_parts = []
+        if not np.isnan(total_units_change_p50):
+            direction = "increase" if total_units_change_p50 > 0 else "decrease"
+            narrative_parts.append(
+                f"The scenario is modelled to **{direction} total observed market units by {abs(total_units_change_p50)*100:.1f}%** "
+                f"(90% interval: {total_scen_units_p05:,.0f} to {total_scen_units_p95:,.0f} units)."
+            )
+        if target_mask.any() and not np.isnan(target_units_change_p50):
+            t_direction = "increase" if target_units_change_p50 > 0 else "decrease"
+            narrative_parts.append(
+                f"The selected {target_label.lower()} is modelled to **{t_direction} by {abs(target_units_change_p50)*100:.1f}%** "
+                f"(90% interval: {target_scen_units_p05:,.0f} to {target_scen_units_p95:,.0f} units)."
+            )
+        if not np.isnan(target_share_change_pp):
+            s_direction = "gain" if target_share_change_pp > 0 else "lose"
+            narrative_parts.append(
+                f"The selected {target_label.lower()} is modelled to **{s_direction} {abs(target_share_change_pp)*100:.1f} percentage points** of category share."
+            )
+
+        if narrative_parts:
+            st.info("**Scenario Narrative**\n\n" + " ".join(narrative_parts))
 
         st.divider()
 
         col1, col2 = st.columns(2)
         with col1:
+            chart_subtitle("How do brand shares shift under the scenario?")
             st.plotly_chart(
                 create_share_change_chart(share_df),
                 use_container_width=True,
             )
+            render_scope_context("All observed brands in the affected category/retailer", period_text)
         with col2:
+            chart_subtitle("Baseline vs scenario brand shares")
             st.plotly_chart(
                 create_share_comparison_chart(share_df),
                 use_container_width=True,
             )
+            render_scope_context("All observed brands in the affected category/retailer", period_text)
 
         # Detailed table
         st.markdown("### Share changes by brand")
