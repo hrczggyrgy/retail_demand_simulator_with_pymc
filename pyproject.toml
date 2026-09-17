@@ -42,6 +42,7 @@ fixable = ["ALL"]
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "PLR2004"]
 "demo_data.py" = ["S101"]
+"retail_demand_model_pymc.ipynb" = ["ALL"]
 
 [tool.mypy]
 python_version = "3.11"
