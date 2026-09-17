@@ -514,6 +514,328 @@ def test_scenario_segment_deltas_reconcile_to_market_delta() -> None:
     print("✓ Scenario segment deltas reconcile to market delta")
 
 
+# ============================================================================
+# Phase 2: Choice-set data layer tests
+# ============================================================================
+
+def test_choice_set_data_layer() -> None:
+    """Test that choice set data layer builds correctly."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+
+    choice_data = engine.build_choice_set_data(enriched, meta)
+
+    assert len(choice_data.market_ids) > 0
+    assert len(choice_data.sku_ids) == 12
+    assert choice_data.observed_units.shape == (len(choice_data.market_ids), 12)
+    assert choice_data.relative_price.shape == (len(choice_data.market_ids), 12)
+    assert choice_data.nd.shape == (len(choice_data.market_ids), 12)
+    assert choice_data.available_mask.shape == (len(choice_data.market_ids), 12)
+    assert choice_data.market_total_units.shape == (len(choice_data.market_ids),)
+    assert choice_data.market_retailer_idx.shape == (len(choice_data.market_ids),)
+    assert choice_data.market_category_idx.shape == (len(choice_data.market_ids),)
+    assert choice_data.market_month_idx.shape == (len(choice_data.market_ids),)
+    assert choice_data.sku_brand_idx.shape == (12,)
+    assert choice_data.sku_category_idx.shape == (12,)
+    assert choice_data.sku_pack_group_idx.shape == (12,)
+    assert choice_data.brand_category_idx.shape == (6,)
+    assert len(choice_data.sku_to_idx) == 12
+    assert len(choice_data.idx_to_sku) == 12
+    print("✓ Choice set data layer builds correctly")
+
+
+def test_choice_set_validation() -> None:
+    """Test choice set validation passes for valid data."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+
+    choice_data = engine.build_choice_set_data(enriched, meta)
+    validation = engine.validate_choice_set(choice_data)
+
+    assert validation["market_totals_match"] is True
+    assert validation["unavailable_have_zero_units"] is True
+    assert validation["shares_sum_to_one"] is True
+    assert validation["n_markets"] == len(choice_data.market_ids)
+    assert validation["n_skus"] == 12
+    print("✓ Choice set validation passes")
+
+
+def test_choice_set_unavailable_zero_units() -> None:
+    """Test that unavailable SKUs have zero observed units."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+
+    choice_data = engine.build_choice_set_data(enriched, meta)
+
+    # Unavailable SKUs should have zero units
+    unavailable_units = choice_data.observed_units[~choice_data.available_mask].sum()
+    assert unavailable_units == 0.0
+
+    # Available SKUs should have positive units (where observed)
+    available_units = choice_data.observed_units[choice_data.available_mask]
+    assert (available_units >= 0).all()
+    print("✓ Unavailable SKUs have zero units")
+
+
+# ============================================================================
+# Phase 3: Joint model tests
+# ============================================================================
+
+def test_joint_model_builds() -> None:
+    """Test that joint SKU share model builds without error."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+
+    choice_data = engine.build_choice_set_data(enriched, meta)
+
+    fast_config = engine.JointModelConfig(
+        draws=50, tune=50, chains=1, target_accept=0.9,
+        use_category_price_pooling=True, use_sku_nd_effects=True,
+    )
+    model = engine.build_joint_sku_share_model(choice_data, fast_config)
+
+    assert "beta_sku" in model.named_vars
+    assert "gamma1_sku" in model.named_vars
+    assert "gamma2_sku" in model.named_vars
+    assert "sku_share" in model.named_vars
+    assert "inclusive_value" in model.named_vars
+    assert "sku_units_obs" in model.named_vars
+    print("✓ Joint model builds with all required variables")
+
+
+def test_joint_model_fits() -> None:
+    """Test that joint model fits and produces posterior."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+
+    choice_data = engine.build_choice_set_data(enriched, meta)
+
+    fast_config = engine.JointModelConfig(
+        draws=30, tune=30, chains=1, target_accept=0.9,
+        use_category_price_pooling=True, use_sku_nd_effects=True,
+    )
+    model = engine.build_joint_sku_share_model(choice_data, fast_config)
+    idata = engine.fit_joint_model(model, fast_config)
+
+    assert hasattr(idata, "posterior")
+    assert "beta_sku" in idata.posterior
+    assert "gamma1_sku" in idata.posterior
+    assert "sku_share" in idata.posterior
+    assert "inclusive_value" in idata.posterior
+    print("✓ Joint model fits and produces posterior")
+
+
+def test_joint_posterior_extraction() -> None:
+    """Test posterior extraction for joint model."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+
+    choice_data = engine.build_choice_set_data(enriched, meta)
+
+    fast_config = engine.JointModelConfig(
+        draws=30, tune=30, chains=1, target_accept=0.9,
+        use_category_price_pooling=True, use_sku_nd_effects=True,
+    )
+    model = engine.build_joint_sku_share_model(choice_data, fast_config)
+    idata = engine.fit_joint_model(model, fast_config)
+
+    cache = engine.extract_joint_posterior(idata, max_draws=10)
+
+    assert "beta_sku" in cache
+    assert "gamma1_sku" in cache
+    assert "gamma2_sku" in cache
+    assert "alpha_sku" in cache
+    assert "alpha_retailer_sku" in cache
+    assert "pack_effect" in cache
+    assert "cat_month_effect" in cache
+    assert "concentration_category" in cache
+    assert "sku_share" in cache
+    assert cache["beta_sku"].shape[1] == 12  # n_skus
+    assert cache["sku_share"].shape[1:] == (len(choice_data.market_ids), 12)
+    print("✓ Joint posterior extraction works")
+
+
+# ============================================================================
+# Phase 4: Draw-by-draw scenario tests
+# ============================================================================
+
+def test_joint_scenario_runs() -> None:
+    """Test that joint scenario runs and produces results."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+
+    choice_data = engine.build_choice_set_data(enriched, meta)
+
+    fast_config = engine.JointModelConfig(
+        draws=30, tune=30, chains=1, target_accept=0.9,
+        use_category_price_pooling=True, use_sku_nd_effects=True,
+    )
+    model = engine.build_joint_sku_share_model(choice_data, fast_config)
+    idata = engine.fit_joint_model(model, fast_config)
+
+    cache = engine.extract_joint_posterior(idata, max_draws=10)
+
+    actions = [
+        engine.ScenarioAction(
+            retailer="Apex Supermarkets",
+            category="CSD",
+            brand="Fizz Up",
+            sku="FIZZ_500ML",
+            month="2024-07-01",
+            new_nd=0.1,
+            nd_mode="pp",
+        )
+    ]
+
+    result = engine.run_joint_scenario_draws(choice_data, cache, actions, n_draws=5, random_seed=42)
+
+    assert isinstance(result, engine.ScenarioResult)
+    assert result.baseline_units_p50.shape == (len(choice_data.market_ids), 12)
+    assert result.scenario_units_p50.shape == (len(choice_data.market_ids), 12)
+    assert result.delta_units_p50.shape == (len(choice_data.market_ids), 12)
+    print("✓ Joint scenario runs and produces results")
+
+
+def test_joint_scenario_reconciliation() -> None:
+    """Test scenario reconciliation for joint model."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+
+    choice_data = engine.build_choice_set_data(enriched, meta)
+
+    fast_config = engine.JointModelConfig(
+        draws=30, tune=30, chains=1, target_accept=0.9,
+        use_category_price_pooling=True, use_sku_nd_effects=True,
+    )
+    model = engine.build_joint_sku_share_model(choice_data, fast_config)
+    idata = engine.fit_joint_model(model, fast_config)
+
+    cache = engine.extract_joint_posterior(idata, max_draws=10)
+
+    actions = [
+        engine.ScenarioAction(
+            retailer="Apex Supermarkets",
+            category="CSD",
+            brand="Fizz Up",
+            sku="FIZZ_500ML",
+            month="2024-07-01",
+            new_nd=0.1,
+            nd_mode="pp",
+        )
+    ]
+
+    result = engine.run_joint_scenario_draws(choice_data, cache, actions, n_draws=5, random_seed=42)
+
+    recon = engine.check_scenario_reconciliation(result, choice_data)
+
+    # Baseline and scenario shares should sum to 1
+    assert recon["baseline_shares_sum_to_one"] is True
+    assert recon["scenario_shares_sum_to_one"] is True
+    # Units should match market totals
+    assert recon["baseline_units_match_totals"] is True
+    assert recon["scenario_units_match_totals"] is True
+    print("✓ Joint scenario reconciliation checks pass")
+
+
+def test_scenario_aggregation() -> None:
+    """Test scenario aggregation at multiple levels."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+
+    choice_data = engine.build_choice_set_data(enriched, meta)
+
+    fast_config = engine.JointModelConfig(
+        draws=30, tune=30, chains=1, target_accept=0.9,
+        use_category_price_pooling=True, use_sku_nd_effects=True,
+    )
+    model = engine.build_joint_sku_share_model(choice_data, fast_config)
+    idata = engine.fit_joint_model(model, fast_config)
+
+    cache = engine.extract_joint_posterior(idata, max_draws=10)
+
+    actions = [
+        engine.ScenarioAction(
+            retailer="Apex Supermarkets",
+            category="CSD",
+            brand="Fizz Up",
+            sku="FIZZ_500ML",
+            month="2024-07-01",
+            new_nd=0.1,
+            nd_mode="pp",
+        )
+    ]
+
+    result = engine.run_joint_scenario_draws(choice_data, cache, actions, n_draws=5, random_seed=42)
+
+    for level in ["market", "retailer", "category", "brand", "sku", "brand_pack", "retailer_category"]:
+        agg = engine.aggregate_scenario_result(result, choice_data, level=level)
+        assert "baseline_units" in agg.columns
+        assert "scenario_units" in agg.columns
+        assert "delta_units" in agg.columns
+        assert "delta_units_pct" in agg.columns
+        # Totals should match
+        assert abs(agg["baseline_units"].sum() - result.baseline_units_p50.sum()) < 1.0
+        assert abs(agg["scenario_units"].sum() - result.scenario_units_p50.sum()) < 1.0
+    print("✓ Scenario aggregation works at all levels")
+
+
+# ============================================================================
+# Phase 5: Nest allocation model tests
+# ============================================================================
+
+def test_nest_model_builds() -> None:
+    """Test that nest allocation model builds without error."""
+    raw = demo_data.generate_demo_data()
+    df, scales = engine.prepare_data(raw)
+    indexed, meta = engine.add_indices(df)
+    enriched = engine.build_retail_features(indexed)
+
+    choice_data = engine.build_choice_set_data(enriched, meta)
+
+    # Create minimal posterior cache for testing
+    n_draws = 10
+    n_rc = 12  # 4 retailers × 3 categories
+    n_categories = 3
+    n_months = 24
+    n_markets = len(choice_data.market_ids)
+    
+    cache = {
+        "inclusive_value": np.random.randn(n_draws, n_markets),
+        "sku_share": np.random.randn(n_draws, n_markets, 12),
+    }
+
+    nest_config = engine.NestModelConfig(
+        draws=30, tune=30, chains=1, target_accept=0.9,
+    )
+    model = engine.build_nest_allocation_model(choice_data, cache, nest_config)
+
+    assert "alpha_rc" in model.named_vars
+    assert "theta_c" in model.named_vars
+    assert "lambda_c" in model.named_vars
+    assert "w_rc" in model.named_vars
+    assert "w_outside" in model.named_vars
+    assert "market_totals_obs" in model.named_vars
+    print("✓ Nest allocation model builds with all required variables")
+
+
 if __name__ == "__main__":
     # Issue 2 deterministic fixture tests
     test_demo_schema_contains_only_raw_columns()
@@ -543,5 +865,23 @@ if __name__ == "__main__":
     test_same_brand_other_sku_price_index_excludes_focal_sku()
     test_one_sku_brand_produces_nan_for_same_brand_index()
     test_scenario_segment_deltas_reconcile_to_market_delta()
+
+    # Phase 2: Choice-set data layer tests
+    test_choice_set_data_layer()
+    test_choice_set_validation()
+    test_choice_set_unavailable_zero_units()
+
+    # Phase 3: Joint model tests
+    test_joint_model_builds()
+    test_joint_model_fits()
+    test_joint_posterior_extraction()
+
+    # Phase 4: Draw-by-draw scenario tests
+    test_joint_scenario_runs()
+    test_joint_scenario_reconciliation()
+    test_scenario_aggregation()
+
+    # Phase 5: Nest allocation model tests
+    test_nest_model_builds()
 
     print("\n=== ALL TESTS PASSED ===")

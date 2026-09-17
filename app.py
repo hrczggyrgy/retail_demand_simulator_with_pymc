@@ -400,12 +400,18 @@ def prepare_data_if_needed() -> None:
         st.session_state.quality_report = quality
 
 
-def _model_config_from_mode(mode: str) -> engine.ModelConfig:
+def _model_config_from_mode(mode: str) -> engine.ModelConfig | engine.JointModelConfig:
     if mode == "Fast (2 chains)":
         return engine.FAST_CONFIG
     elif mode == "Advanced (4 chains, Student-t)":
         return engine.ADVANCED_CONFIG
+    elif mode == "Joint SKU Share Model (Dirichlet-Multinomial)":
+        return engine.JointModelConfig()
     return engine.DEFAULT_CONFIG
+
+
+def _is_joint_model_mode(mode: str) -> bool:
+    return mode == "Joint SKU Share Model (Dirichlet-Multinomial)"
 
 
 def fit_model_explicitly() -> None:
@@ -413,36 +419,57 @@ def fit_model_explicitly() -> None:
         return
 
     df = st.session_state.prepared_data
-
-    config = _model_config_from_mode(st.session_state.get("model_mode", "Default (4 chains)"))
+    mode = st.session_state.get("model_mode", "Default (4 chains)")
+    config = _model_config_from_mode(mode)
 
     with st.spinner("Estimating price and distribution response..."):
-        if config.use_category_price_pooling or config.use_sku_nd_effects:
-            model = engine.build_pymc_model_v2(df, st.session_state.meta, st.session_state.nd_basis, config)
+        if _is_joint_model_mode(mode):
+            # Build choice set data for joint model
+            enriched = engine.build_retail_features(df)
+            choice_data = engine.build_choice_set_data(enriched, st.session_state.meta)
+            st.session_state.choice_data = choice_data
+            
+            model = engine.build_joint_sku_share_model(choice_data, config)
+            idata = engine.fit_joint_model(model, config)
+            
+            # Posterior predictive
+            idata = engine.sample_joint_posterior_predictive(model, idata)
+            
+            st.session_state.posterior_cache = engine.extract_joint_posterior(
+                idata,
+                max_draws=config.scenario_draws if hasattr(config, "scenario_draws") else 400,
+                random_seed=config.random_seed,
+            )
         else:
-            model = engine.build_pymc_model(df, st.session_state.meta, st.session_state.nd_basis)
+            if config.use_category_price_pooling or config.use_sku_nd_effects:
+                model = engine.build_pymc_model_v2(df, st.session_state.meta, st.session_state.nd_basis, config)
+            else:
+                model = engine.build_pymc_model(df, st.session_state.meta, st.session_state.nd_basis)
 
-        idata = engine.fit_model(model, config)
+            idata = engine.fit_model(model, config)
+            idata = engine.add_posterior_predictive(model, idata)
 
-        # Add posterior predictive samples for PPC plots
-        idata = engine.add_posterior_predictive(model, idata)
+            st.session_state.posterior_cache = engine.extract_scenario_posterior(
+                idata,
+                max_draws=config.scenario_draws,
+                random_seed=config.random_seed,
+            )
 
     st.session_state.model_result = idata
     st.session_state.fitted_model = model
-    st.session_state.model_settings = {"config": config}
-    st.session_state.model_diagnostics = engine.get_model_diagnostics(idata)
-    st.session_state.elasticities = engine.extract_elasticities(
-        idata,
-        st.session_state.meta,
-        st.session_state.scales,
-    )
-
-    # Extract posterior cache for fast scenarios
-    st.session_state.posterior_cache = engine.extract_scenario_posterior(
-        idata,
-        max_draws=config.scenario_draws,
-        random_seed=config.random_seed,
-    )
+    st.session_state.model_settings = {"config": config, "mode": mode}
+    
+    if _is_joint_model_mode(mode):
+        st.session_state.model_diagnostics = engine.summarize_convergence_diagnostics(idata)
+        # Extract elasticities from joint model (beta_sku)
+        # TODO: implement joint model elasticity extraction
+    else:
+        st.session_state.model_diagnostics = engine.get_model_diagnostics(idata)
+        st.session_state.elasticities = engine.extract_elasticities(
+            idata,
+            st.session_state.meta,
+            st.session_state.scales,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -496,11 +523,18 @@ def render_sidebar() -> None:
 
         model_mode = st.selectbox(
             "Model mode",
-            ["Fast (2 chains)", "Default (4 chains)", "Advanced (4 chains, Student-t)"],
+            [
+                "Fast (2 chains)",
+                "Default (4 chains)",
+                "Advanced (4 chains, Student-t)",
+                "Joint SKU Share Model (Dirichlet-Multinomial)",
+            ],
             index=1,
             help=(
                 "Fast: quick exploratory fits. Default: balanced speed/quality. "
-                "Advanced: full hierarchy with robust likelihood (slower)."
+                "Advanced: full hierarchy with robust likelihood (slower). "
+                "Joint SKU Share Model: Dirichlet-Multinomial choice model for "
+                "within retailer-category SKU allocation (experimental)."
             ),
         )
         # Reset model when mode changes

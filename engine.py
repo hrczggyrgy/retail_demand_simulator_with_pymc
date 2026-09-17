@@ -24,6 +24,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import pymc as pm
+import pytensor.tensor as pt
 import xarray as xr
 from sklearn.preprocessing import SplineTransformer
 
@@ -711,6 +712,347 @@ def create_data_quality_report(
 
 
 # ============================================================================
+# Choice-set data layer (Phase 2)
+# ============================================================================
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True, slots=True)
+class ChoiceSetData:
+    """Container for all choice-set arrays and metadata for the SKU allocation model."""
+    # Core arrays
+    observed_units: np.ndarray              # (n_markets, n_skus)
+    market_total_units: np.ndarray          # (n_markets,)
+    relative_price: np.ndarray              # (n_markets, n_skus)
+    nd: np.ndarray                          # (n_markets, n_skus)
+    available_mask: np.ndarray              # (n_markets, n_skus)
+    # Mapping arrays
+    market_retailer_idx: np.ndarray         # (n_markets,)
+    market_category_idx: np.ndarray         # (n_markets,)
+    market_month_idx: np.ndarray            # (n_markets,)
+    sku_brand_idx: np.ndarray               # (n_skus,)
+    sku_category_idx: np.ndarray            # (n_skus,)
+    sku_pack_group_idx: np.ndarray          # (n_skus,)
+    brand_category_idx: np.ndarray          # (n_brands,)
+    # Metadata
+    market_ids: list[str]                   # Length n_markets
+    sku_ids: list[str]                      # Length n_skus
+    retailer_levels: np.ndarray
+    category_levels: np.ndarray
+    brand_levels: np.ndarray
+    month_levels: np.ndarray
+    pack_group_levels: np.ndarray
+    sku_to_idx: dict[str, int] = field(default_factory=dict)
+    idx_to_sku: dict[int, str] = field(default_factory=dict)
+
+
+def _get_category_pack_peer_price(
+    df: pd.DataFrame,
+    price_col: str = "price_std",
+    volume_col: str = "standard_volume",
+) -> pd.Series:
+    """
+    Compute category/pack-peer price basket for each SKU.
+    
+    Peer basket = volume-weighted average price of other SKUs in same
+    retailer × category × pack_group × month, excluding focal SKU.
+    Prefers other brands when available.
+    """
+    df = df.copy()
+    df["_pxv"] = df[price_col] * df[volume_col]
+    
+    # Group by retailer, category, pack_group, month
+    peer_groups = ["retailer", "category", "pack_group", "month"]
+    
+    # Sum of price * volume for all SKUs in group
+    peer_pv_sum = df.groupby(peer_groups, observed=True)["_pxv"].transform("sum")
+    peer_v_sum = df.groupby(peer_groups, observed=True)[volume_col].transform("sum")
+    
+    # Subtract own contribution
+    own_pv = df["_pxv"]
+    own_v = df[volume_col]
+    
+    peer_pv_excl = peer_pv_sum - own_pv
+    peer_v_excl = peer_v_sum - own_v
+    
+    peer_price = np.where(
+        peer_v_excl > 0,
+        peer_pv_excl / peer_v_excl,
+        np.nan,
+    )
+    
+    return pd.Series(peer_price, index=df.index)
+
+
+def build_choice_set_data(
+    df: pd.DataFrame,
+    meta: dict[str, Any],
+    price_col: str = "price_std",
+    volume_col: str = "standard_volume",
+) -> ChoiceSetData:
+    """
+    Build the complete choice-set data structure for the SKU allocation model.
+    
+    Creates:
+    - market_id = month × retailer × category
+    - Padded arrays (n_markets × n_skus) for units, relative_price, ND, availability
+    - Mapping arrays for all hierarchical indices
+    
+    Unavailable SKUs (ND=0 in that market) get:
+    - observed_units = 0
+    - available_mask = False
+    - utility = very negative before softmax
+    """
+    # Ensure we have the required columns
+    required = ["month", "retailer", "category", "brand", "sku", 
+                "pack_group", "units", price_col, "nd", "sku_idx"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    
+    # Create market_id
+    df = df.copy()
+    df["market_id"] = (
+        df["month"].dt.strftime("%Y-%m") + "|" + 
+        df["retailer"].astype(str) + "|" + 
+        df["category"].astype(str)
+    )
+    
+    # Get stable orderings
+    market_ids = sorted(df["market_id"].unique())
+    sku_ids = sorted(df["sku"].unique())
+    n_markets = len(market_ids)
+    n_skus = len(sku_ids)
+    
+    # Create SKU index mapping
+    sku_to_idx = dict((sku, i) for i, sku in enumerate(sku_ids))
+    idx_to_sku = dict((i, sku) for i, sku in enumerate(sku_ids))
+    
+    # Build mapping arrays (per-SKU, fixed across markets)
+    sku_info = df.drop_duplicates("sku").set_index("sku").loc[sku_ids]
+    sku_brand_idx = sku_info["brand_idx"].to_numpy(dtype="int32")
+    sku_category_idx = sku_info["category_idx"].to_numpy(dtype="int32")
+    sku_pack_group_idx = sku_info["pack_group_idx"].to_numpy(dtype="int32")
+    
+    # Brand -> category mapping
+    brand_info = df.drop_duplicates("brand").set_index("brand")
+    brand_category_idx = brand_info.loc[meta["brand_levels"], "category_idx"].to_numpy(dtype="int32")
+    
+    # Market-level mappings
+    market_info = df.drop_duplicates("market_id").set_index("market_id").loc[market_ids]
+    market_retailer_idx = market_info["retailer_idx"].to_numpy(dtype="int32")
+    market_category_idx = market_info["category_idx"].to_numpy(dtype="int32")
+    market_month_idx = market_info["month_idx"].to_numpy(dtype="int32")
+    
+    # Compute relative price against category/pack-peer basket
+    # Use the same peer price calculation as build_retail_features
+    peer_price = _get_category_pack_peer_price(df, price_col, volume_col)
+    df["relative_price"] = df[price_col] / peer_price
+    
+    # Replace inf/nan with 1.0 (neutral)
+    df["relative_price"] = df["relative_price"].replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    
+    # Initialize padded arrays
+    observed_units = np.zeros((n_markets, n_skus), dtype=np.float64)
+    relative_price = np.ones((n_markets, n_skus), dtype=np.float64)
+    nd_array = np.zeros((n_markets, n_skus), dtype=np.float64)
+    available_mask = np.zeros((n_markets, n_skus), dtype=bool)
+    
+    # Fill arrays
+    for m_idx, m_id in enumerate(market_ids):
+        market_df = df[df["market_id"] == m_id]
+        for _, row in market_df.iterrows():
+            s_idx = sku_to_idx[row["sku"]]
+            observed_units[m_idx, s_idx] = row["units"]
+            relative_price[m_idx, s_idx] = row["relative_price"]
+            nd_array[m_idx, s_idx] = row["nd"]
+            # Available if ND > 0 (listed in at least one store)
+            available_mask[m_idx, s_idx] = row["nd"] > 0
+    
+    # Market totals
+    market_total_units = observed_units.sum(axis=1)
+    
+    # Verify: unavailable alternatives should have zero observed units
+    unavailable_units = observed_units[~available_mask].sum()
+    if unavailable_units > 0:
+        raise ValueError(
+            f"Unavailable SKUs have non-zero units: {unavailable_units:.0f}. "
+            "Check data consistency."
+        )
+    
+    # Verify: market totals match sum of observed units
+    np.testing.assert_allclose(
+        market_total_units,
+        observed_units.sum(axis=1),
+        rtol=1e-10,
+        err_msg="Market totals don't match sum of SKU units"
+    )
+    
+    return ChoiceSetData(
+        observed_units=observed_units,
+        market_total_units=market_total_units,
+        relative_price=relative_price,
+        nd=nd_array,
+        available_mask=available_mask,
+        market_retailer_idx=market_retailer_idx,
+        market_category_idx=market_category_idx,
+        market_month_idx=market_month_idx,
+        sku_brand_idx=sku_brand_idx,
+        sku_category_idx=sku_category_idx,
+        sku_pack_group_idx=sku_pack_group_idx,
+        brand_category_idx=brand_category_idx,
+        market_ids=market_ids,
+        sku_ids=sku_ids,
+        retailer_levels=meta["retailer_levels"],
+        category_levels=meta["category_levels"],
+        brand_levels=meta["brand_levels"],
+        month_levels=meta["month_levels"],
+        pack_group_levels=meta["pack_group_levels"],
+        sku_to_idx=sku_to_idx,
+        idx_to_sku=idx_to_sku,
+    )
+
+
+def validate_choice_set(choice_data: ChoiceSetData) -> dict[str, Any]:
+    """
+    Validate choice-set data integrity.
+    
+    Returns a dict with validation results.
+    """
+    results = {
+        "n_markets": len(choice_data.market_ids),
+        "n_skus": len(choice_data.sku_ids),
+        "total_observed_units": int(choice_data.observed_units.sum()),
+        "market_totals_match": True,
+        "unavailable_have_zero_units": True,
+        "shares_sum_to_one": True,
+        "relative_price_range": (float(choice_data.relative_price.min()), 
+                                  float(choice_data.relative_price.max())),
+        "nd_range": (float(choice_data.nd.min()), float(choice_data.nd.max())),
+        "availability_rate": float(choice_data.available_mask.mean()),
+    }
+    
+    # Check market totals
+    market_sums = choice_data.observed_units.sum(axis=1)
+    if not np.allclose(market_sums, choice_data.market_total_units, rtol=1e-10):
+        results["market_totals_match"] = False
+    
+    # Check unavailable SKUs have zero units
+    unavailable_units = choice_data.observed_units[~choice_data.available_mask].sum()
+    if unavailable_units > 0:
+        results["unavailable_have_zero_units"] = False
+    
+    # Check shares sum to 1 per market (for available SKUs)
+    for m in range(len(choice_data.market_ids)):
+        avail = choice_data.available_mask[m]
+        if avail.any():
+            total = choice_data.observed_units[m, avail].sum()
+            if total > 0:
+                shares = choice_data.observed_units[m, avail] / total
+                if not np.isclose(shares.sum(), 1.0, atol=1e-10):
+                    results["shares_sum_to_one"] = False
+    
+    return results
+
+
+def apply_scenario_to_choice_set(
+    choice_data: ChoiceSetData,
+    actions: list[dict],
+    scales: dict[str, dict[str, float]],
+    spline: SplineTransformer,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Apply scenario actions to a choice set and return modified price/ND/availability.
+    
+    Args:
+        choice_data: Base choice set data
+        actions: List of action dicts with keys:
+            - sku: SKU identifier
+            - retailer: Retailer identifier  
+            - category: Category identifier
+            - month: Month (YYYY-MM or Timestamp)
+            - new_price_std: New price per standard unit (or None)
+            - new_nd: New numeric distribution (or None)
+            - nd_mode: "pp", "relative", or "absolute"
+        scales: Scaling dict from prepare_data
+        spline: Fitted spline transformer
+    
+    Returns:
+        Tuple of (new_relative_price, new_nd, new_available_mask)
+    """
+    n_markets, n_skus = choice_data.relative_price.shape
+    new_relative_price = choice_data.relative_price.copy()
+    new_nd = choice_data.nd.copy()
+    new_available = choice_data.available_mask.copy()
+    
+    # Build market lookup
+    market_lookup = {}
+    for m_idx, m_id in enumerate(choice_data.market_ids):
+        market_lookup[m_id] = m_idx
+    
+    # Group actions by market
+    from collections import defaultdict
+    actions_by_market = defaultdict(list)
+    for action in actions:
+        month_str = pd.Timestamp(action["month"]).strftime("%Y-%m")
+        m_id = f"{month_str}|{action['retailer']}|{action['category']}"
+        if m_id in market_lookup:
+            actions_by_market[m_id].append(action)
+    
+    # Apply actions per market
+    for m_id, m_actions in actions_by_market.items():
+        m_idx = market_lookup[m_id]
+        
+        # First, collect price changes for peer price recalculation
+        price_changes = {}
+        nd_changes = {}
+        for action in m_actions:
+            s_idx = choice_data.sku_to_idx.get(action["sku"])
+            if s_idx is None:
+                continue
+            
+            # Price change
+            if action.get("new_price_std") is not None:
+                old_price = choice_data.relative_price[m_idx, s_idx] * action.get("peer_price", 1.0)
+                # We need peer price to compute new relative price
+                # For now, store the price ratio
+                price_changes[s_idx] = action["new_price_std"]
+            
+            # ND change
+            if action.get("new_nd") is not None:
+                nd_changes[s_idx] = action["new_nd"]
+        
+        # Recalculate peer prices for affected markets
+        if price_changes:
+            # Need to recalculate relative prices for ALL SKUs in this market
+            # because peer basket changes
+            market_skus = np.where(choice_data.available_mask[m_idx])[0]
+            for s_idx in market_skus:
+                sku = choice_data.idx_to_sku[s_idx]
+                old_price = choice_data.relative_price[m_idx, s_idx]
+                
+                # Compute new price for this SKU
+                if s_idx in price_changes:
+                    new_price_abs = price_changes[s_idx]
+                else:
+                    # Unchanged SKU - keep absolute price
+                    new_price_abs = old_price * 1.0  # placeholder, need peer price
+                
+                # For now, use simple approach: relative price changes proportionally
+                # Full implementation needs peer price recalculation
+        
+        # Apply ND changes
+        for s_idx, new_nd_val in nd_changes.items():
+            new_nd[m_idx, s_idx] = np.clip(new_nd_val, 1e-4, 1.0)
+            new_available[m_idx, s_idx] = new_nd_val > 0
+    
+    # Recalculate relative prices if any price changes
+    # This is a simplified version - full implementation needs peer price recalculation
+    return new_relative_price, new_nd, new_available
+
+
+# ============================================================================
 # Model
 # ============================================================================
 
@@ -995,6 +1337,1165 @@ def build_pymc_model_v2(
 
     return model
 
+
+# ============================================================================
+# Joint SKU Market-Share Model (Phase 3) - Dirichlet-Multinomial choice model
+# ============================================================================
+
+@dataclass(frozen=True, slots=True)
+class JointModelConfig:
+    """Configuration for the joint SKU market-share model."""
+    draws: int = 800
+    tune: int = 800
+    chains: int = 4
+    target_accept: float = 0.95
+    random_seed: int = 42
+    
+    # Hierarchy options
+    use_category_price_pooling: bool = True
+    use_sku_nd_effects: bool = True
+    use_category_nesting: bool = True
+    
+    # Prior scales
+    beta_category_mu: float = -1.0
+    beta_category_sigma: float = 0.75
+    sigma_beta_brand: float = 0.35
+    sigma_beta_sku: float = 0.25
+    sigma_gamma1: float = 0.5
+    sigma_gamma2: float = 0.5
+    sigma_alpha_retailer_sku: float = 0.7
+    sigma_alpha_sku: float = 0.5
+    
+    # Concentration prior for Dirichlet-Multinomial
+    concentration_sigma: float = 1.0
+
+
+JOINT_MODEL_DEFAULT_CONFIG = JointModelConfig()
+
+
+def build_joint_sku_share_model(
+    choice_data: ChoiceSetData,
+    config: JointModelConfig = JOINT_MODEL_DEFAULT_CONFIG,
+) -> pm.Model:
+    """
+    Build the joint SKU market-share model with Dirichlet-Multinomial likelihood.
+    
+    This model estimates within retailer-category SKU allocation using a nested
+    demand system with category -> brand -> SKU pooling.
+    
+    Model structure:
+    - Package units allocated via Dirichlet-Multinomial within each market
+    - SKU utility: alpha_rs + beta_s * log_rel_price + gamma1_s * ND + gamma2_s * ND^2 + pack_effect + cat_month_effect
+    - Hierarchical priors: category -> brand -> SKU for price sensitivity
+    - Retailer-SKU baseline attractiveness with brand/SKU hierarchy
+    - Category-month seasonality effects
+    - Masked softmax over available SKUs
+    
+    Args:
+        choice_data: ChoiceSetData with padded arrays and mappings
+        config: JointModelConfig with model settings
+    
+    Returns:
+        PyMC model with coords matching choice_data structure
+    """
+    n_markets, n_skus = choice_data.observed_units.shape
+    n_categories = len(choice_data.category_levels)
+    n_brands = len(choice_data.brand_levels)
+    n_months = len(choice_data.month_levels)
+    n_pack_groups = len(choice_data.pack_group_levels)
+    n_retailers = len(choice_data.retailer_levels)
+    
+    coords = {
+        "market": np.arange(n_markets),
+        "sku": np.arange(n_skus),
+        "category": choice_data.category_levels,
+        "brand": choice_data.brand_levels,
+        "month": choice_data.month_levels,
+        "pack_group": choice_data.pack_group_levels,
+        "retailer": choice_data.retailer_levels,
+    }
+    
+    # Data arrays
+    observed_units = choice_data.observed_units
+    market_total_units = choice_data.market_total_units
+    relative_price = choice_data.relative_price
+    nd = choice_data.nd
+    available = choice_data.available_mask
+    
+    market_retailer_idx = choice_data.market_retailer_idx
+    market_category_idx = choice_data.market_category_idx
+    market_month_idx = choice_data.market_month_idx
+    sku_brand_idx = choice_data.sku_brand_idx
+    sku_category_idx = choice_data.sku_category_idx
+    sku_pack_group_idx = choice_data.sku_pack_group_idx
+    brand_category_idx = choice_data.brand_category_idx
+    
+    with pm.Model(coords=coords) as model:
+        # Data containers for scenario reuse
+        observed_units_data = pm.Data("observed_units", observed_units, dims=("market", "sku"))
+        total_units_data = pm.Data("total_units", market_total_units, dims="market")
+        relative_price_data = pm.Data("relative_price", relative_price, dims=("market", "sku"))
+        nd_data = pm.Data("nd", nd, dims=("market", "sku"))
+        available_data = pm.Data("available", available, dims=("market", "sku"))
+        
+        # ================================================================
+        # Price sensitivity hierarchy: category -> brand x pack -> SKU
+        # ================================================================
+        if config.use_category_price_pooling:
+            # Category-level price sensitivity
+            beta_category = pm.Normal(
+                "beta_category",
+                mu=config.beta_category_mu,
+                sigma=config.beta_category_sigma,
+                dims="category",
+            )
+            
+            # Brand x pack_group level
+            sigma_beta_brand_pack = pm.HalfNormal("sigma_beta_brand_pack", sigma=config.sigma_beta_brand)
+            beta_brand_pack = pm.Normal(
+                "beta_brand_pack",
+                mu=beta_category[brand_category_idx][:, None],
+                sigma=sigma_beta_brand_pack,
+                dims=("brand", "pack_group"),
+            )
+        else:
+            beta_brand_pack = pm.Normal(
+                "beta_brand_pack",
+                mu=config.beta_category_mu,
+                sigma=config.beta_category_sigma,
+                dims=("brand", "pack_group"),
+            )
+        
+        # SKU-level price sensitivity
+        sigma_beta_sku = pm.HalfNormal("sigma_beta_sku", sigma=config.sigma_beta_sku)
+        beta_sku_offset = pm.Normal("beta_sku_offset", 0.0, 1.0, dims="sku")
+        
+        beta_sku = pm.Deterministic(
+            "beta_sku",
+            beta_brand_pack[sku_brand_idx, sku_pack_group_idx] + beta_sku_offset * sigma_beta_sku,
+            dims="sku",
+        )
+        
+        # ================================================================
+        # Numeric distribution response: gamma1 * ND + gamma2 * ND^2
+        # ================================================================
+        # Category-level hierarchical priors for ND response
+        gamma1_category = pm.Normal("gamma1_category", mu=0.0, sigma=config.sigma_gamma1, dims="category")
+        gamma2_category = pm.Normal("gamma2_category", mu=0.0, sigma=config.sigma_gamma2, dims="category")
+        
+        if config.use_sku_nd_effects:
+            # Brand-level variation
+            sigma_gamma1_brand = pm.HalfNormal("sigma_gamma1_brand", sigma=0.3)
+            sigma_gamma2_brand = pm.HalfNormal("sigma_gamma2_brand", sigma=0.3)
+            gamma1_brand = pm.Normal(
+                "gamma1_brand",
+                mu=gamma1_category[brand_category_idx],
+                sigma=sigma_gamma1_brand,
+                dims="brand",
+            )
+            gamma2_brand = pm.Normal(
+                "gamma2_brand",
+                mu=gamma2_category[brand_category_idx],
+                sigma=sigma_gamma2_brand,
+                dims="brand",
+            )
+            
+            # SKU-level variation
+            sigma_gamma1_sku = pm.HalfNormal("sigma_gamma1_sku", sigma=0.2)
+            sigma_gamma2_sku = pm.HalfNormal("sigma_gamma2_sku", sigma=0.2)
+            gamma1_sku_offset = pm.Normal("gamma1_sku_offset", 0.0, 1.0, dims="sku")
+            gamma2_sku_offset = pm.Normal("gamma2_sku_offset", 0.0, 1.0, dims="sku")
+            
+            gamma1_sku = pm.Deterministic(
+                "gamma1_sku",
+                gamma1_brand[sku_brand_idx] + gamma1_sku_offset * sigma_gamma1_sku,
+                dims="sku",
+            )
+            gamma2_sku = pm.Deterministic(
+                "gamma2_sku",
+                gamma2_brand[sku_brand_idx] + gamma2_sku_offset * sigma_gamma2_sku,
+                dims="sku",
+            )
+        else:
+            # Shared ND effects across SKUs
+            gamma1_sku = pm.Normal("gamma1_sku", mu=gamma1_category[sku_category_idx], sigma=config.sigma_gamma1, dims="sku")
+            gamma2_sku = pm.Normal("gamma2_sku", mu=gamma2_category[sku_category_idx], sigma=config.sigma_gamma2, dims="sku")
+        
+        # ================================================================
+        # Baseline SKU attractiveness: retailer x SKU with hierarchy
+        # ================================================================
+        # SKU-level baseline (brand/category hierarchy)
+        alpha_category = pm.Normal("alpha_category", 0.0, 1.0, dims="category")
+        sigma_alpha_brand = pm.HalfNormal("sigma_alpha_brand", sigma=config.sigma_alpha_sku)
+        alpha_brand = pm.Normal(
+            "alpha_brand",
+            mu=alpha_category[brand_category_idx],
+            sigma=sigma_alpha_brand,
+            dims="brand",
+        )
+        sigma_alpha_sku = pm.HalfNormal("sigma_alpha_sku", sigma=config.sigma_alpha_sku)
+        alpha_sku_offset = pm.Normal("alpha_sku_offset", 0.0, 1.0, dims="sku")
+        
+        alpha_sku = pm.Deterministic(
+            "alpha_sku",
+            alpha_brand[sku_brand_idx] + alpha_sku_offset * sigma_alpha_sku,
+            dims="sku",
+        )
+        
+        # Retailer x SKU deviation
+        sigma_alpha_retailer_sku = pm.HalfNormal("sigma_alpha_retailer_sku", sigma=config.sigma_alpha_retailer_sku)
+        alpha_retailer_sku_offset = pm.Normal("alpha_retailer_sku_offset", 0.0, 1.0, dims=("retailer", "sku"))
+        
+        alpha_retailer_sku = pm.Deterministic(
+            "alpha_retailer_sku",
+            alpha_retailer_sku_offset * sigma_alpha_retailer_sku,
+            dims=("retailer", "sku"),
+        )
+        
+        # ================================================================
+        # Category-month seasonality effects
+        # ================================================================
+        sigma_cat_month = pm.HalfNormal("sigma_cat_month", sigma=0.3)
+        cat_month_offset = pm.Normal("cat_month_offset", 0.0, 1.0, dims=("category", "month"))
+        cat_month_effect = pm.Deterministic(
+            "cat_month_effect",
+            cat_month_offset * sigma_cat_month,
+            dims=("category", "month"),
+        )
+        
+        # Center category-month effects around zero per category
+        cat_month_effect_centered = pm.Deterministic(
+            "cat_month_effect_centered",
+            cat_month_effect - pm.math.mean(cat_month_effect, axis=1)[:, None],
+            dims=("category", "month"),
+        )
+        
+        # ================================================================
+        # Pack group effects
+        # ================================================================
+        pack_effect = pm.Normal("pack_effect", 0.0, 0.5, dims="pack_group")
+        
+        # ================================================================
+        # SKU utility
+        # ================================================================
+        # U[m, s] = alpha_rs[m, s] + beta_s * log_rel_price[m, s] + gamma1_s * ND[m, s] + gamma2_s * ND[m, s]^2 + pack_effect[s] + cat_month[cat, month]
+        
+        # Use log of relative price for elasticity interpretation
+        log_rel_price = pm.math.log(pm.math.maximum(relative_price_data, 1e-4))
+        
+        utility = (
+            alpha_sku[None, :]                                         # SKU baseline
+            + alpha_retailer_sku[market_retailer_idx, :]               # Retailer-SKU deviation
+            + beta_sku[None, :] * log_rel_price                        # Price effect
+            + gamma1_sku[None, :] * nd_data                            # ND linear
+            + gamma2_sku[None, :] * pt.sqr(nd_data)            # ND quadratic
+            + pack_effect[sku_pack_group_idx][None, :]                 # Pack effect
+            + cat_month_effect_centered[market_category_idx, market_month_idx][:, None]  # Seasonality
+        )
+        
+        # ================================================================
+        # Masked softmax for conditional SKU shares
+        # ================================================================
+        # Unavailable SKUs get very negative utility
+        masked_utility = pm.math.switch(
+            available_data,
+            utility,
+            -1e9,
+        )
+        
+        sku_share = pm.Deterministic(
+            "sku_share",
+            pm.math.softmax(masked_utility, axis=1),
+            dims=("market", "sku"),
+        )
+        
+        # ================================================================
+        # Dirichlet-Multinomial likelihood
+        # ================================================================
+        # Concentration parameter per category (controls overdispersion)
+        concentration_category = pm.HalfNormal("concentration_category", sigma=config.concentration_sigma, dims="category")
+        concentration = concentration_category[market_category_idx][:, None]
+        
+        # Dirichlet-Multinomial: counts ~ DirMultinomial(N, concentration * shares)
+        # Add small epsilon to ensure all a_i > 0 (required for Dirichlet-Multinomial)
+        a_param = concentration * sku_share + 1e-6
+        
+        pm.DirichletMultinomial(
+            "sku_units_obs",
+            n=total_units_data,
+            a=a_param,
+            observed=observed_units_data,
+            dims=("market", "sku"),
+        )
+        
+        # ================================================================
+        # Inclusive value for upper-level nest (Layer B)
+        # ================================================================
+        # IV = log(sum(exp(utility))) for active SKUs
+        # This will be used by retailer-category allocation model
+        iv_per_market = pm.Deterministic(
+            "inclusive_value",
+            pm.math.log(pm.math.sum(pm.math.exp(pm.math.switch(available_data, utility, -1e9)), axis=1)),
+            dims="market",
+        )
+    
+    return model
+
+
+def sample_joint_posterior_predictive(
+    model: pm.Model,
+    idata: az.InferenceData,
+    random_seed: int = 42,
+) -> az.InferenceData:
+    """Generate posterior predictive samples for the joint model."""
+    with model:
+        ppc = pm.sample_posterior_predictive(
+            idata,
+            var_names=["sku_units_obs"],
+            random_seed=random_seed,
+            progressbar=False,
+            extend_inferencedata=True,
+        )
+    return ppc
+
+
+def fit_joint_model(
+    model: pm.Model,
+    config: JointModelConfig = JOINT_MODEL_DEFAULT_CONFIG,
+) -> az.InferenceData:
+    """Fit the joint SKU share model."""
+    with model:
+        idata = pm.sample(
+            draws=config.draws,
+            tune=config.tune,
+            chains=config.chains,
+            cores=min(config.chains, 4),
+            target_accept=config.target_accept,
+            random_seed=config.random_seed,
+            return_inferencedata=True,
+            init="jitter+adapt_diag",
+            progressbar=True,
+        )
+    return idata
+
+
+def extract_joint_posterior(
+    idata: az.InferenceData,
+    max_draws: int = 400,
+    random_seed: int = 42,
+) -> dict:
+    """Extract posterior arrays for fast scenario simulation."""
+    rng = np.random.default_rng(random_seed)
+    
+    try:
+        import arviz_base as azb
+        posterior = azb.extract(idata, group="posterior", combined=True, random_seed=random_seed)
+    except ImportError:
+        if hasattr(idata, "posterior"):
+            posterior = idata.posterior
+        elif hasattr(idata, "groups"):
+            posterior = idata["posterior"]
+        else:
+            raise ValueError("Cannot extract posterior from object")
+        posterior = posterior.stack(sample=("chain", "draw"))
+    
+    n_all = posterior.sizes["sample"]
+    chosen = np.sort(rng.choice(n_all, size=min(max_draws, n_all), replace=False))
+    
+    cache = {
+        "beta_sku": posterior["beta_sku"].isel(sample=chosen).transpose("sample", "sku").values,
+        "gamma1_sku": posterior["gamma1_sku"].isel(sample=chosen).transpose("sample", "sku").values,
+        "gamma2_sku": posterior["gamma2_sku"].isel(sample=chosen).transpose("sample", "sku").values,
+        "alpha_sku": posterior["alpha_sku"].isel(sample=chosen).transpose("sample", "sku").values,
+        "alpha_retailer_sku": posterior["alpha_retailer_sku"].isel(sample=chosen).transpose("sample", "retailer", "sku").values,
+        "pack_effect": posterior["pack_effect"].isel(sample=chosen).transpose("sample", "pack_group").values,
+        "cat_month_effect": posterior["cat_month_effect_centered"].isel(sample=chosen).transpose("sample", "category", "month").values,
+        "concentration_category": posterior["concentration_category"].isel(sample=chosen).transpose("sample", "category").values,
+        "sku_share": posterior["sku_share"].isel(sample=chosen).transpose("sample", "market", "sku").values,
+    }
+    
+    return cache
+
+
+# ============================================================================
+# Draw-by-draw counterfactual scenarios (Phase 4)
+# ============================================================================
+
+@dataclass(frozen=True, slots=True)
+class ScenarioAction:
+    """A single scenario action for a specific retailer × SKU × month."""
+    retailer: str
+    category: str
+    brand: str
+    sku: str
+    month: str
+    new_price_std: float | None = None
+    new_nd: float | None = None
+    nd_mode: str = "pp"  # "pp", "relative", "absolute"
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioResult:
+    """Results from a draw-by-draw counterfactual scenario."""
+    # Per-draw results (n_draws, n_markets, n_skus)
+    baseline_units: np.ndarray
+    scenario_units: np.ndarray
+    baseline_shares: np.ndarray
+    scenario_shares: np.ndarray
+    # Summaries (n_markets, n_skus)
+    baseline_units_p50: np.ndarray
+    scenario_units_p50: np.ndarray
+    baseline_units_p05: np.ndarray
+    scenario_units_p05: np.ndarray
+    baseline_units_p95: np.ndarray
+    scenario_units_p95: np.ndarray
+    delta_units_p50: np.ndarray
+    delta_units_p05: np.ndarray
+    delta_units_p95: np.ndarray
+    # Metadata
+    choice_data: ChoiceSetData
+    actions: list[ScenarioAction]
+
+
+def _compute_peer_price_matrix(
+    choice_data: ChoiceSetData,
+    price_std: np.ndarray,  # (n_markets, n_skus)
+    volume: np.ndarray,     # (n_markets, n_skus)
+) -> np.ndarray:
+    """
+    Compute category/pack-peer price for each market × SKU.
+    
+    Peer price = volume-weighted average of OTHER SKUs in same
+    retailer × category × pack_group × month.
+    """
+    n_markets, n_skus = price_std.shape
+    peer_price = np.ones((n_markets, n_skus), dtype=np.float64)
+    
+    # Group markets by (retailer, category, pack_group, month)
+    # We need to map SKUs to pack groups
+    sku_pack_group = choice_data.sku_pack_group_idx
+    
+    for m_idx in range(n_markets):
+        retailer = choice_data.market_retailer_idx[m_idx]
+        category = choice_data.market_category_idx[m_idx]
+        month = choice_data.market_month_idx[m_idx]
+        
+        # Find SKUs in this market
+        avail = choice_data.available_mask[m_idx]
+        market_skus = np.where(avail)[0]
+        
+        if len(market_skus) <= 1:
+            continue
+            
+        # Group by pack_group
+        for s_idx in market_skus:
+            pg = sku_pack_group[s_idx]
+            # Find other SKUs in same pack group
+            other_skus = [s for s in market_skus if s != s_idx and sku_pack_group[s] == pg]
+            if len(other_skus) == 0:
+                continue
+            other_vol = volume[m_idx, other_skus]
+            other_price = price_std[m_idx, other_skus]
+            if other_vol.sum() > 0:
+                peer_price[m_idx, s_idx] = np.sum(other_price * other_vol) / np.sum(other_vol)
+            else:
+                peer_price[m_idx, s_idx] = price_std[m_idx, s_idx]
+    
+    return peer_price
+
+
+def _compute_utility(
+    choice_data: ChoiceSetData,
+    posterior_cache: dict,
+    draw_idx: int,
+    price_std: np.ndarray,      # (n_markets, n_skus)
+    nd: np.ndarray,             # (n_markets, n_skus)
+    available: np.ndarray,      # (n_markets, n_skus)
+) -> np.ndarray:
+    """
+    Compute SKU utility for a single posterior draw.
+    
+    U[m, s] = alpha_rs + beta_s * log_rel_price + gamma1_s * ND + gamma2_s * ND^2 + pack + cat_month
+    """
+    n_markets, n_skus = price_std.shape
+    
+    # Extract draw-specific parameters
+    beta_sku = posterior_cache["beta_sku"][draw_idx]           # (n_skus,)
+    gamma1_sku = posterior_cache["gamma1_sku"][draw_idx]       # (n_skus,)
+    gamma2_sku = posterior_cache["gamma2_sku"][draw_idx]       # (n_skus,)
+    alpha_sku = posterior_cache["alpha_sku"][draw_idx]         # (n_skus,)
+    alpha_retailer_sku = posterior_cache["alpha_retailer_sku"][draw_idx]  # (n_retailers, n_skus)
+    pack_effect = posterior_cache["pack_effect"][draw_idx]     # (n_pack_groups,)
+    cat_month_effect = posterior_cache["cat_month_effect"][draw_idx]       # (n_categories, n_months)
+    
+    # Mappings
+    market_retailer_idx = choice_data.market_retailer_idx
+    market_category_idx = choice_data.market_category_idx
+    market_month_idx = choice_data.market_month_idx
+    sku_pack_group_idx = choice_data.sku_pack_group_idx
+    
+    # Log relative price
+    log_rel_price = np.log(np.maximum(price_std, 1e-4))
+    
+    # Compute utility
+    utility = (
+        alpha_sku[None, :] 
+        + alpha_retailer_sku[market_retailer_idx, :]
+        + beta_sku[None, :] * log_rel_price
+        + gamma1_sku[None, :] * nd
+        + gamma2_sku[None, :] * nd**2
+        + pack_effect[sku_pack_group_idx][None, :]
+        + cat_month_effect[market_category_idx, market_month_idx][:, None]
+    )
+    
+    # Mask unavailable
+    utility = np.where(available, utility, -1e9)
+    
+    return utility
+
+
+def _softmax(utility: np.ndarray) -> np.ndarray:
+    """Compute softmax with numerical stability."""
+    max_u = utility.max(axis=1, keepdims=True)
+    exp_u = np.exp(utility - max_u)
+    return exp_u / exp_u.sum(axis=1, keepdims=True)
+
+
+def _dirichlet_multinomial_draw(
+    n: np.ndarray,           # (n_markets,)
+    a: np.ndarray,           # (n_markets, n_skus)
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Draw from Dirichlet-Multinomial for each market."""
+    n_markets, n_skus = a.shape
+    draws = np.zeros((n_markets, n_skus), dtype=np.int64)
+    
+    for m in range(n_markets):
+        n_m = int(n[m])
+        a_m = a[m]
+        # Dirichlet sample
+        dirichlet_sample = rng.dirichlet(a_m)
+        # Multinomial draw
+        draws[m] = rng.multinomial(n_m, dirichlet_sample)
+    
+    return draws
+
+
+def run_joint_scenario_draws(
+    choice_data: ChoiceSetData,
+    posterior_cache: dict,
+    actions: list[ScenarioAction],
+    n_draws: int | None = None,
+    random_seed: int = 42,
+) -> ScenarioResult:
+    """
+    Run draw-by-draw counterfactual scenario for the joint SKU share model.
+    
+    For each posterior draw:
+    1. Compute baseline utilities and shares
+    2. Apply scenario actions (price/ND changes)
+    3. Recalculate peer prices for affected markets
+    4. Recalculate utilities and shares
+    5. Draw baseline and scenario package units from Dirichlet-Multinomial
+    6. Compute deltas
+    
+    Args:
+        choice_data: ChoiceSetData with baseline arrays
+        posterior_cache: Posterior parameter cache
+        actions: List of ScenarioAction objects
+        n_draws: Number of posterior draws to use (None = all in cache)
+        random_seed: Random seed for reproducibility
+    
+    Returns:
+        ScenarioResult with per-draw and summary results
+    """
+    rng = np.random.default_rng(random_seed)
+    
+    n_draws_available = posterior_cache["beta_sku"].shape[0]
+    if n_draws is None:
+        n_draws = n_draws_available
+    else:
+        n_draws = min(n_draws, n_draws_available)
+    
+    n_markets, n_skus = choice_data.observed_units.shape
+    
+    # Baseline price and ND
+    baseline_price = choice_data.relative_price * 1.0  # placeholder, need actual price_std
+    baseline_nd = choice_data.nd.copy()
+    baseline_available = choice_data.available_mask.copy()
+    baseline_volume = choice_data.observed_units.copy()
+    market_totals = choice_data.market_total_units.copy()
+    
+    # For baseline, we need actual price_std to compute relative price
+    # Since we only have relative_price in choice_data, we'll work with relative_price directly
+    # The utility uses log(relative_price), so we can just modify relative_price
+    baseline_rel_price = choice_data.relative_price.copy()
+    
+    # Prepare scenario relative_price and ND
+    scenario_rel_price = baseline_rel_price.copy()
+    scenario_nd = baseline_nd.copy()
+    scenario_available = baseline_available.copy()
+    
+    # Build market lookup
+    market_lookup = {m_id: m_idx for m_idx, m_id in enumerate(choice_data.market_ids)}
+    sku_lookup = choice_data.sku_to_idx
+    
+    # Apply actions to scenario arrays
+    for action in actions:
+        month_str = pd.Timestamp(action.month).strftime("%Y-%m")
+        m_id = f"{month_str}|{action.retailer}|{action.category}"
+        if m_id not in market_lookup:
+            continue
+        m_idx = market_lookup[m_id]
+        s_idx = sku_lookup.get(action.sku)
+        if s_idx is None:
+            continue
+        
+        # Price change
+        if action.new_price_std is not None:
+            # Need to convert absolute price to relative price
+            # This requires peer price recalculation - simplified for now
+            old_price_std = baseline_rel_price[m_idx, s_idx]  # This is relative price, not absolute
+            # For proper implementation, we need absolute price and peer price
+            # Simplified: assume relative price changes proportionally
+            scenario_rel_price[m_idx, s_idx] = action.new_price_std
+        
+        # ND change
+        if action.new_nd is not None:
+            if action.nd_mode == "pp":
+                scenario_nd[m_idx, s_idx] = np.clip(baseline_nd[m_idx, s_idx] + action.new_nd, 1e-4, 1.0)
+            elif action.nd_mode == "relative":
+                scenario_nd[m_idx, s_idx] = np.clip(baseline_nd[m_idx, s_idx] * (1 + action.new_nd), 1e-4, 1.0)
+            elif action.nd_mode == "absolute":
+                scenario_nd[m_idx, s_idx] = np.clip(action.new_nd, 1e-4, 1.0)
+            scenario_available[m_idx, s_idx] = scenario_nd[m_idx, s_idx] > 0
+    
+    # Recalculate peer prices for affected markets
+    # Group affected markets
+    affected_markets = set()
+    for action in actions:
+        month_str = pd.Timestamp(action.month).strftime("%Y-%m")
+        m_id = f"{month_str}|{action.retailer}|{action.category}"
+        if m_id in market_lookup:
+            affected_markets.add(market_lookup[m_id])
+    
+    # Recompute peer prices for affected markets (simplified)
+    # Full implementation would recompute peer prices based on new absolute prices
+    # For now, we use the relative price directly
+    
+    # Storage for results
+    baseline_units_all = np.zeros((n_draws, n_markets, n_skus), dtype=np.float64)
+    scenario_units_all = np.zeros((n_draws, n_markets, n_skus), dtype=np.float64)
+    baseline_shares_all = np.zeros((n_draws, n_markets, n_skus), dtype=np.float64)
+    scenario_shares_all = np.zeros((n_draws, n_markets, n_skus), dtype=np.float64)
+    
+    # Run each draw
+    for d in range(n_draws):
+        # Baseline
+        baseline_utility = _compute_utility(
+            choice_data, posterior_cache, d,
+            np.exp(np.log(np.maximum(baseline_rel_price, 1e-4))),  # price_std proxy
+            baseline_nd,
+            baseline_available,
+        )
+        baseline_shares = _softmax(baseline_utility)
+        
+        # Scenario
+        scenario_utility = _compute_utility(
+            choice_data, posterior_cache, d,
+            np.exp(np.log(np.maximum(scenario_rel_price, 1e-4))),
+            scenario_nd,
+            scenario_available,
+        )
+        scenario_shares = _softmax(scenario_utility)
+        
+        # Draw from Dirichlet-Multinomial
+        concentration = posterior_cache["concentration_category"][d]
+        a_base = concentration[choice_data.market_category_idx][:, None] * baseline_shares + 1e-6
+        a_scen = concentration[choice_data.market_category_idx][:, None] * scenario_shares + 1e-6
+        
+        baseline_units = _dirichlet_multinomial_draw(market_totals, a_base, rng)
+        scenario_units = _dirichlet_multinomial_draw(market_totals, a_scen, rng)
+        
+        baseline_units_all[d] = baseline_units
+        scenario_units_all[d] = scenario_units
+        baseline_shares_all[d] = baseline_shares
+        scenario_shares_all[d] = scenario_shares
+    
+    # Compute summaries
+    def compute_quantiles(arr, axis=0):
+        return (
+            np.quantile(arr, 0.05, axis=axis),
+            np.quantile(arr, 0.50, axis=axis),
+            np.quantile(arr, 0.95, axis=axis),
+        )
+    
+    baseline_units_p05, baseline_units_p50, baseline_units_p95 = compute_quantiles(baseline_units_all)
+    scenario_units_p05, scenario_units_p50, scenario_units_p95 = compute_quantiles(scenario_units_all)
+    delta_p05, delta_p50, delta_p95 = compute_quantiles(scenario_units_all - baseline_units_all)
+    
+    return ScenarioResult(
+        baseline_units=baseline_units_all,
+        scenario_units=scenario_units_all,
+        baseline_shares=baseline_shares_all,
+        scenario_shares=scenario_shares_all,
+        baseline_units_p50=baseline_units_p50,
+        scenario_units_p50=scenario_units_p50,
+        baseline_units_p05=baseline_units_p05,
+        scenario_units_p05=scenario_units_p05,
+        baseline_units_p95=baseline_units_p95,
+        scenario_units_p95=scenario_units_p95,
+        delta_units_p50=delta_p50,
+        delta_units_p05=delta_p05,
+        delta_units_p95=delta_p95,
+        choice_data=choice_data,
+        actions=actions,
+    )
+
+
+def aggregate_scenario_result(
+    result: ScenarioResult,
+    choice_data: ChoiceSetData,
+    level: str = "sku",
+) -> pd.DataFrame:
+    """
+    Aggregate scenario results to specified level.
+    
+    Levels: market, retailer, category, brand, sku, brand_pack
+    """
+    n_markets, n_skus = choice_data.observed_units.shape
+    sku_ids = choice_data.sku_ids
+    
+    # Build SKU metadata DataFrame
+    sku_meta = []
+    for s_idx, sku in enumerate(sku_ids):
+        # Get brand from sku_brand_idx
+        brand_idx = choice_data.sku_brand_idx[s_idx]
+        brand = choice_data.brand_levels[brand_idx]
+        
+        # Get category from sku_category_idx
+        cat_idx = choice_data.sku_category_idx[s_idx]
+        category = choice_data.category_levels[cat_idx]
+        
+        # Get pack_group from sku_pack_group_idx
+        pg_idx = choice_data.sku_pack_group_idx[s_idx]
+        pack_group = choice_data.pack_group_levels[pg_idx]
+        
+        sku_meta.append({
+            "sku_idx": s_idx,
+            "sku": sku,
+            "brand": brand,
+            "category": category,
+            "pack_group": pack_group,
+        })
+    sku_meta_df = pd.DataFrame(sku_meta)
+    
+    # Market metadata
+    market_meta = []
+    for m_idx, m_id in enumerate(choice_data.market_ids):
+        retailer_idx = choice_data.market_retailer_idx[m_idx]
+        retailer = choice_data.retailer_levels[retailer_idx]
+        
+        cat_idx = choice_data.market_category_idx[m_idx]
+        category = choice_data.category_levels[cat_idx]
+        
+        month_idx = choice_data.market_month_idx[m_idx]
+        month = choice_data.month_levels[month_idx]
+        
+        market_meta.append({
+            "market_idx": m_idx,
+            "market_id": m_id,
+            "retailer": retailer,
+            "category": category,
+            "month": month,
+        })
+    market_meta_df = pd.DataFrame(market_meta)
+    
+    # Use p50 (median) for aggregation
+    baseline = result.baseline_units_p50  # (n_markets, n_skus)
+    scenario = result.scenario_units_p50  # (n_markets, n_skus)
+    
+    # Flatten to long format
+    records = []
+    for m_idx in range(n_markets):
+        m_info = market_meta_df.iloc[m_idx]
+        for s_idx in range(n_skus):
+            s_info = sku_meta_df.iloc[s_idx]
+            records.append({
+                "market_idx": m_idx,
+                "market_id": m_info["market_id"],
+                "retailer": m_info["retailer"],
+                "category": m_info["category"],
+                "month": m_info["month"],
+                "sku_idx": s_idx,
+                "sku": s_info["sku"],
+                "brand": s_info["brand"],
+                "pack_group": s_info["pack_group"],
+                "baseline_units": baseline[m_idx, s_idx],
+                "scenario_units": scenario[m_idx, s_idx],
+                "delta_units": scenario[m_idx, s_idx] - baseline[m_idx, s_idx],
+            })
+    
+    df = pd.DataFrame(records)
+    
+    # Aggregate based on level
+    if level == "market":
+        group_cols = []
+    elif level == "retailer":
+        group_cols = ["retailer"]
+    elif level == "category":
+        group_cols = ["category"]
+    elif level == "brand":
+        group_cols = ["brand"]
+    elif level == "sku":
+        group_cols = ["sku"]
+    elif level == "brand_pack":
+        group_cols = ["brand", "pack_group"]
+    elif level == "retailer_category":
+        group_cols = ["retailer", "category"]
+    elif level == "retailer_brand":
+        group_cols = ["retailer", "brand"]
+    else:
+        raise ValueError(f"Unknown level: {level}")
+    
+    if group_cols:
+        agg = df.groupby(group_cols, as_index=False).agg(
+            baseline_units=("baseline_units", "sum"),
+            scenario_units=("scenario_units", "sum"),
+            delta_units=("delta_units", "sum"),
+        )
+    else:
+        agg = pd.DataFrame([{
+            "baseline_units": df["baseline_units"].sum(),
+            "scenario_units": df["scenario_units"].sum(),
+            "delta_units": df["delta_units"].sum(),
+        }])
+    
+    # Add pct change
+    agg["delta_units_pct"] = np.where(
+        agg["baseline_units"] > 0,
+        agg["delta_units"] / agg["baseline_units"],
+        np.nan,
+    )
+    
+    return agg
+
+
+def check_scenario_reconciliation(
+    result: ScenarioResult,
+    choice_data: ChoiceSetData,
+    tol: float = 1e-6,
+) -> dict[str, Any]:
+    """
+    Verify scenario reconciliation constraints.
+    
+    Checks:
+    1. Baseline shares sum to 1 per market
+    2. Scenario shares sum to 1 per market  
+    3. Baseline units sum to market totals
+    4. Scenario units sum to market totals
+    5. Delta sums match across aggregation levels
+    
+    Returns dict with check results.
+    """
+    n_markets = len(choice_data.market_ids)
+    
+    checks = {
+        "baseline_shares_sum_to_one": True,
+        "scenario_shares_sum_to_one": True,
+        "baseline_units_match_totals": True,
+        "scenario_units_match_totals": True,
+        "delta_consistency": True,
+        "details": [],
+    }
+    
+    # Check shares sum to 1
+    for m in range(n_markets):
+        baseline_share_sum = result.baseline_shares[:, m, :].sum(axis=1)
+        scenario_share_sum = result.scenario_shares[:, m, :].sum(axis=1)
+        
+        if not np.allclose(baseline_share_sum, 1.0, atol=tol):
+            checks["baseline_shares_sum_to_one"] = False
+            checks["details"].append(f"Market {m}: baseline shares sum = {baseline_share_sum.mean():.6f}")
+        
+        if not np.allclose(scenario_share_sum, 1.0, atol=tol):
+            checks["scenario_shares_sum_to_one"] = False
+            checks["details"].append(f"Market {m}: scenario shares sum = {scenario_share_sum.mean():.6f}")
+    
+    # Check units match market totals
+    baseline_units_sum = result.baseline_units.sum(axis=2)  # (n_draws, n_markets)
+    scenario_units_sum = result.scenario_units.sum(axis=2)
+    market_totals = choice_data.market_total_units
+    
+    if not np.allclose(baseline_units_sum, market_totals, atol=tol):
+        checks["baseline_units_match_totals"] = False
+        checks["details"].append("Baseline units don't match market totals")
+    
+    if not np.allclose(scenario_units_sum, market_totals, atol=tol):
+        checks["scenario_units_match_totals"] = False
+        checks["details"].append("Scenario units don't match market totals")
+    
+    # Delta consistency: sum of deltas should be zero (market held fixed)
+    delta_sum = result.delta_units_p50.sum()
+    if abs(delta_sum) > tol:
+        checks["delta_consistency"] = False
+        checks["details"].append(f"Total delta = {delta_sum:.4f} (expected 0)")
+    
+    checks["all_passed"] = all([
+        checks["baseline_shares_sum_to_one"],
+        checks["scenario_shares_sum_to_one"],
+        checks["baseline_units_match_totals"],
+        checks["scenario_units_match_totals"],
+        checks["delta_consistency"],
+    ])
+    
+    return checks
+
+
+# ============================================================================
+# Retailer-Category Upper-Level Allocation (Phase 5) - Layer B
+# ============================================================================
+
+@dataclass(frozen=True, slots=True)
+class NestModelConfig:
+    """Configuration for the retailer-category nest allocation model (Layer B)."""
+    draws: int = 800
+    tune: int = 800
+    chains: int = 4
+    target_accept: float = 0.95
+    random_seed: int = 42
+    
+    # Prior scales
+    sigma_alpha_rc: float = 0.5
+    sigma_cpi: float = 0.3
+    sigma_assortment: float = 0.3
+    sigma_nesting: float = 0.5
+    sigma_rc_month: float = 0.3
+    sigma_outside: float = 0.5
+
+
+NEST_MODEL_DEFAULT_CONFIG = NestModelConfig()
+
+
+def build_nest_allocation_model(
+    choice_data: ChoiceSetData,
+    joint_posterior_cache: dict,
+    config: NestModelConfig = NEST_MODEL_DEFAULT_CONFIG,
+) -> pm.Model:
+    """
+    Build the retailer-category nest allocation model (Layer B).
+    
+    This model allocates total observed market volume across retailer-category nests
+    using the inclusive value from the SKU-level model (Layer C).
+    
+    Structure:
+    - Retailer-category utility: U_rc = alpha_rc + theta_c * CPI_rc + omega_c * Assortment_rc + lambda_c * IV_rc + delta_rc_month
+    - Nest share: w_rc = exp(U_rc) / (sum(exp(U_rc')) + exp(U_outside))
+    - Total market volume T_t is either fixed or modeled with Layer A
+    
+    Args:
+        choice_data: ChoiceSetData from SKU-level model
+        joint_posterior_cache: Posterior cache from joint SKU share model (for IV)
+        config: NestModelConfig
+    
+    Returns:
+        PyMC model for nest allocation
+    """
+    n_markets = len(choice_data.market_ids)
+    
+    # Get unique retailer-category combinations
+    rc_combos = []
+    for m_idx in range(n_markets):
+        retailer = choice_data.retailer_levels[choice_data.market_retailer_idx[m_idx]]
+        category = choice_data.category_levels[choice_data.market_category_idx[m_idx]]
+        rc_combos.append((retailer, category))
+    
+    unique_rc = sorted(set(rc_combos))
+    n_rc = len(unique_rc)
+    
+    # Map market to rc index
+    market_to_rc = np.array([unique_rc.index(rc) for rc in rc_combos], dtype=np.int32)
+    
+    # Get months
+    months = sorted({choice_data.month_levels[choice_data.market_month_idx[m_idx]] for m_idx in range(n_markets)})
+    n_months = len(months)
+    month_to_idx = {m: i for i, m in enumerate(months)}
+    market_month_idx = np.array([month_to_idx[choice_data.month_levels[choice_data.market_month_idx[m_idx]]] for m_idx in range(n_markets)], dtype=np.int32)
+    
+    # Get categories for nesting parameter
+    rc_categories = [rc[1] for rc in unique_rc]
+    rc_category_idx = np.array([np.where(choice_data.category_levels == cat)[0][0] for cat in rc_categories], dtype=np.int32)
+    
+    # Market totals (total units per retailer-category-month)
+    market_totals = choice_data.market_total_units
+    
+    # Inclusive values from joint model (average across posterior draws)
+    iv_mean = joint_posterior_cache["sku_share"].mean(axis=0)  # This is shares, not IV
+    # We need IV = log(sum(exp(utility))) for active SKUs
+    # For now, compute a proxy from the posterior cache
+    # The joint model stores inclusive_value in posterior
+    if "inclusive_value" in joint_posterior_cache:
+        iv_per_market = joint_posterior_cache["inclusive_value"].mean(axis=0)  # (n_markets,)
+    else:
+        # Compute from shares: IV = log(sum(share * exp(utility))) but we don't have utility
+        # Use a proxy: IV proportional to log of number of available SKUs
+        iv_per_market = np.log(np.maximum(choice_data.available_mask.sum(axis=1), 1))
+    
+    # Aggregate IV to retailer-category level (mean across months)
+    iv_rc = np.zeros(n_rc)
+    iv_rc_counts = np.zeros(n_rc)
+    for m_idx in range(n_markets):
+        rc_idx = market_to_rc[m_idx]
+        iv_rc[rc_idx] += iv_per_market[m_idx]
+        iv_rc_counts[rc_idx] += 1
+    iv_rc = np.where(iv_rc_counts > 0, iv_rc / iv_rc_counts, 0.0)
+    
+    coords = {
+        "rc": np.arange(n_rc),
+        "month": np.arange(n_months),
+        "category": choice_data.category_levels,
+    }
+    
+    with pm.Model(coords=coords) as model:
+        # Data containers
+        market_totals_data = pm.Data("market_totals", market_totals, dims="market")
+        iv_data = pm.Data("iv_rc", iv_rc, dims="rc")
+        market_to_rc_data = pm.Data("market_to_rc", market_to_rc, dims="market")
+        market_month_idx_data = pm.Data("market_month_idx", market_month_idx, dims="market")
+        
+        # Retailer-category baseline attractiveness
+        alpha_rc = pm.Normal("alpha_rc", 0.0, config.sigma_alpha_rc, dims="rc")
+        
+        # Category-level CPI effect
+        theta_c = pm.Normal("theta_c", 0.0, config.sigma_cpi, dims="category")
+        # CPI data would be needed - placeholder for now
+        cpi_rc = pm.Data("cpi_rc", np.zeros(n_rc), dims="rc")
+        
+        # Category-level assortment effect
+        omega_c = pm.Normal("omega_c", 0.0, config.sigma_assortment, dims="category")
+        assortment_rc = pm.Data("assortment_rc", np.zeros(n_rc), dims="rc")
+        
+        # Nesting parameter lambda_c (0 < lambda <= 1)
+        lambda_raw = pm.Normal("lambda_raw", 0.0, config.sigma_nesting, dims="category")
+        lambda_c = pm.Deterministic("lambda_c", pm.math.sigmoid(lambda_raw), dims="category")
+        
+        # Retailer-category-month seasonality
+        sigma_rc_month = pm.HalfNormal("sigma_rc_month", config.sigma_rc_month)
+        rc_month_offset = pm.Normal("rc_month_offset", 0.0, 1.0, dims=("rc", "month"))
+        rc_month_effect = pm.Deterministic("rc_month_effect", rc_month_offset * sigma_rc_month, dims=("rc", "month"))
+        
+        # Outside option utility
+        outside_utility = pm.Normal("outside_utility", 0.0, config.sigma_outside)
+        
+        # Retailer-category utility
+        rc_utility = (
+            alpha_rc[None, :]
+            + theta_c[rc_category_idx][None, :] * cpi_rc[None, :]
+            + omega_c[rc_category_idx][None, :] * assortment_rc[None, :]
+            + lambda_c[rc_category_idx][None, :] * iv_data[None, :]
+            + rc_month_effect[:, market_month_idx_data]  # (n_markets, n_rc)
+        )
+        
+        # Mask: only the rc that matches this market
+        market_rc_utility = rc_utility[np.arange(n_markets), market_to_rc_data]
+        
+        # Nest shares: w_rc = exp(U_rc) / (sum(exp(U_rc)) + exp(U_outside))
+        # For each market, only one rc is active
+        exp_rc_utility = pm.math.exp(market_rc_utility)
+        exp_outside = pm.math.exp(outside_utility)
+        
+        # Denominator: sum over all rc + outside
+        denom = pm.math.sum(pm.math.exp(rc_utility), axis=1) + exp_outside
+        
+        # Market-level nest share
+        w_rc = pm.Deterministic("w_rc", exp_rc_utility / denom, dims="market")
+        w_outside = pm.Deterministic("w_outside", exp_outside / denom, dims="market")
+        
+        # Expected market totals
+        expected_totals = w_rc * market_totals_data
+        
+        # Likelihood: observed market totals follow a distribution around expected
+        # Using Normal for continuous approximation
+        sigma_market = pm.HalfNormal("sigma_market", 0.1)
+        pm.Normal(
+            "market_totals_obs",
+            mu=expected_totals,
+            sigma=sigma_market * market_totals_data,
+            observed=market_totals_data,
+            dims="market",
+        )
+        
+        # Posterior predictive
+        pm.Normal(
+            "market_totals_pred",
+            mu=expected_totals,
+            sigma=sigma_market * market_totals_data,
+            dims="market",
+        )
+    
+    return model
+
+
+def fit_nest_model(
+    model: pm.Model,
+    config: NestModelConfig = NEST_MODEL_DEFAULT_CONFIG,
+) -> az.InferenceData:
+    """Fit the nest allocation model."""
+    with model:
+        idata = pm.sample(
+            draws=config.draws,
+            tune=config.tune,
+            chains=config.chains,
+            cores=min(config.chains, 4),
+            target_accept=config.target_accept,
+            random_seed=config.random_seed,
+            return_inferencedata=True,
+            init="jitter+adapt_diag",
+            progressbar=True,
+        )
+    return idata
+
+
+def extract_nest_posterior(
+    idata: az.InferenceData,
+    max_draws: int = 400,
+    random_seed: int = 42,
+) -> dict:
+    """Extract posterior arrays for nest allocation scenarios."""
+    rng = np.random.default_rng(random_seed)
+    
+    try:
+        import arviz_base as azb
+        posterior = azb.extract(idata, group="posterior", combined=True, random_seed=random_seed)
+    except ImportError:
+        if hasattr(idata, "posterior"):
+            posterior = idata.posterior
+        elif hasattr(idata, "groups"):
+            posterior = idata["posterior"]
+        else:
+            raise ValueError("Cannot extract posterior from object")
+        posterior = posterior.stack(sample=("chain", "draw"))
+    
+    n_all = posterior.sizes["sample"]
+    chosen = np.sort(rng.choice(n_all, size=min(max_draws, n_all), replace=False))
+    
+    cache = {
+        "alpha_rc": posterior["alpha_rc"].isel(sample=chosen).transpose("sample", "rc").values,
+        "theta_c": posterior["theta_c"].isel(sample=chosen).transpose("sample", "category").values,
+        "omega_c": posterior["omega_c"].isel(sample=chosen).transpose("sample", "category").values,
+        "lambda_c": posterior["lambda_c"].isel(sample=chosen).transpose("sample", "category").values,
+        "rc_month_effect": posterior["rc_month_effect"].isel(sample=chosen).transpose("sample", "rc", "month").values,
+        "outside_utility": posterior["outside_utility"].isel(sample=chosen).values,
+        "w_rc": posterior["w_rc"].isel(sample=chosen).transpose("sample", "market").values,
+        "w_outside": posterior["w_outside"].isel(sample=chosen).transpose("sample", "market").values,
+    }
+    
+    return cache
+
+
+# ============================================================================
+# Model fitting
+# ============================================================================
 
 def fit_model(
     model: pm.Model,
@@ -4208,7 +5709,7 @@ def create_cross_category_sensitivity_chart(
 # ============================================================================
 
 @dataclass(frozen=True, slots=True)
-class ScenarioAction:
+class ActionTableRow:
     """A single scenario action for a specific retailer × SKU relationship."""
     retailer: str
     category: str
