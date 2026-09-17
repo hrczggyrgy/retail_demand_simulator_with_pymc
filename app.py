@@ -7,7 +7,7 @@ Pages:
 3. Fit & validate    — Model mode, Fit/Re-fit button, diagnostics, PPC, elasticity forest
 4. Scenario cockpit  — Editable action table (data_editor), guardrails, scenario outputs, market impact
 
-Standardized columns: standard_volume, price_per_standard_unit, nd, velocity_std
+Standardized columns: standard_volume, price_std, nd, velocity_std
 Decomposition identity: standard_volume = retailer_stores × nd × velocity_std
 """
 
@@ -84,7 +84,7 @@ STANDARD_COLUMNS = {
     "pack_size": "pack_size",
     # Derived
     "standard_volume": "standard_volume",
-    "price_per_standard_unit": "price_per_standard_unit",
+    "price_std": "price_std",
     "nd": "nd",
     "velocity_std": "velocity_std",
     "relative_price_std": "relative_price_std",
@@ -799,12 +799,12 @@ def render_market_diagnostics_page(
     with col3:
         st.markdown("### Price-Pack Architecture")
         chart_subtitle("Which packs occupy comparable price-value positions?")
-        if "price_per_standard_unit" in latest.columns and "pack_size" in latest.columns:
+        if "price_std" in latest.columns and "pack_size" in latest.columns:
             fig = px.scatter(
-                latest, x="pack_size", y="price_per_standard_unit",
+                latest, x="pack_size", y="price_std",
                 size="revenue", color="brand", hover_data=["sku", "standard_volume", "nd"],
                 title=f"Price per Standard Unit by Pack Size – {latest_month.strftime('%b %Y')}",
-                labels={"pack_size": "Pack Size", "price_per_standard_unit": "Price per Standard Unit"}
+                labels={"pack_size": "Pack Size", "price_std": "Price per Standard Unit"}
             )
             if "category_price_median" in latest.columns:
                 cat_median = latest["category_price_median"].median()
@@ -876,16 +876,16 @@ def render_market_diagnostics_page(
     st.divider()
     st.markdown("### Growth Decomposition Waterfall")
     chart_subtitle("Which brands explain the category's standard volume change?")
-    if "brand_units" in view_enriched.columns:
+    if "brand_std_volume" in view_enriched.columns:
         latest_m = view_enriched["month"].max()
         prev_m = view_enriched["month"].min()
         curr = view_enriched[view_enriched["month"] == latest_m].groupby("brand").agg(
             volume=("standard_volume", "sum"),
-            brand_volume=("brand_units", "first")
+            brand_volume=("brand_std_volume", "first")
         )
         prev = view_enriched[view_enriched["month"] == prev_m].groupby("brand").agg(
             volume=("standard_volume", "sum"),
-            brand_volume=("brand_units", "first")
+            brand_volume=("brand_std_volume", "first")
         )
         merged = curr.join(prev, lsuffix="_curr", rsuffix="_prev", how="outer").fillna(0)
         merged["change"] = merged["volume_curr"] - merged["volume_prev"]
@@ -905,7 +905,7 @@ def render_market_diagnostics_page(
         render_scope_context("All observed brands in category", 
                            f"Latest ({latest_m.strftime('%b %Y')}) vs. earliest ({prev_m.strftime('%b %Y')}) period")
     else:
-        st.info("Brand units not available for growth decomposition.")
+        st.info("Brand standard volume not available for growth decomposition.")
 
 
 # ---------------------------------------------------------------------------
@@ -1271,7 +1271,7 @@ def run_joint_scenario_from_actions(
     actions = []
     for _, row in checked.iterrows():
         price_change_pct = row["price_change_pct"] / 100.0
-        baseline_price_std = row["price_per_standard_unit"]
+        baseline_price_std = row["price_std"]
         new_price_std = baseline_price_std * (1 + price_change_pct) if price_change_pct != 0 else None
         
         nd_change_pp = row["nd_change_pp"] / 100.0
@@ -1626,7 +1626,7 @@ def render_source_destination_sankey(
         brand=selected_action["brand"],
         sku=selected_action["sku"],
         month=str(selected_action["month"]),
-        new_price_std=selected_action["price_per_standard_unit"] * (1 + selected_action["price_change_pct"] / 100.0) if selected_action["price_change_pct"] != 0 else None,
+        new_price_std=selected_action["price_std"] * (1 + selected_action["price_change_pct"] / 100.0) if selected_action["price_change_pct"] != 0 else None,
         new_nd=(
             selected_action["nd"] + selected_action["nd_change_pp"] / 100.0
             if selected_action["nd_mode"] == "pp" and selected_action["nd_change_pp"] != 0
@@ -2139,8 +2139,8 @@ def render_scenario_audit_export(
                     "scenario_revenue": row.get("revenue_p50", row.get("revenue", 0)),
                     "baseline_nd": row.get("baseline_nd", row.get("nd", 0)),
                     "scenario_nd": row.get("scenario_nd", row.get("nd", 0)),
-                    "baseline_price": row.get("baseline_price", row.get("price_per_standard_unit", 0)),
-                    "scenario_price": row.get("scenario_price", row.get("price_per_standard_unit", 0)),
+                    "baseline_price": row.get("baseline_price", row.get("price_std", 0)),
+                    "scenario_price": row.get("scenario_price", row.get("price_std", 0)),
                 })
         export_df = pd.DataFrame(export_data)
         csv = export_df.to_csv(index=False)
