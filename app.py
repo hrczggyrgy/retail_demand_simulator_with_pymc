@@ -1342,6 +1342,9 @@ def render_market_impact_comparison(
     nd_change = scenario_settings.get("nd_change", 0.0)
     nd_mode = scenario_settings.get("nd_mode", "pp")
 
+    # Period text for scope context
+    period_text = f"{start_month.strftime('%b %Y')} – {end_month.strftime('%b %Y')}"
+
     # Determine selected SKU for segment classification
     selected_sku = target_value if target_level == "SKU" else None
     selected_brand = target_value if target_level == "Brand" else (scenario_df[scenario_df["sku"] == selected_sku]["brand"].iloc[0] if selected_sku else None)
@@ -1405,7 +1408,7 @@ def render_market_impact_comparison(
         hide_index=True,
     )
 
-    # Reallocation breakdown
+    # Reallocation breakdown (P1: primary visuals, P2: segment-level selector)
     if selected_sku and selected_brand and selected_category and selected_pack_group and selected_retailer:
         st.markdown("#### Reallocation Breakdown")
         realloc = engine.compute_reallocation_breakdown(
@@ -1414,54 +1417,75 @@ def render_market_impact_comparison(
             selected_pack_group, selected_retailer
         )
 
+        # P2: Segment-level selector for winner-loser visuals
+        segment_level = st.selectbox(
+            "Compare segments at",
+            ["segment", "brand", "brand_pack", "retailer", "category"],
+            index=0,
+            format_func=lambda x: x.replace("_", " ").title(),
+            help="Choose the aggregation level for the winner/loser chart. 'Segment' shows the 6 neutral segments (selected SKU, same-brand other SKU, etc.)."
+        )
+
+        # P1: Keep only top 2 decision visuals open (waterfall + dumbbell)
         col1, col2 = st.columns(2)
         with col1:
+            chart_subtitle("Which modelled components explain the scenario difference?")
             st.plotly_chart(
                 engine.create_reallocation_waterfall(realloc),
                 use_container_width=True
             )
         with col2:
+            chart_subtitle("Which observed market segments gain or lose under the scenario?")
             st.plotly_chart(
-                engine.create_dumbbell_chart(realloc),
+                engine.create_dumbbell_chart(realloc, level=segment_level),
                 use_container_width=True
             )
 
-        st.dataframe(
-            realloc[["segment_label", "baseline_units", "scenario_units", "delta_units", "delta_units_pct", "share_of_total_delta"]].style.format({
-                "baseline_units": "{:,.0f}",
-                "scenario_units": "{:,.0f}",
-                "delta_units": "{:+,.0f}",
-                "delta_units_pct": "{:+.1%}",
-                "share_of_total_delta": "{:.1%}",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
+        # P1: Move detailed table to expander
+        with st.expander("📋 Reallocation detail table", expanded=False):
+            st.dataframe(
+                realloc[["segment_label", "baseline_units", "scenario_units", "delta_units", "delta_units_pct", "share_of_total_delta"]].style.format({
+                    "baseline_units": "{:,.0f}",
+                    "scenario_units": "{:,.0f}",
+                    "delta_units": "{:+,.0f}",
+                    "delta_units_pct": "{:+.1%}",
+                    "share_of_total_delta": "{:.1%}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
 
-    # Visualizations
+    # Visualizations (P1: keep top 2 open, move rest to expanders)
     st.markdown("#### Market Visualizations")
 
-    viz_tabs = st.tabs(["Category Bubble Map", "Brand×Pack Heatmap", "Cross-Category Sensitivity"])
-
-    with viz_tabs[0]:
+    # Primary visuals (always visible)
+    viz_col1, viz_col2 = st.columns(2)
+    with viz_col1:
+        chart_subtitle("Which categories gain or lose share vs. volume?")
         st.plotly_chart(
             engine.create_category_bubble_map(market_impact),
             use_container_width=True
         )
+        render_scope_context("All observed categories in the affected market", period_text)
 
-    with viz_tabs[1]:
+    with viz_col2:
+        chart_subtitle("How do brand×pack combinations shift under the scenario?")
         st.plotly_chart(
             engine.create_brand_pack_heatmap(market_impact),
             use_container_width=True
         )
+        render_scope_context("All observed brand×pack combinations", period_text)
 
-    with viz_tabs[2]:
+    # Advanced visuals in expanders (P1)
+    with st.expander("🔬 Advanced: Cross-Category Sensitivity", expanded=False):
+        chart_subtitle("How does the substitution assumption affect other categories?")
         st.plotly_chart(
             engine.create_cross_category_sensitivity_chart(scenarios, cross_cat_sensitivity),
             use_container_width=True
         )
         st.caption("Cross-category sensitivity is an assumption-led multiplier. "
                    "Conservative: no substitution. Central: 5% of displaced volume reallocates. High: 15%.")
+        render_scope_context("Other categories within the same retailer", period_text)
 
     # Parameter Attribution (for SKU-level targets)
     if target_level == "SKU" and target_value:

@@ -4021,8 +4021,15 @@ def create_reallocation_waterfall(realloc_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def create_dumbbell_chart(realloc_df: pd.DataFrame) -> go.Figure:
-    """Create a dumbbell chart comparing baseline vs scenario by segment."""
+def create_dumbbell_chart(realloc_df: pd.DataFrame, level: str = "segment") -> go.Figure:
+    """Create a dumbbell chart comparing baseline vs scenario by segment.
+    
+    Args:
+        realloc_df: DataFrame with baseline_units, scenario_units, segment_label columns
+        level: Aggregation level for display ("segment", "brand", "brand_pack", "retailer", "category")
+               Currently only "segment" is fully supported; other levels would require 
+               re-computing reallocation at that level.
+    """
     df = realloc_df.sort_values("baseline_units", ascending=True).copy()
 
     fig = go.Figure()
@@ -4055,8 +4062,9 @@ def create_dumbbell_chart(realloc_df: pd.DataFrame) -> go.Figure:
             hoverinfo="skip"
         ))
 
+    level_display = level.replace("_", " ").title()
     fig.update_layout(
-        title="Winner-Loser Dumbbell: Baseline vs Scenario by Segment",
+        title=f"Winner-Loser Dumbbell: Baseline vs Scenario by {level_display}",
         xaxis_title="Units",
         height=400,
         showlegend=True
