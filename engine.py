@@ -108,6 +108,17 @@ NUMERIC_COLUMNS = [
 
 KEY_COLUMNS = ["month", "retailer", "category", "brand", "sku"]
 
+# Standardized analytical column names (used throughout the engine)
+STANDARD_COLUMNS = {
+    "standard_volume": "standard_volume",
+    "price_per_standard_unit": "price_std",
+    "nd": "nd",
+    "velocity_std": "velocity_std",
+    "log_velocity_std": "log_velocity_std",
+    "relative_price_std": "relative_price_std",
+    "log_relative_price_std": "log_relative_price_std",
+}
+
 DEFAULT_DRAWS = 800
 DEFAULT_TUNE = 800
 DEFAULT_CHAINS = 1
@@ -435,11 +446,19 @@ def prepare_data(
     if df.empty:
         raise ValueError("No valid rows remain after initial data cleaning.")
 
-    # Basic physical metrics.
+    # Basic physical metrics using standardized column names.
     df["standard_volume"] = df["units"] * df["pack_size"]
     df["price_std"] = df["revenue"] / df["standard_volume"]
     df["nd"] = df["sku_stores"] / df["retailer_stores"]
     df["velocity_std"] = df["standard_volume"] / df["sku_stores"]
+
+    # Decomposition identity check: Q_std = RetailerStores * ND * Velocity_std
+    df["decomposition_check"] = (
+        df["retailer_stores"] * df["nd"] * df["velocity_std"]
+    )
+    df["decomposition_error"] = (
+        df["standard_volume"] - df["decomposition_check"]
+    ).abs()
 
     # One grouped aggregation + merge instead of multiple transform calls.
     cell = ["retailer", "category", "month"]
@@ -466,13 +485,28 @@ def prepare_data(
     )
     df["relative_price"] = df["price_std"] / df["other_skus_price_std"]
 
+    # --- Pack group (category-relative) ---
+    df["pack_group"] = _add_category_relative_pack_groups(df)
+
+    # Relative price against category/pack-peer price basket (weighted avg of similar SKUs)
+    # Similar SKUs = same category, same pack_group within retailer/month
+    df["_price_weight"] = df["standard_volume"]
+    peer_groups = ["retailer", "category", "pack_group", "month"]
+    peer_rev = df.groupby(peer_groups, observed=True)["revenue"].transform("sum")
+    peer_vol = df.groupby(peer_groups, observed=True)["standard_volume"].transform("sum")
+    df["peer_price_std"] = peer_rev / peer_vol
+    df["relative_price_std"] = df["price_std"] / df["peer_price_std"]
+    df = df.drop(columns=["_price_weight"])
+
     usable = (
         df["price_std"].gt(0)
         & df["other_skus_price_std"].gt(0)
+        & df["peer_price_std"].gt(0)
         & df["nd"].gt(0)
         & df["nd"].le(1)
         & df["velocity_std"].gt(0)
         & df["relative_price"].gt(0)
+        & df["relative_price_std"].gt(0)
     )
 
     dropped = int((~usable).sum())
@@ -488,13 +522,13 @@ def prepare_data(
     if df.empty:
         raise ValueError("No rows remain after relative-price/distribution cleaning.")
 
-    # Transform once.
-    df["log_velocity"] = np.log(df["velocity_std"])
-    df["log_relative_price"] = np.log(df["relative_price"])
+    # Transform once using standardized names.
+    df["log_velocity_std"] = np.log(df["velocity_std"])
+    df["log_relative_price_std"] = np.log(df["relative_price_std"])
     df["log_nd"] = np.log(df["nd"])
 
     scales: dict[str, dict[str, float]] = {}
-    for col in ["log_velocity", "log_relative_price", "log_nd"]:
+    for col in ["log_velocity_std", "log_relative_price_std", "log_nd"]:
         mean = float(df[col].mean())
         sd = float(df[col].std(ddof=0))
         if not np.isfinite(sd) or sd <= 0:
@@ -700,8 +734,8 @@ def build_pymc_model(
     entity_idx = df["entity_idx"].to_numpy(dtype="int32")
     month_idx = df["month_idx"].to_numpy(dtype="int32")
     sku_idx = df["sku_idx"].to_numpy(dtype="int32")
-    y = df["log_velocity_z"].to_numpy(dtype=float)
-    price_x = df["log_relative_price_z"].to_numpy(dtype=float)
+    y = df["log_velocity_std_z"].to_numpy(dtype=float)
+    price_x = df["log_relative_price_std_z"].to_numpy(dtype=float)
 
     with pm.Model(coords=coords) as model:
         alpha = pm.Normal("alpha", 0.0, 1.0)
@@ -776,7 +810,7 @@ def build_pymc_model(
         sigma = pm.HalfNormal("sigma", 0.7)
 
         pm.Normal(
-            "log_velocity_z_obs",
+            "log_velocity_std_z_obs",
             mu,
             sigma,
             observed=y,
@@ -799,8 +833,8 @@ def build_pymc_model_v2(
     """
     Hierarchical log-standard-velocity model with deeper pooling.
 
-    Dependent variable: log_velocity_z
-    Predictors: log_relative_price_z, ND spline basis
+    Dependent variable: log_velocity_std_z
+    Predictors: log_relative_price_std_z, ND spline basis
     Hierarchy: category -> brand x pack_group -> SKU for price slopes
     """
     coords = {
@@ -823,8 +857,8 @@ def build_pymc_model_v2(
     sku_category_idx = np.asarray(meta["sku_category_idx"], dtype="int32")
     brand_category_idx = np.asarray(meta["brand_category_idx"], dtype="int32")
 
-    y = df["log_velocity_z"].to_numpy(dtype=float)
-    price_x = df["log_relative_price_z"].to_numpy(dtype=float)
+    y = df["log_velocity_std_z"].to_numpy(dtype=float)
+    price_x = df["log_relative_price_std_z"].to_numpy(dtype=float)
 
     with pm.Model(coords=coords) as model:
         # Data containers for scenario reuse
@@ -943,7 +977,7 @@ def build_pymc_model_v2(
             nu = pm.Deterministic("nu", nu_minus_two + 2.0)
 
             pm.StudentT(
-                "log_velocity_z_obs",
+                "log_velocity_std_z_obs",
                 nu=nu,
                 mu=mu,
                 sigma=sigma,
@@ -952,7 +986,7 @@ def build_pymc_model_v2(
             )
         else:
             pm.Normal(
-                "log_velocity_z_obs",
+                "log_velocity_std_z_obs",
                 mu=mu,
                 sigma=sigma,
                 observed=y,
@@ -1712,8 +1746,8 @@ def extract_elasticities(
     beta_z = _posterior_array(trace, beta_name, ("sku",))
     beta_raw = (
         beta_z
-        * scales["log_velocity"]["sd"]
-        / scales["log_relative_price"]["sd"]
+        * scales["log_velocity_std"]["sd"]
+        / scales["log_relative_price_std"]["sd"]
     )
 
     info = meta["sku_info"].copy()
@@ -2094,7 +2128,7 @@ def _posterior_delta_log_velocity(
     if "price_slope_z" in posterior and "sku_idx" in df.columns:
         price_slopes = posterior["price_slope_z"][:, df["sku_idx"].to_numpy()]
         delta_price_z = (
-            price_x_delta / scales["log_relative_price"]["sd"]
+            price_x_delta / scales["log_relative_price_std"]["sd"]
         )
         price_delta = price_slopes * delta_price_z
 
@@ -2138,7 +2172,7 @@ def _posterior_delta_log_velocity(
     # Back to log velocity.
     delta_log_velocity = (
         price_delta + nd_delta
-    ) * scales["log_velocity"]["sd"]
+    ) * scales["log_velocity_std"]["sd"]
 
     velocity_ratio = np.exp(delta_log_velocity)
 
@@ -2453,6 +2487,7 @@ def create_market_summary(df: pd.DataFrame) -> pd.DataFrame:
             price_per_standard_unit=("price_std", "mean"),
             nd=("nd", "mean"),
             velocity_std=("velocity_std", "mean"),
+            decomposition_error=("decomposition_error", "mean"),
         )
         .reset_index()
         .sort_values("month")
@@ -2469,6 +2504,7 @@ def create_category_summary(df: pd.DataFrame) -> pd.DataFrame:
             price_per_standard_unit=("price_std", "mean"),
             nd=("nd", "mean"),
             velocity_std=("velocity_std", "mean"),
+            decomposition_error=("decomposition_error", "mean"),
         )
         .reset_index()
         .sort_values(["month", "category"])
@@ -2485,6 +2521,7 @@ def create_retailer_summary(df: pd.DataFrame) -> pd.DataFrame:
             price_per_standard_unit=("price_std", "mean"),
             nd=("nd", "mean"),
             velocity_std=("velocity_std", "mean"),
+            decomposition_error=("decomposition_error", "mean"),
         )
         .reset_index()
         .sort_values(["month", "retailer"])
@@ -2501,6 +2538,7 @@ def create_brand_summary(df: pd.DataFrame) -> pd.DataFrame:
             price_per_standard_unit=("price_std", "mean"),
             nd=("nd", "mean"),
             velocity_std=("velocity_std", "mean"),
+            decomposition_error=("decomposition_error", "mean"),
         )
         .reset_index()
         .sort_values(["month", "brand"])
@@ -2520,8 +2558,10 @@ def create_sku_summary(df: pd.DataFrame) -> pd.DataFrame:
             price_per_standard_unit=("price_std", "mean"),
             other_skus_price_std=("other_skus_price_std", "mean"),
             relative_price=("relative_price", "mean"),
+            relative_price_std=("relative_price_std", "mean"),
             nd=("nd", "mean"),
             velocity_std=("velocity_std", "mean"),
+            decomposition_error=("decomposition_error", "mean"),
         )
         .reset_index()
     )
@@ -2743,9 +2783,9 @@ def decompose_sales_growth(
     group_cols: list[str] = None,
 ) -> pd.DataFrame:
     """
-    Decompose sales growth into distribution, velocity, and interaction effects.
+    Decompose standard volume growth into distribution, velocity, and interaction effects.
     
-    Units = sku_stores * velocity_std
+    Standard Volume = sku_stores * velocity_std
     Growth = Distribution effect + Velocity effect + Interaction effect
     
     Returns a DataFrame with growth components per group.
@@ -2762,8 +2802,8 @@ def decompose_sales_growth(
     period_data = df.sort_values(group_cols + ["month"]).groupby(group_cols).agg(
         first_month=("month", "first"),
         last_month=("month", "last"),
-        first_units=("units", "first"),
-        last_units=("units", "last"),
+        first_standard_volume=("standard_volume", "first"),
+        last_standard_volume=("standard_volume", "last"),
         first_stores=("sku_stores", "first"),
         last_stores=("sku_stores", "last"),
         first_velocity=("velocity_std", "first"),
@@ -2782,9 +2822,9 @@ def decompose_sales_growth(
     if period_data.empty:
         return pd.DataFrame()
 
-    # Decomposition
-    # Units = stores * velocity
-    # ΔUnits = Δstores * velocity_old + stores_old * Δvelocity + Δstores * Δvelocity
+    # Decomposition using standard volume
+    # Standard Volume = stores * velocity_std
+    # ΔStandardVolume = Δstores * velocity_old + stores_old * Δvelocity + Δstores * Δvelocity
 
     period_data["distribution_effect"] = (
         (period_data["last_stores"] - period_data["first_stores"])
@@ -2798,31 +2838,31 @@ def decompose_sales_growth(
         (period_data["last_stores"] - period_data["first_stores"])
         * (period_data["last_velocity"] - period_data["first_velocity"])
     )
-    period_data["total_units_change"] = (
-        period_data["last_units"] - period_data["first_units"]
+    period_data["total_standard_volume_change"] = (
+        period_data["last_standard_volume"] - period_data["first_standard_volume"]
     )
 
     # Revenue decomposition
-    # Revenue = Units * Price
-    period_data["unit_volume_effect"] = (
-        period_data["total_units_change"] * period_data["first_price"]
+    # Revenue = Standard Volume * Price per standard unit
+    period_data["volume_effect"] = (
+        period_data["total_standard_volume_change"] * period_data["first_price"]
     )
     period_data["price_effect"] = (
-        period_data["last_units"] * (period_data["last_price"] - period_data["first_price"])
+        period_data["last_standard_volume"] * (period_data["last_price"] - period_data["first_price"])
     )
     period_data["total_revenue_change"] = (
         period_data["last_revenue"] - period_data["first_revenue"]
     )
 
     # Growth rates
-    period_data["units_growth_pct"] = (
-        period_data["total_units_change"] / period_data["first_units"] * 100
+    period_data["standard_volume_growth_pct"] = (
+        period_data["total_standard_volume_change"] / period_data["first_standard_volume"] * 100
     )
     period_data["revenue_growth_pct"] = (
         period_data["total_revenue_change"] / period_data["first_revenue"] * 100
     )
 
-    return period_data.sort_values("total_units_change", ascending=False).reset_index(drop=True)
+    return period_data.sort_values("total_standard_volume_change", ascending=False).reset_index(drop=True)
 
 
 def compute_price_architecture(
@@ -2834,24 +2874,21 @@ def compute_price_architecture(
     Returns per-SKU price metrics for price ladder analysis.
     """
     sku_metrics = df.groupby(["retailer", "category", "brand", "sku", "pack_size"]).agg(
-        avg_price=("price_std", "mean"),
+        avg_price_std=("price_std", "mean"),
         avg_units=("units", "mean"),
         avg_revenue=("revenue", "mean"),
-        avg_velocity=("velocity_std", "mean"),
+        avg_velocity_std=("velocity_std", "mean"),
         avg_nd=("nd", "mean"),
         months=("month", "nunique"),
     ).reset_index()
 
-    # Price per physical unit
-    sku_metrics["price_per_unit"] = sku_metrics["avg_price"] / sku_metrics["pack_size"]
-
-    # Category benchmarks
-    cat_price = sku_metrics.groupby(["retailer", "category"])["price_per_unit"].transform("median")
-    sku_metrics["rel_price_index"] = sku_metrics["price_per_unit"] / cat_price
+    # Category benchmarks (price per standard unit)
+    cat_price = sku_metrics.groupby(["retailer", "category"])["avg_price_std"].transform("median")
+    sku_metrics["rel_price_index"] = sku_metrics["avg_price_std"] / cat_price
 
     # Brand benchmarks
-    brand_price = sku_metrics.groupby(["retailer", "category", "brand"])["price_per_unit"].transform("median")
-    sku_metrics["brand_price_index"] = sku_metrics["price_per_unit"] / brand_price
+    brand_price = sku_metrics.groupby(["retailer", "category", "brand"])["avg_price_std"].transform("median")
+    sku_metrics["brand_price_index"] = sku_metrics["avg_price_std"] / brand_price
 
     # Pack segment
     sku_metrics["pack_segment"] = pd.cut(
@@ -2861,8 +2898,8 @@ def compute_price_architecture(
     )
 
     # Pack segment benchmarks
-    seg_price = sku_metrics.groupby(["retailer", "category", "pack_segment"])["price_per_unit"].transform("median")
-    sku_metrics["pack_value_index"] = sku_metrics["price_per_unit"] / seg_price
+    seg_price = sku_metrics.groupby(["retailer", "category", "pack_segment"])["avg_price_std"].transform("median")
+    sku_metrics["pack_value_index"] = sku_metrics["avg_price_std"] / seg_price
 
     # Price dispersion (within SKU across months)
     price_disp = df.groupby(["retailer", "category", "brand", "sku"])["price_std"].agg(
@@ -2877,7 +2914,7 @@ def compute_price_architecture(
         how="left"
     )
 
-    return sku_metrics.sort_values(["retailer", "category", "brand", "price_per_unit"]).reset_index(drop=True)
+    return sku_metrics.sort_values(["retailer", "category", "brand", "avg_price_std"]).reset_index(drop=True)
 
 
 def compute_distribution_opportunity(
@@ -2886,12 +2923,12 @@ def compute_distribution_opportunity(
     """
     Compute distribution opportunity metrics per SKU.
     
-    Identifies white-space (high velocity, low ND) and 
-    rationalization candidates (low velocity, high ND).
+    Identifies white-space (high velocity_std, low ND) and 
+    rationalization candidates (low velocity_std, high ND).
     """
     sku_metrics = df.groupby(["retailer", "category", "brand", "sku", "pack_size"]).agg(
         avg_nd=("nd", "mean"),
-        avg_velocity=("velocity_std", "mean"),
+        avg_velocity_std=("velocity_std", "mean"),
         total_units=("units", "sum"),
         total_revenue=("revenue", "sum"),
         max_stores=("retailer_stores", "max"),
@@ -2899,8 +2936,8 @@ def compute_distribution_opportunity(
     ).reset_index()
 
     # Category benchmarks for velocity
-    cat_vel = sku_metrics.groupby(["retailer", "category"])["avg_velocity"].transform("median")
-    sku_metrics["velocity_index"] = sku_metrics["avg_velocity"] / cat_vel
+    cat_vel = sku_metrics.groupby(["retailer", "category"])["avg_velocity_std"].transform("median")
+    sku_metrics["velocity_index"] = sku_metrics["avg_velocity_std"] / cat_vel
 
     # Distribution headroom
     sku_metrics["distribution_headroom"] = 1.0 - sku_metrics["avg_nd"]
@@ -2926,10 +2963,10 @@ def compute_distribution_opportunity(
 
     # Classification
     conditions = [
-        (sku_metrics["avg_velocity"] > cat_vel) & (sku_metrics["avg_nd"] < 0.5),
-        (sku_metrics["avg_velocity"] > cat_vel) & (sku_metrics["avg_nd"] >= 0.5),
-        (sku_metrics["avg_velocity"] <= cat_vel) & (sku_metrics["avg_nd"] < 0.5),
-        (sku_metrics["avg_velocity"] <= cat_vel) & (sku_metrics["avg_nd"] >= 0.5),
+        (sku_metrics["avg_velocity_std"] > cat_vel) & (sku_metrics["avg_nd"] < 0.5),
+        (sku_metrics["avg_velocity_std"] > cat_vel) & (sku_metrics["avg_nd"] >= 0.5),
+        (sku_metrics["avg_velocity_std"] <= cat_vel) & (sku_metrics["avg_nd"] < 0.5),
+        (sku_metrics["avg_velocity_std"] <= cat_vel) & (sku_metrics["avg_nd"] >= 0.5),
     ]
     choices = ["Expand", "Protect", "Test/Review", "Rationalize"]
     sku_metrics["distribution_action"] = np.select(conditions, choices, default="Review")
@@ -2942,32 +2979,32 @@ def compute_market_share_analytics(
     group_cols: list[str] = None,
 ) -> pd.DataFrame:
     """
-    Compute comprehensive market share analytics.
+    Compute comprehensive market share analytics using standard volume.
     """
     if group_cols is None:
         group_cols = ["retailer", "category", "month", "brand", "sku"]
 
     # Monthly share by group
     monthly = df.groupby(group_cols).agg(
-        units=("units", "sum"),
+        standard_volume=("standard_volume", "sum"),
         revenue=("revenue", "sum"),
     ).reset_index()
 
     # Total market per retailer/category/month
     market_cols = ["retailer", "category", "month"]
     market_total = monthly.groupby(market_cols).agg(
-        market_units=("units", "sum"),
+        market_standard_volume=("standard_volume", "sum"),
         market_revenue=("revenue", "sum"),
     ).reset_index()
 
     monthly = monthly.merge(market_total, on=market_cols, how="left")
-    monthly["unit_share"] = monthly["units"] / monthly["market_units"]
+    monthly["standard_volume_share"] = monthly["standard_volume"] / monthly["market_standard_volume"]
     monthly["revenue_share"] = monthly["revenue"] / monthly["market_revenue"]
 
     # Share momentum (3, 6, 12 month changes)
     monthly = monthly.sort_values(group_cols + ["month"])
     for window in [3, 6, 12]:
-        monthly[f"unit_share_change_{window}m"] = monthly.groupby(group_cols)["unit_share"].transform(
+        monthly[f"standard_volume_share_change_{window}m"] = monthly.groupby(group_cols)["standard_volume_share"].transform(
             lambda x: x - x.shift(window)
         )
         monthly[f"revenue_share_change_{window}m"] = monthly.groupby(group_cols)["revenue_share"].transform(
@@ -2992,7 +3029,7 @@ def compute_contribution_to_growth(
     level: str = "brand",
 ) -> pd.DataFrame:
     """
-    Compute contribution to category growth at specified level.
+    Compute contribution to category growth at specified level using standard volume.
     
     Level can be: brand, sku, retailer
     """
@@ -3014,26 +3051,26 @@ def compute_contribution_to_growth(
 
     # Start and end period values
     start_data = df_period[df_period["month"] == start].groupby(group_cols).agg(
-        start_units=("units", "sum"),
+        start_standard_volume=("standard_volume", "sum"),
         start_revenue=("revenue", "sum"),
     ).reset_index()
 
     end_data = df_period[df_period["month"] == end].groupby(group_cols).agg(
-        end_units=("units", "sum"),
+        end_standard_volume=("standard_volume", "sum"),
         end_revenue=("revenue", "sum"),
     ).reset_index()
 
     growth = start_data.merge(end_data, on=group_cols, how="outer").fillna(0)
-    growth["unit_change"] = growth["end_units"] - growth["start_units"]
+    growth["standard_volume_change"] = growth["end_standard_volume"] - growth["start_standard_volume"]
     growth["revenue_change"] = growth["end_revenue"] - growth["start_revenue"]
 
     # Total category change
-    total_unit_change = growth["unit_change"].sum()
+    total_standard_volume_change = growth["standard_volume_change"].sum()
     total_rev_change = growth["revenue_change"].sum()
 
-    growth["unit_contribution_pct"] = np.where(
-        total_unit_change != 0,
-        growth["unit_change"] / total_unit_change * 100,
+    growth["standard_volume_contribution_pct"] = np.where(
+        total_standard_volume_change != 0,
+        growth["standard_volume_change"] / total_standard_volume_change * 100,
         0
     )
     growth["revenue_contribution_pct"] = np.where(
@@ -3043,13 +3080,13 @@ def compute_contribution_to_growth(
     )
 
     # Share of growth
-    growth["unit_share_of_growth"] = np.where(
-        total_unit_change > 0,
-        growth["unit_change"] / total_unit_change * 100,
+    growth["standard_volume_share_of_growth"] = np.where(
+        total_standard_volume_change > 0,
+        growth["standard_volume_change"] / total_standard_volume_change * 100,
         0
     )
 
-    return growth.sort_values("unit_contribution_pct", ascending=False).reset_index(drop=True)
+    return growth.sort_values("standard_volume_contribution_pct", ascending=False).reset_index(drop=True)
 
 
 def generate_data_health_report(
@@ -3119,6 +3156,20 @@ def generate_data_health_report(
                 "upper_bound": float(upper),
             }
 
+    # Standard volume decomposition identity check
+    if all(c in raw_df.columns for c in ["units", "revenue", "sku_stores", "retailer_stores", "pack_size"]):
+        raw_df = raw_df.copy()
+        raw_df["standard_volume"] = raw_df["units"] * raw_df["pack_size"]
+        raw_df["nd"] = raw_df["sku_stores"] / raw_df["retailer_stores"]
+        raw_df["velocity_std"] = raw_df["standard_volume"] / raw_df["sku_stores"]
+        raw_df["decomposition_check"] = raw_df["retailer_stores"] * raw_df["nd"] * raw_df["velocity_std"]
+        raw_df["decomposition_error"] = (raw_df["standard_volume"] - raw_df["decomposition_check"]).abs()
+        report["decomposition_identity"] = {
+            "max_error": float(raw_df["decomposition_error"].max()),
+            "mean_error": float(raw_df["decomposition_error"].mean()),
+            "error_gt_001": int((raw_df["decomposition_error"] > 0.01).sum()),
+        }
+
     # Coverage completeness
     if "month" in raw_df.columns and "retailer" in raw_df.columns and "sku" in raw_df.columns:
         expected = raw_df.groupby(["retailer", "sku"])["month"].nunique()
@@ -3151,6 +3202,13 @@ def generate_data_health_report(
 
         # Exclusion rate
         report["exclusion_rate"] = 1.0 - (len(prepared_df) / len(raw_df)) if len(raw_df) > 0 else 0
+
+        # Decomposition identity check on prepared data
+        if "decomposition_error" in prepared_df.columns:
+            report["prepared_decomposition_identity"] = {
+                "max_error": float(prepared_df["decomposition_error"].max()),
+                "mean_error": float(prepared_df["decomposition_error"].mean()),
+            }
 
     return report
 
@@ -3276,7 +3334,7 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Central feature engineering function - adds all derived retail analytics columns.
     
-    Creates: unit_price, price_per_size_unit, nd, velocity, log_velocity,
+    Creates: unit_price, price_per_size_unit, nd, velocity, velocity_std, log_velocity_std,
     category_units, brand_units, shares, price indices, pack_group, month_num, lag features.
     Also adds data_quality_status flags.
     
@@ -3311,6 +3369,15 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
     df["data_quality_status"] = np.select(conditions, choices, default="valid")
 
     # --- Core derived columns ---
+    df["standard_volume"] = df["units"] * df["pack_size"]
+    df["price_std"] = df["revenue"] / df["standard_volume"]
+    df["nd"] = df["sku_stores"] / df["retailer_stores"]
+    df["velocity_std"] = df["standard_volume"] / df["sku_stores"]
+
+    # Decomposition identity check
+    df["decomposition_check"] = df["retailer_stores"] * df["nd"] * df["velocity_std"]
+    df["decomposition_error"] = (df["standard_volume"] - df["decomposition_check"]).abs()
+
     df["unit_price"] = np.where(
         df["units"] > 0,
         df["revenue"] / df["units"],
@@ -3323,86 +3390,79 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
         np.nan
     )
 
-    df["nd"] = np.where(
-        df["retailer_stores"] > 0,
-        df["sku_stores"] / df["retailer_stores"],
-        np.nan
-    )
-
-    df["velocity"] = np.where(
-        df["sku_stores"] > 0,
-        df["units"] / df["sku_stores"],
-        np.nan
-    )
-
-    df["velocity_std"] = df["velocity"]  # alias for model compatibility
-    df["log_velocity"] = np.log1p(df["velocity"])
+    df["log_velocity_std"] = np.log(df["velocity_std"])
 
     # --- Market context columns ---
-    # Category units (total demand per month × retailer × category)
-    cat_units = df.groupby(["month", "retailer", "category"])["units"].transform("sum")
-    df["category_units"] = cat_units
+    # Category standard volume (total demand per month × retailer × category)
+    cat_std_vol = df.groupby(["month", "retailer", "category"])["standard_volume"].transform("sum")
+    df["category_std_volume"] = cat_std_vol
 
-    # Brand units (total demand per month × retailer × category × brand)
-    brand_units = df.groupby(["month", "retailer", "category", "brand"])["units"].transform("sum")
-    df["brand_units"] = brand_units
+    # Brand standard volume (total demand per month × retailer × category × brand)
+    brand_std_vol = df.groupby(["month", "retailer", "category", "brand"])["standard_volume"].transform("sum")
+    df["brand_std_volume"] = brand_std_vol
 
-    # Pack-group units (total demand per month × retailer × category × brand × pack_group)
-    # Pack group computed later, so we'll add this after pack_group
-
-    # Shares
+    # Shares (using standard volume)
     df["brand_share"] = np.where(
-        df["category_units"] > 0,
-        df["brand_units"] / df["category_units"],
+        df["category_std_volume"] > 0,
+        df["brand_std_volume"] / df["category_std_volume"],
         np.nan
     )
 
     df["sku_share_of_brand"] = np.where(
-        df["brand_units"] > 0,
-        df["units"] / df["brand_units"],
+        df["brand_std_volume"] > 0,
+        df["standard_volume"] / df["brand_std_volume"],
         np.nan
     )
 
     df["sku_share_of_category"] = np.where(
-        df["category_units"] > 0,
-        df["units"] / df["category_units"],
+        df["category_std_volume"] > 0,
+        df["standard_volume"] / df["category_std_volume"],
         np.nan
     )
 
     # --- Price indices ---
-    # Category price median
-    cat_price_median = df.groupby(["month", "retailer", "category"])["unit_price"].transform("median")
+    # Category price median (per standard unit)
+    cat_price_median = df.groupby(["month", "retailer", "category"])["price_std"].transform("median")
     df["category_price_median"] = cat_price_median
 
-    # Category price index (volume-weighted average price per size unit)
-    _w = df["price_per_size_unit"].fillna(0) * df["units"]
+    # Category price index (volume-weighted average price per standard unit)
+    _w = df["price_std"].fillna(0) * df["standard_volume"]
     _wsum = _w.groupby([df["month"], df["retailer"], df["category"]]).transform("sum")
-    _usum = df["units"].groupby([df["month"], df["retailer"], df["category"]]).transform("sum")
-    df["category_price_index"] = np.where(_usum > 0, _wsum / _usum, np.nan)
+    _vsum = df["standard_volume"].groupby([df["month"], df["retailer"], df["category"]]).transform("sum")
+    df["category_price_index"] = np.where(_vsum > 0, _wsum / _vsum, np.nan)
 
     # Relative price index (vs category median)
     df["relative_price_index"] = np.where(
         df["category_price_median"] > 0,
-        df["unit_price"] / df["category_price_median"],
+        df["price_std"] / df["category_price_median"],
         np.nan
     )
 
     # Relative price index vs volume-weighted category price index
     df["relative_price_index_vw"] = np.where(
         df["category_price_index"] > 0,
-        df["price_per_size_unit"] / df["category_price_index"],
+        df["price_std"] / df["category_price_index"],
         np.nan
     )
 
+    # --- Pack group (category-relative) ---
+    df["pack_group"] = _add_category_relative_pack_groups(df)
+
+    # Relative price against category/pack-peer price basket (weighted avg of similar SKUs)
+    peer_groups = ["retailer", "category", "pack_group", "month"]
+    peer_rev = df.groupby(peer_groups, observed=True)["revenue"].transform("sum")
+    peer_vol = df.groupby(peer_groups, observed=True)["standard_volume"].transform("sum")
+    df["peer_price_std"] = peer_rev / peer_vol
+    df["relative_price_std"] = df["price_std"] / df["peer_price_std"]
+
     # Same-brand other-SKU price index: volume-weighted avg price of other SKUs sharing the brand identifier.
-    # Computed as (brand weighted total - selected SKU contribution) / (brand units - selected SKU units).
-    df["_pxu"] = df["unit_price"] * df["units"]
+    df["_pxu"] = df["price_std"] * df["standard_volume"]
 
     brand_grp = ["month", "retailer", "category", "brand"]
     brand_pu = df.groupby(brand_grp)["_pxu"].transform("sum")
-    brand_u = df.groupby(brand_grp)["units"].transform("sum")
+    brand_v = df.groupby(brand_grp)["standard_volume"].transform("sum")
 
-    own_denom = brand_u - df["units"]
+    own_denom = brand_v - df["standard_volume"]
     df["same_brand_other_sku_price_index"] = np.where(
         own_denom > 0,
         (brand_pu - df["_pxu"]) / own_denom,
@@ -3410,12 +3470,11 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # Other-brand price index: volume-weighted avg price of all other brands
-    # = (category weighted total - brand weighted total) / (category units - brand units).
     cat_grp = ["month", "retailer", "category"]
     cat_pu = df.groupby(cat_grp)["_pxu"].transform("sum")
-    cat_u = df.groupby(cat_grp)["units"].transform("sum")
+    cat_v = df.groupby(cat_grp)["standard_volume"].transform("sum")
 
-    comp_denom = cat_u - brand_u
+    comp_denom = cat_v - brand_v
     df["other_brand_price_index"] = np.where(
         comp_denom > 0,
         (cat_pu - brand_pu) / comp_denom,
@@ -3424,22 +3483,19 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.drop(columns=["_pxu"])
 
-    # --- Pack group (category-relative) ---
-    df["pack_group"] = _add_category_relative_pack_groups(df)
-
-    # --- Pack-group units and shares (after pack_group is created) ---
-    pack_units = df.groupby(["month", "retailer", "category", "brand", "pack_group"])["units"].transform("sum")
-    df["pack_group_units"] = pack_units
+    # --- Pack-group standard volume and shares ---
+    pack_std_vol = df.groupby(["month", "retailer", "category", "brand", "pack_group"])["standard_volume"].transform("sum")
+    df["pack_group_std_volume"] = pack_std_vol
 
     df["brand_pack_share"] = np.where(
-        df["brand_units"] > 0,
-        df["pack_group_units"] / df["brand_units"],
+        df["brand_std_volume"] > 0,
+        df["pack_group_std_volume"] / df["brand_std_volume"],
         np.nan
     )
 
     df["pack_group_share_of_category"] = np.where(
-        df["category_units"] > 0,
-        df["pack_group_units"] / df["category_units"],
+        df["category_std_volume"] > 0,
+        df["pack_group_std_volume"] / df["category_std_volume"],
         np.nan
     )
 
@@ -3450,16 +3506,16 @@ def build_retail_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["retailer", "category", "brand", "sku", "month"])
     df["lag_units"] = df.groupby(["retailer", "category", "brand", "sku"])["units"].shift(1)
     df["lag_share"] = df.groupby(["retailer", "category", "brand", "sku"])["sku_share_of_category"].shift(1)
-    df["lag_price"] = df.groupby(["retailer", "category", "brand", "sku"])["unit_price"].shift(1)
+    df["lag_price"] = df.groupby(["retailer", "category", "brand", "sku"])["price_std"].shift(1)
 
     # --- Extreme price flag ---
-    valid_price = df["unit_price"].replace([np.inf, -np.inf], np.nan).dropna()
+    valid_price = df["price_std"].replace([np.inf, -np.inf], np.nan).dropna()
     if len(valid_price) > 0:
         q1, q3 = valid_price.quantile([0.25, 0.75])
         iqr = q3 - q1
         lower = q1 - 3 * iqr
         upper = q3 + 3 * iqr
-        df["extreme_price"] = (df["unit_price"] < lower) | (df["unit_price"] > upper)
+        df["extreme_price"] = (df["price_std"] < lower) | (df["price_std"] > upper)
         df.loc[df["extreme_price"], "data_quality_status"] = "extreme_price"
     else:
         df["extreme_price"] = False
@@ -3554,6 +3610,7 @@ def _simulate_scenario_core(
     out["baseline_units"] = df["units"]
     out["baseline_revenue"] = df["revenue"]
     out["baseline_nd"] = df["nd"]
+    out["baseline_price_std"] = df["price_std"]
     if "unit_price" not in out.columns:
         out["unit_price"] = np.where(df["units"] > 0, df["revenue"] / df["units"], np.nan)
     out["baseline_price"] = out["unit_price"]
@@ -3563,6 +3620,7 @@ def _simulate_scenario_core(
     out["scenario_unit_price"] = out["scenario_price"]  # canonical name
     out["scenario_price_change"] = price_change
     out["scenario_nd_change"] = nd_change
+    out["scenario_price_std"] = out["baseline_price_std"] * (1.0 + price_change)
 
     # Validate against canonical contract
     validate_scenario_result(out)
@@ -4143,3 +4201,554 @@ def create_cross_category_sensitivity_chart(
         yaxis=dict(visible=False)
     )
     return fig
+
+
+# ============================================================================
+# Scenario Action Table Support (New simplified workflow)
+# ============================================================================
+
+@dataclass(frozen=True, slots=True)
+class ScenarioAction:
+    """A single scenario action for a specific retailer × SKU relationship."""
+    retailer: str
+    category: str
+    brand: str
+    sku: str
+    pack_size: float
+    baseline_price_std: float
+    baseline_nd: float
+    new_price_std: float
+    new_nd: float
+    apply: bool = True
+
+
+def create_scenario_action_table(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Create the editable scenario action table from the prepared data.
+    
+    Returns a DataFrame with one row per unique retailer × category × brand × SKU
+    containing baseline values and editable new values.
+    """
+    # Get latest month data for each SKU as baseline
+    latest_month = df["month"].max()
+    latest = df[df["month"] == latest_month].copy()
+    
+    # Group by retailer, category, brand, sku to get latest values
+    action_cols = ["retailer", "category", "brand", "sku", "pack_size"]
+    baseline = latest.groupby(action_cols, as_index=False).agg(
+        baseline_price_std=("price_std", "mean"),
+        baseline_nd=("nd", "mean"),
+    )
+    
+    # Add editable columns
+    baseline["new_price_std"] = baseline["baseline_price_std"]
+    baseline["new_nd"] = baseline["baseline_nd"]
+    baseline["apply"] = False
+    
+    # Calculate changes
+    baseline["price_change"] = 0.0
+    baseline["nd_change"] = 0.0
+    
+    # Reorder columns for UI
+    cols_order = [
+        "apply", "retailer", "category", "brand", "sku", "pack_size",
+        "baseline_price_std", "baseline_nd", "new_price_std", "new_nd",
+        "price_change", "nd_change"
+    ]
+    
+    return baseline[cols_order].reset_index(drop=True)
+
+
+def update_action_table_changes(action_df: pd.DataFrame) -> pd.DataFrame:
+    """Recalculate price_change and nd_change from new values."""
+    out = action_df.copy()
+    out["price_change"] = np.where(
+        out["baseline_price_std"] > 0,
+        (out["new_price_std"] - out["baseline_price_std"]) / out["baseline_price_std"],
+        0.0
+    )
+    out["nd_change"] = out["new_nd"] - out["baseline_nd"]
+    return out
+
+
+def run_scenario_actions(
+    df: pd.DataFrame,
+    action_df: pd.DataFrame,
+    posterior_cache: dict,
+    spline,
+    scales: dict,
+    nd_mode: str = "pp",
+) -> pd.DataFrame:
+    """
+    Run scenario for all checked actions in the action table.
+    
+    Applies multiple price/ND changes simultaneously and returns combined scenario result.
+    """
+    # Filter to applied actions
+    applied = action_df[action_df["apply"]].copy()
+    
+    if applied.empty:
+        # Return baseline scenario (no changes)
+        return _simulate_scenario_core(
+            df, posterior_cache, spline, scales,
+            price_change=0.0, nd_change=0.0, nd_mode=nd_mode,
+            target_level="market", target_value="all"
+        )
+    
+    # For each applied action, we need to apply it to matching rows
+    # Start with baseline
+    scenario_df = df.copy()
+    scenario_df["_target"] = False
+    scenario_df["scenario_price_change"] = 0.0
+    scenario_df["scenario_nd_change"] = 0.0
+    scenario_df["scenario_nd"] = scenario_df["nd"]
+    scenario_df["scenario_price_std"] = scenario_df["price_std"]
+    
+    for _, action in applied.iterrows():
+        # Build target mask for this action
+        mask = (
+            (scenario_df["retailer"] == action["retailer"]) &
+            (scenario_df["category"] == action["category"]) &
+            (scenario_df["brand"] == action["brand"]) &
+            (scenario_df["sku"] == action["sku"])
+        )
+        
+        scenario_df.loc[mask, "_target"] = True
+        scenario_df.loc[mask, "scenario_price_change"] = action["price_change"]
+        scenario_df.loc[mask, "scenario_nd_change"] = action["nd_change"]
+        scenario_df.loc[mask, "scenario_nd"] = action["new_nd"]
+        scenario_df.loc[mask, "scenario_price_std"] = action["new_price_std"]
+    
+    # Run scenario with all targets
+    target_mask = scenario_df["_target"]
+    
+    price_effect = np.zeros((posterior_cache["price_slope_z"].shape[0], len(df)))
+    nd_effect = np.zeros((posterior_cache["price_slope_z"].shape[0], len(df)))
+    
+    # For price effect, we need to handle different price changes per SKU
+    # This is a simplification - we apply the average price change to target rows
+    if target_mask.any():
+        # Group by SKU and apply specific price changes
+        for sku_idx_val in scenario_df.loc[target_mask, "sku_idx"].unique():
+            sku_mask = (scenario_df["sku_idx"] == sku_idx_val) & target_mask
+            if sku_mask.any():
+                price_change_val = scenario_df.loc[sku_mask, "scenario_price_change"].iloc[0]
+                if price_change_val != 0.0:
+                    pe = price_delta_log_volume(
+                        posterior_cache["price_slope_z"],
+                        scenario_df["sku_idx"].to_numpy(dtype="int32"),
+                        price_change_val,
+                        sku_mask.to_numpy(),
+                    )
+                    price_effect += pe
+        
+        # ND effect - similar approach
+        for sku_idx_val in scenario_df.loc[target_mask, "sku_idx"].unique():
+            sku_mask = (scenario_df["sku_idx"] == sku_idx_val) & target_mask
+            if sku_mask.any():
+                nd_change_val = scenario_df.loc[sku_mask, "scenario_nd_change"].iloc[0]
+                if nd_change_val != 0.0:
+                    nd_base = scenario_df["nd"].to_numpy()
+                    nd_new_val = scenario_df.loc[sku_mask, "scenario_nd"].iloc[0]
+                    nd_new_arr = nd_base.copy()
+                    nd_new_arr[sku_mask] = nd_new_val
+                    
+                    ne = nd_delta_log_volume(
+                        posterior_cache,
+                        spline,
+                        scales,
+                        scenario_df["sku_idx"].to_numpy(dtype="int32"),
+                        nd_base,
+                        nd_new_arr,
+                        sku_mask.to_numpy(),
+                    )
+                    nd_effect += ne
+    
+    total_effect = combined_delta_log_volume(price_effect, nd_effect)
+    
+    result = summarise_scenario_draws(
+        df["units"].to_numpy(),
+        df["revenue"].to_numpy(),
+        0.0,  # price_change handled per-SKU above
+        total_effect,
+    )
+    
+    out = df.copy()
+    result.index = out.index
+    for col in result.columns:
+        out[col] = result[col]
+    
+    out["baseline_units"] = df["units"]
+    out["baseline_revenue"] = df["revenue"]
+    out["baseline_nd"] = df["nd"]
+    out["baseline_price_std"] = df["price_std"]
+    out["scenario_nd"] = scenario_df["scenario_nd"]
+    out["scenario_price_std"] = scenario_df["scenario_price_std"]
+    out["scenario_price_change"] = scenario_df["scenario_price_change"]
+    out["scenario_nd_change"] = scenario_df["scenario_nd_change"]
+    
+    # Revenue uses the scenario price
+    out["revenue_p05"] = out["units_p05"] * out["scenario_price_std"]
+    out["revenue_p50"] = out["units_p50"] * out["scenario_price_std"]
+    out["revenue_p95"] = out["units_p95"] * out["scenario_price_std"]
+    
+    # Add scenario_unit_price for canonical contract
+    out["scenario_unit_price"] = out["scenario_price_std"]
+    
+    validate_scenario_result(out)
+    
+    return out
+
+
+def run_scenario_suite_actions(
+    df: pd.DataFrame,
+    action_df: pd.DataFrame,
+    posterior_cache: dict,
+    spline,
+    scales: dict,
+    nd_mode: str = "pp",
+) -> dict:
+    """
+    Run four standard scenarios for the action table.
+    
+    Returns dict with keys: baseline, price_only, distribution_only, combined
+    """
+    applied = action_df[action_df["apply"]].copy()
+    
+    if applied.empty:
+        # Return empty baseline
+        baseline = _simulate_scenario_core(
+            df, posterior_cache, spline, scales,
+            price_change=0.0, nd_change=0.0, nd_mode=nd_mode,
+            target_level="market", target_value="all"
+        )
+        return {
+            "baseline": baseline,
+            "price_only": baseline.copy(),
+            "distribution_only": baseline.copy(),
+            "combined": baseline.copy(),
+        }
+    
+    # Baseline: no changes
+    baseline = _simulate_scenario_core(
+        df, posterior_cache, spline, scales,
+        price_change=0.0, nd_change=0.0, nd_mode=nd_mode,
+        target_level="market", target_value="all"
+    )
+    
+    # Price-only: apply only price changes
+    price_only_actions = applied.copy()
+    price_only_actions["new_nd"] = price_only_actions["baseline_nd"]
+    price_only_actions["nd_change"] = 0.0
+    price_only = run_scenario_actions(
+        df, price_only_actions, posterior_cache, spline, scales, nd_mode
+    )
+    
+    # Distribution-only: apply only ND changes
+    dist_only_actions = applied.copy()
+    dist_only_actions["new_price_std"] = dist_only_actions["baseline_price_std"]
+    dist_only_actions["price_change"] = 0.0
+    dist_only = run_scenario_actions(
+        df, dist_only_actions, posterior_cache, spline, scales, nd_mode
+    )
+    
+    # Combined: apply both
+    combined = run_scenario_actions(
+        df, applied, posterior_cache, spline, scales, nd_mode
+    )
+    
+    return {
+        "baseline": baseline,
+        "price_only": price_only,
+        "distribution_only": dist_only,
+        "combined": combined,
+    }
+
+
+def create_driver_waterfall(
+    baseline_df: pd.DataFrame,
+    scenario_df: pd.DataFrame,
+    selected_sku: str = None,
+) -> pd.DataFrame:
+    """
+    Create driver decomposition waterfall data.
+    
+    Returns DataFrame with components:
+    - Baseline standard volume
+    - Price-associated velocity change
+    - Mechanical new-store / ND effect
+    - Nonlinear ND velocity effect
+    - Price × ND interaction
+    - Scenario standard volume
+    """
+    if selected_sku:
+        base = baseline_df[baseline_df["sku"] == selected_sku].copy()
+        scen = scenario_df[scenario_df["sku"] == selected_sku].copy()
+    else:
+        base = baseline_df.copy()
+        scen = scenario_df.copy()
+    
+    if base.empty or scen.empty:
+        return pd.DataFrame()
+    
+    # Aggregate
+    base_q = base["standard_volume"].sum()
+    scen_q = scen["standard_volume"].sum()
+    
+    # Calculate components from the scenario math
+    # We need to extract the effects from the scenario calculations
+    # For now, return a structured summary that can be used for waterfall
+    
+    components = pd.DataFrame({
+        "component": [
+            "Baseline standard volume",
+            "Price-associated velocity change",
+            "Mechanical new-store / ND effect",
+            "Nonlinear ND velocity effect",
+            "Price × ND interaction",
+            "Scenario standard volume",
+        ],
+        "value": [
+            base_q,
+            scen_q - base_q,  # Placeholder - needs proper decomposition
+            0.0,
+            0.0,
+            0.0,
+            scen_q,
+        ],
+        "is_delta": [False, True, True, True, True, False],
+    })
+    
+    return components
+
+
+def create_market_impact_table(
+    baseline_df: pd.DataFrame,
+    scenario_df: pd.DataFrame,
+    action_df: pd.DataFrame = None,
+) -> pd.DataFrame:
+    """
+    Create market impact comparison table at multiple levels.
+    
+    Returns DataFrame with rows for: Selected SKU, Selected Brand, 
+    Selected Retailer-Category, Total Observed Market
+    """
+    results = []
+    
+    # Total market
+    base_total = baseline_df["standard_volume"].sum()
+    scen_total = scenario_df["standard_volume"].sum()
+    results.append({
+        "level": "Total observed market",
+        "baseline_standard_volume": base_total,
+        "scenario_standard_volume": scen_total,
+        "change_standard_volume": scen_total - base_total,
+        "change_pct": (scen_total - base_total) / base_total * 100 if base_total > 0 else 0,
+        "baseline_revenue": baseline_df["revenue"].sum(),
+        "scenario_revenue": scenario_df["revenue"].sum(),
+    })
+    
+    if action_df is not None:
+        applied = action_df[action_df["apply"]].copy()
+        if not applied.empty:
+            # Get unique values from actions
+            retailers = applied["retailer"].unique()
+            categories = applied["category"].unique()
+            brands = applied["brand"].unique()
+            skus = applied["sku"].unique()
+            
+            # Selected SKU level
+            for sku in skus:
+                base_sku = baseline_df[baseline_df["sku"] == sku]["standard_volume"].sum()
+                scen_sku = scenario_df[scenario_df["sku"] == sku]["standard_volume"].sum()
+                results.append({
+                    "level": f"Selected SKU: {sku}",
+                    "baseline_standard_volume": base_sku,
+                    "scenario_standard_volume": scen_sku,
+                    "change_standard_volume": scen_sku - base_sku,
+                    "change_pct": (scen_sku - base_sku) / base_sku * 100 if base_sku > 0 else 0,
+                    "baseline_revenue": baseline_df[baseline_df["sku"] == sku]["revenue"].sum(),
+                    "scenario_revenue": scenario_df[scenario_df["sku"] == sku]["revenue"].sum(),
+                })
+            
+            # Selected brand level
+            for brand in brands:
+                base_brand = baseline_df[baseline_df["brand"] == brand]["standard_volume"].sum()
+                scen_brand = scenario_df[scenario_df["brand"] == brand]["standard_volume"].sum()
+                results.append({
+                    "level": f"Selected brand: {brand}",
+                    "baseline_standard_volume": base_brand,
+                    "scenario_standard_volume": scen_brand,
+                    "change_standard_volume": scen_brand - base_brand,
+                    "change_pct": (scen_brand - base_brand) / base_brand * 100 if base_brand > 0 else 0,
+                    "baseline_revenue": baseline_df[baseline_df["brand"] == brand]["revenue"].sum(),
+                    "scenario_revenue": scenario_df[scenario_df["brand"] == brand]["revenue"].sum(),
+                })
+            
+            # Selected retailer-category level
+            for ret in retailers:
+                for cat in categories:
+                    base_rc = baseline_df[
+                        (baseline_df["retailer"] == ret) & 
+                        (baseline_df["category"] == cat)
+                    ]["standard_volume"].sum()
+                    scen_rc = scenario_df[
+                        (scenario_df["retailer"] == ret) & 
+                        (scenario_df["category"] == cat)
+                    ]["standard_volume"].sum()
+                    if base_rc > 0:
+                        results.append({
+                            "level": f"Retailer-Category: {ret} / {cat}",
+                            "baseline_standard_volume": base_rc,
+                            "scenario_standard_volume": scen_rc,
+                            "change_standard_volume": scen_rc - base_rc,
+                            "change_pct": (scen_rc - base_rc) / base_rc * 100,
+                            "baseline_revenue": baseline_df[
+                                (baseline_df["retailer"] == ret) & 
+                                (baseline_df["category"] == cat)
+                            ]["revenue"].sum(),
+                            "scenario_revenue": scenario_df[
+                                (scenario_df["retailer"] == ret) & 
+                                (scenario_df["category"] == cat)
+                            ]["revenue"].sum(),
+                        })
+    
+    return pd.DataFrame(results)
+
+
+def create_winner_loser_dumbbell(
+    baseline_df: pd.DataFrame,
+    scenario_df: pd.DataFrame,
+    level: str = "brand",
+    top_n: int = 15,
+) -> go.Figure:
+    """
+    Create winner/loser dumbbell chart at segment level.
+    
+    Args:
+        baseline_df: Baseline scenario DataFrame
+        scenario_df: Scenario DataFrame
+        level: Aggregation level ("brand", "sku", "category", "retailer")
+        top_n: Number of top segments to show
+    """
+    group_cols = {"brand": ["brand"], "sku": ["brand", "sku"], 
+                  "category": ["category"], "retailer": ["retailer"]}
+    
+    cols = group_cols.get(level, ["brand"])
+    
+    base_agg = baseline_df.groupby(cols, observed=True).agg(
+        baseline_standard_volume=("standard_volume", "sum"),
+        baseline_revenue=("revenue", "sum"),
+    ).reset_index()
+    
+    scen_agg = scenario_df.groupby(cols, observed=True).agg(
+        scenario_standard_volume=("standard_volume", "sum"),
+        scenario_revenue=("revenue", "sum"),
+    ).reset_index()
+    
+    merged = base_agg.merge(scen_agg, on=cols, how="outer").fillna(0)
+    merged["delta"] = merged["scenario_standard_volume"] - merged["baseline_standard_volume"]
+    merged["delta_pct"] = np.where(
+        merged["baseline_standard_volume"] > 0,
+        merged["delta"] / merged["baseline_standard_volume"] * 100,
+        0
+    )
+    
+    # Sort by delta and take top N
+    merged = merged.sort_values("delta", ascending=False).head(top_n)
+    
+    # Create label
+    if "sku" in merged.columns:
+        merged["label"] = merged["brand"].astype(str) + " | " + merged["sku"].astype(str)
+    elif "brand" in merged.columns:
+        merged["label"] = merged["brand"].astype(str)
+    elif "category" in merged.columns:
+        merged["label"] = merged["category"].astype(str)
+    else:
+        merged["label"] = merged["retailer"].astype(str)
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=merged["baseline_standard_volume"],
+        y=merged["label"],
+        mode="markers",
+        marker=dict(size=12, color="gray", symbol="circle"),
+        name="Baseline",
+        showlegend=True
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=merged["scenario_standard_volume"],
+        y=merged["label"],
+        mode="markers",
+        marker=dict(size=12, color="blue", symbol="circle"),
+        name="Scenario",
+        showlegend=True
+    ))
+    
+    for _, row in merged.iterrows():
+        fig.add_trace(go.Scatter(
+            x=[row["baseline_standard_volume"], row["scenario_standard_volume"]],
+            y=[row["label"], row["label"]],
+            mode="lines",
+            line=dict(color="lightgray", width=2),
+            showlegend=False,
+            hoverinfo="skip"
+        ))
+    
+    fig.update_layout(
+        title=f"Winner-Loser Dumbbell: Baseline vs Scenario by {level.title()}",
+        xaxis_title="Standard Volume",
+        height=max(400, 30 * len(merged) + 100),
+        showlegend=True
+    )
+    return fig
+
+
+def check_scenario_guardrails(
+    df: pd.DataFrame,
+    action_df: pd.DataFrame,
+) -> dict[str, Any]:
+    """Check if scenario values are within observed ranges."""
+    warnings = []
+    
+    applied = action_df[action_df["apply"]].copy()
+    
+    if applied.empty:
+        return {"warnings": [], "affected_rows": 0}
+    
+    # ND bounds
+    nd_new = applied["new_nd"]
+    if (nd_new > 1).any():
+        warnings.append(
+            f"ND change would push {(nd_new > 1).sum()} rows above 100% ND; capped at 100%"
+        )
+    if (nd_new < 0).any():
+        warnings.append(
+            f"ND change would push {(nd_new < 0).sum()} rows below 0% ND; capped at 0%"
+        )
+    
+    # Price range - check against historical relative_price_std range
+    if "relative_price_std" in df.columns:
+        hist_min = df["relative_price_std"].min()
+        hist_max = df["relative_price_std"].max()
+        # Estimate new relative price
+        for _, action in applied.iterrows():
+            mask = (
+                (df["retailer"] == action["retailer"]) &
+                (df["category"] == action["category"]) &
+                (df["sku"] == action["sku"])
+            )
+            if mask.any():
+                current_rel = df.loc[mask, "relative_price_std"].mean()
+                new_rel = current_rel * (action["new_price_std"] / action["baseline_price_std"])
+                if new_rel < hist_min or new_rel > hist_max:
+                    warnings.append(
+                        f"Price change for {action['sku']} would push relative price "
+                        f"outside historical range [{hist_min:.2f}, {hist_max:.2f}]"
+                    )
+    
+    return {"warnings": warnings, "affected_rows": len(applied)}

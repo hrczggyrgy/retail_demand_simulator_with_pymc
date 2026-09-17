@@ -57,8 +57,8 @@ def test_prepare_data():
     # Required columns after prepare
     for c in ["month","retailer","category","brand","sku","pack_size","pack_group",
               "units","revenue","sku_stores","retailer_stores","nd",
-              "log_nd","log_relative_price","log_velocity",
-              "log_nd_z","log_relative_price_z","log_velocity_z"]:
+              "log_nd","log_relative_price_std","log_velocity_std",
+              "log_nd_z","log_relative_price_std_z","log_velocity_std_z"]:
         assert c in df.columns, f"Missing: {c}"
     assert len(df) == 1152
     # sku_idx added by app after prepare
@@ -451,14 +451,14 @@ def test_same_brand_other_sku_price_index_excludes_focal_sku() -> None:
     for _, group in brand_rows.groupby(group_cols, observed=True):
         for sku in group["sku"].unique():
             sku_rows = group[group["sku"] == sku]
-            # The index for this SKU should be the volume-weighted
+            # The index for this SKU should be the standard-volume-weighted
             # avg price of OTHER SKUs in the same brand within this group
             other_skus = group[group["sku"] != sku]
             if len(other_skus) > 0:
-                # Volume-weighted avg price = sum(price * units) / sum(units) for other SKUs
+                # Standard-volume-weighted avg price = sum(price_std * standard_volume) / sum(standard_volume)
                 expected_idx = (
-                    other_skus["unit_price"] * other_skus["units"]
-                ).sum() / other_skus["units"].sum()
+                    other_skus["price_std"] * other_skus["standard_volume"]
+                ).sum() / other_skus["standard_volume"].sum()
                 actual_idx = sku_rows["same_brand_other_sku_price_index"].iloc[0]
                 np.testing.assert_allclose(actual_idx, expected_idx, rtol=1e-10)
     print("✓ same_brand_other_sku_price_index excludes focal SKU")
