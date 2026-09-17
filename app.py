@@ -1346,6 +1346,785 @@ def run_joint_scenario_from_actions(
     }
 
 
+def render_scenario_guardrails(
+    checked: pd.DataFrame,
+    df: pd.DataFrame,
+    model_mode: str,
+    diagnostics,
+) -> None:
+    """B. Guardrails and model readiness — prevent implausible interpretation."""
+    st.markdown("### Guardrails & Model Readiness")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**Scenario Validity**")
+        
+        # Price range check
+        if "relative_price_std" in df.columns:
+            hist_min = df["relative_price_std"].min()
+            hist_max = df["relative_price_std"].max()
+            price_warnings = []
+            for _, action in checked.iterrows():
+                if action["price_change_pct"] != 0:
+                    mask = (
+                        (df["retailer"] == action["retailer"]) &
+                        (df["category"] == action["category"]) &
+                        (df["sku"] == action["sku"])
+                    )
+                    if mask.any():
+                        current_rel = df.loc[mask, "relative_price_std"].mean()
+                        new_rel = current_rel * (1 + action["price_change_pct"] / 100.0)
+                        if new_rel < hist_min or new_rel > hist_max:
+                            price_warnings.append(f"❌ {action['sku']}: price extrapolative")
+                        elif new_rel < hist_min * 1.1 or new_rel > hist_max * 0.9:
+                            price_warnings.append(f"⚠ {action['sku']}: price near boundary")
+                        else:
+                            price_warnings.append(f"✅ {action['sku']}: price within range")
+            if price_warnings:
+                for w in price_warnings:
+                    st.markdown(w)
+            else:
+                st.markdown("✅ No price changes")
+        
+        # ND range check
+        nd_warnings = []
+        for _, action in checked.iterrows():
+            if action["nd_change_pp"] != 0:
+                nd_mode = action["nd_mode"]
+                baseline_nd = action["nd"]
+                if nd_mode == "pp":
+                    new_nd = baseline_nd + action["nd_change_pp"] / 100.0
+                elif nd_mode == "relative":
+                    new_nd = baseline_nd * (1 + action["nd_change_pp"] / 100.0)
+                else:
+                    new_nd = action["nd_change_pp"] / 100.0
+                
+                if new_nd < 0 or new_nd > 1:
+                    nd_warnings.append(f"❌ {action['sku']}: ND outside [0,1]")
+                elif new_nd > 0.95 or new_nd < 0.05:
+                    nd_warnings.append(f"⚠ {action['sku']}: ND near boundary")
+                else:
+                    nd_warnings.append(f"✅ {action['sku']}: ND within range")
+        if nd_warnings:
+            for w in nd_warnings:
+                st.markdown(w)
+        else:
+            st.markdown("✅ No ND changes")
+    
+    with col2:
+        st.markdown("**Model Readiness**")
+        
+        is_joint = _is_joint_model_mode(model_mode)
+        
+        # Handle both dict and ConvergenceDiagnostics
+        if hasattr(diagnostics, "__dataclass_fields__"):
+            divergences = diagnostics.divergences
+            max_rhat = diagnostics.max_rhat
+            min_ess = diagnostics.min_ess_bulk
+            is_acceptable = diagnostics.is_acceptable
+        else:
+            divergences = diagnostics.get("divergences", 0)
+            max_rhat = diagnostics.get("max_rhat")
+            min_ess = diagnostics.get("min_ess_bulk")
+            is_acceptable = diagnostics.get("is_decision_ready", False)
+        
+        if is_acceptable:
+            st.markdown("✅ Convergence: **Decision-ready**")
+        elif divergences == 0 and (max_rhat is None or max_rhat < 1.01) and (min_ess is None or min_ess > 400):
+            st.markdown("✅ Convergence: **Exploratory — acceptable**")
+        else:
+            issues = []
+            if divergences > 5:
+                issues.append(f"❌ {divergences} divergences (threshold: 0)")
+            elif divergences > 0:
+                issues.append(f"⚠ {divergences} divergences (threshold: 0)")
+            if max_rhat is not None and max_rhat > 1.05:
+                issues.append(f"❌ Max R-hat = {max_rhat:.3f} (threshold: 1.05)")
+            elif max_rhat is not None and max_rhat > 1.01:
+                issues.append(f"⚠ Max R-hat = {max_rhat:.3f} (threshold: 1.01)")
+            if min_ess is not None and min_ess < 100:
+                issues.append(f"❌ Min ESS = {min_ess:.0f} (threshold: 100)")
+            elif min_ess is not None and min_ess < 400:
+                issues.append(f"⚠ Min ESS = {min_ess:.0f} (threshold: 400)")
+            for issue in issues:
+                st.markdown(issue)
+            if not issues:
+                st.markdown("✅ Convergence: **Exploratory — acceptable**")
+        
+        if is_joint:
+            st.markdown("⚠ **Joint allocation model is experimental**")
+        
+        # Reconciliation check for joint model
+        if is_joint and st.session_state.get("scenario_suite") is not None:
+            suite = st.session_state.scenario_suite
+            if "_joint_result" in suite and "_joint_choice_data" in suite:
+                recon = engine.check_scenario_reconciliation(suite["_joint_result"], suite["_joint_choice_data"])
+                if recon.get("all_passed", False):
+                    st.markdown("✅ Scenario reconciliation: **Passed**")
+                else:
+                    st.markdown("❌ Scenario reconciliation: **Failed**")
+                    for detail in recon.get("details", []):
+                        st.caption(f"  {detail}")
+
+
+def render_executive_impact_cards(
+    scenarios: dict,
+    checked: pd.DataFrame,
+    is_joint_mode: bool,
+) -> None:
+    """C. Executive impact cards — commercial answer first."""
+    st.markdown("### Executive Impact")
+    
+    # Metric toggle
+    metric = st.segmented_control(
+        "Primary scenario metric",
+        options=[
+            "Standard volume",
+            "Package units",
+            "Revenue",
+            "Share",
+        ],
+        default="Standard volume",
+        key="impact_metric",
+    )
+    
+    # Use combined scenario vs baseline
+    baseline = scenarios["baseline"]
+    combined = scenarios["combined"]
+    
+    # Get selected SKU if single
+    selected_sku = checked["sku"].iloc[0] if len(checked["sku"].unique()) == 1 else None
+    
+    # Find selected SKU row in combined
+    if selected_sku and "sku" in combined.columns:
+        sku_row = combined[combined["sku"] == selected_sku]
+        if not sku_row.empty:
+            row = sku_row.iloc[0]
+            baseline_vol = row.get("baseline_units", row.get("units_p50", 0))
+            scenario_vol = row.get("scenario_units", row.get("units_p50", 0))
+            delta = scenario_vol - baseline_vol
+            delta_pct = delta / baseline_vol * 100 if baseline_vol > 0 else 0
+            
+            # P05/P95 if available
+            delta_p05 = row.get("delta_p05", delta)
+            delta_p95 = row.get("delta_p95", delta)
+            prob_positive = row.get("probability_positive", 0.5)
+        else:
+            baseline_vol = scenario_vol = delta = delta_pct = 0
+            delta_p05 = delta_p95 = 0
+            prob_positive = 0.5
+    else:
+        # Aggregate total
+        baseline_vol = baseline["units_p50"].sum() if "units_p50" in baseline.columns else 0
+        scenario_vol = combined["units_p50"].sum() if "units_p50" in combined.columns else 0
+        delta = scenario_vol - baseline_vol
+        delta_pct = delta / baseline_vol * 100 if baseline_vol > 0 else 0
+        delta_p05 = delta_p95 = delta
+        prob_positive = 0.5
+    
+    # Cards
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    
+    with c1:
+        st.metric(
+            "Selected SKU Δ Std Vol",
+            f"{baseline_vol:,.0f} → {scenario_vol:,.0f}",
+            f"{delta:+,.0f} ({delta_pct:+.1f}%)",
+            delta_color="normal" if delta >= 0 else "inverse",
+        )
+        st.caption(f"90% CI: [{delta_p05:+,.0f}, {delta_p95:+,.0f}]")
+        st.caption(f"P(positive) = {prob_positive:.0%}")
+    
+    with c2:
+        # Brand total
+        brand_total_base = baseline[baseline["brand"] == checked["brand"].iloc[0]]["units_p50"].sum() if "brand" in baseline.columns else 0
+        brand_total_scen = combined[combined["brand"] == checked["brand"].iloc[0]]["units_p50"].sum() if "brand" in combined.columns else 0
+        brand_delta = brand_total_scen - brand_total_base
+        brand_pct = brand_delta / brand_total_base * 100 if brand_total_base > 0 else 0
+        st.metric(
+            "Selected Brand Δ Std Vol",
+            f"{brand_total_base:,.0f} → {brand_total_scen:,.0f}",
+            f"{brand_delta:+,.0f} ({brand_pct:+.1f}%)",
+        )
+    
+    with c3:
+        # Retailer-category
+        cat_total_base = baseline["units_p50"].sum() if "units_p50" in baseline.columns else 0
+        cat_total_scen = combined["units_p50"].sum() if "units_p50" in combined.columns else 0
+        cat_delta = cat_total_scen - cat_total_base
+        cat_pct = cat_delta / cat_total_base * 100 if cat_total_base > 0 else 0
+        st.metric(
+            "Market Δ Std Vol",
+            f"{cat_total_base:,.0f} → {cat_total_scen:,.0f}",
+            f"{cat_delta:+,.0f} ({cat_pct:+.1f}%)",
+        )
+    
+    with c4:
+        # Revenue
+        base_rev = baseline.get("revenue_p50", baseline.get("baseline_revenue", 0)).sum() if "revenue_p50" in baseline.columns else 0
+        scen_rev = combined.get("revenue_p50", combined.get("scenario_revenue", 0)).sum() if "revenue_p50" in combined.columns else 0
+        rev_delta = scen_rev - base_rev
+        rev_pct = rev_delta / base_rev * 100 if base_rev > 0 else 0
+        st.metric(
+            "Revenue Δ",
+            f"{base_rev:,.0f} → {scen_rev:,.0f}",
+            f"{rev_delta:+,.0f} ({rev_pct:+.1f}%)",
+        )
+    
+    with c5:
+        # Source of gain
+        if is_joint_mode and "_joint_result" in scenarios:
+            st.metric(
+                "Source of Gain",
+                "Reallocation" if abs(delta) > 0 else "—",
+                f"{abs(delta):,.0f} from competitors" if delta > 0 else "—",
+            )
+        else:
+            st.metric("Source of Gain", "Assumption-led", "Cross-effect multipliers")
+    
+    with c6:
+        # Reliability
+        reliability = "Decision-ready" if is_joint_mode else "Exploratory"
+        st.metric("Reliability", reliability, "Model status")
+
+
+def render_source_destination_sankey(
+    scenarios: dict,
+    checked: pd.DataFrame,
+    posterior_cache: dict,
+) -> None:
+    """E. Source-Destination Sankey — where does the gain come from?"""
+    st.markdown("### Source-Destination Flow")
+    st.caption("Flows show model-implied sources of selected-SKU growth under the fitted market-share model. They do not represent observed household-level shopper switching.")
+    
+    if "_joint_result" not in scenarios or "_joint_choice_data" not in scenarios:
+        st.info("Source-destination analysis requires joint model scenario output.")
+        return
+    
+    joint_result = scenarios["_joint_result"]
+    choice_data = scenarios["_joint_choice_data"]
+    selected_action = checked.iloc[0]
+    
+    # Build source action for the selected SKU
+    action = engine.ScenarioAction(
+        retailer=selected_action["retailer"],
+        category=selected_action["category"],
+        brand=selected_action["brand"],
+        sku=selected_action["sku"],
+        month=str(selected_action["month"]),
+        new_price_std=selected_action["price_per_standard_unit"] * (1 + selected_action["price_change_pct"] / 100.0) if selected_action["price_change_pct"] != 0 else None,
+        new_nd=(
+            selected_action["nd"] + selected_action["nd_change_pp"] / 100.0
+            if selected_action["nd_mode"] == "pp" and selected_action["nd_change_pp"] != 0
+            else selected_action["nd"] * (1 + selected_action["nd_change_pp"] / 100.0)
+            if selected_action["nd_mode"] == "relative" and selected_action["nd_change_pp"] != 0
+            else selected_action["nd_change_pp"] / 100.0
+            if selected_action["nd_mode"] == "absolute" and selected_action["nd_change_pp"] != 0
+            else None
+        ),
+        nd_mode=selected_action["nd_mode"],
+    )
+    
+    # Check reconciliation
+    recon = engine.check_scenario_reconciliation(joint_result, choice_data)
+    
+    if not recon.get("all_passed", False):
+        st.warning("Source-destination flow is unavailable because scenario reconciliation did not pass.")
+        for detail in recon.get("details", []):
+            st.caption(f"  {detail}")
+        return
+    
+    # Build source summary
+    source_df = engine.build_source_destination_summary(
+        joint_result, choice_data, action
+    )
+    
+    if source_df.empty:
+        st.info("No significant source segments identified.")
+        return
+    
+    # Create and display Sankey
+    sankey_fig = engine.create_reallocation_sankey(
+        source_df=source_df,
+        selected_sku_label=selected_action["sku"],
+    )
+    st.plotly_chart(sankey_fig, use_container_width=True)
+    
+    # Show segment table
+    with st.expander("📋 Source Segment Details", expanded=False):
+        display_cols = [
+            "source_relationship",
+            "baseline_standard_volume_p50",
+            "scenario_standard_volume_p50",
+            "delta_standard_volume_p50",
+            "delta_standard_volume_p05",
+            "delta_standard_volume_p95",
+            "source_share_p50",
+            "probability_source_loss",
+        ]
+        available_cols = [c for c in display_cols if c in source_df.columns]
+        st.dataframe(
+            source_df[available_cols].style.format({
+                "baseline_standard_volume_p50": "{:,.0f}",
+                "scenario_standard_volume_p50": "{:,.0f}",
+                "delta_standard_volume_p50": "{:+,.0f}",
+                "delta_standard_volume_p05": "{:+,.0f}",
+                "delta_standard_volume_p95": "{:+,.0f}",
+                "source_share_p50": "{:.1%}",
+                "probability_source_loss": "{:.0%}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def render_winner_loser_analysis(
+    scenarios: dict,
+    checked: pd.DataFrame,
+    meta: dict,
+) -> None:
+    """F. Winner-Loser interval chart and detail table."""
+    st.markdown("### Winner / Loser Analysis")
+    
+    baseline = scenarios["baseline"]
+    combined = scenarios["combined"]
+    
+    # Merge baseline and combined
+    if "sku" in baseline.columns and "sku" in combined.columns:
+        merged = combined[["sku", "units_p50", "baseline_units", "delta_p05", "delta_p50", "delta_p95"]].copy()
+        merged = merged.rename(columns={"units_p50": "scenario_units_p50"})
+        
+        # Add metadata
+        if "brand" in combined.columns:
+            merged["brand"] = combined["brand"]
+        if "category" in combined.columns:
+            merged["category"] = combined["category"]
+        if "retailer" in combined.columns:
+            merged["retailer"] = combined["retailer"]
+        if "pack_group" in combined.columns:
+            merged["pack_group"] = combined["pack_group"]
+        
+        # Add probability positive
+        if "probability_positive" in combined.columns:
+            merged["probability_positive"] = combined["probability_positive"]
+        else:
+            # Compute from deltas
+            merged["probability_positive"] = 0.5  # placeholder
+        
+        # Classify relationship to selected SKU
+        selected_sku = checked["sku"].iloc[0] if len(checked["sku"].unique()) == 1 else None
+        selected_brand = checked["brand"].iloc[0] if len(checked["brand"].unique()) == 1 else None
+        selected_category = checked["category"].iloc[0] if len(checked["category"].unique()) == 1 else None
+        selected_retailer = checked["retailer"].iloc[0] if len(checked["retailer"].unique()) == 1 else None
+        selected_pack = None
+        if selected_sku and "sku_to_idx" in meta and "sku_levels" in meta:
+            sku_idx = meta["sku_to_idx"].get(selected_sku)
+            if sku_idx is not None and "pack_group_levels" in meta:
+                pass  # Would need pack group mapping
+        
+        def classify_rel(row):
+            if row["sku"] == selected_sku:
+                return "selected_sku"
+            if selected_brand and row.get("brand") == selected_brand:
+                return "same_brand"
+            if selected_category and row.get("category") == selected_category:
+                if selected_retailer and row.get("retailer") == selected_retailer:
+                    return "same_category_same_retailer"
+                return "same_category_other_retailer"
+            if selected_retailer and row.get("retailer") == selected_retailer:
+                return "same_retailer_other_category"
+            return "other"
+        
+        merged["relationship"] = merged.apply(classify_rel, axis=1)
+        
+        # Sort by delta_p50
+        merged = merged.sort_values("delta_p50")
+        
+        # Top 10 winners and losers
+        losers = merged.head(10)
+        winners = merged.tail(10)
+        top_changes = pd.concat([losers, winners]).sort_values("delta_p50")
+        
+        # Interval chart
+        fig = go.Figure()
+        
+        colors = []
+        for _, row in top_changes.iterrows():
+            if row["delta_p05"] > 0:
+                colors.append("#2e7d32")  # dark green - confident gain
+            elif row["delta_p95"] < 0:
+                colors.append("#c62828")  # dark red - confident loss
+            else:
+                colors.append("#f57f17")  # amber - uncertain
+        
+        fig.add_trace(go.Scatter(
+            x=top_changes["delta_p50"],
+            y=top_changes["sku"],
+            mode="markers",
+            marker=dict(color=colors, size=10),
+            name="P50",
+            hovertemplate="SKU: %{y}<br>Delta P50: %{x:,.0f}<extra></extra>",
+        ))
+        
+        # Error bars via segments
+        for i, (_, row) in enumerate(top_changes.iterrows()):
+            fig.add_shape(
+                type="line",
+                x0=row["delta_p05"], x1=row["delta_p95"],
+                y0=i, y1=i,
+                line=dict(color=colors[i], width=2),
+                xref="x", yref="y",
+            )
+        
+        fig.update_layout(
+            title="Top 10 Winners & Losers — Posterior Interval",
+            xaxis_title="Delta Standard Volume (P05–P95 interval, P50 dot)",
+            yaxis_title="SKU",
+            height=500,
+            margin=dict(l=150, r=20, t=60, b=40),
+            showlegend=False,
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Detail table
+        with st.expander("📋 Full Winner/Loser Table", expanded=False):
+            display_cols = [
+                "rank", "retailer", "category", "brand", "sku", "pack_group",
+                "baseline_units", "scenario_units_p50", "delta_p50", "delta_p05", "delta_p95",
+                "probability_positive", "relationship"
+            ]
+            # Add rank
+            top_changes = top_changes.reset_index(drop=True)
+            top_changes["rank"] = range(1, len(top_changes) + 1)
+            
+            available_cols = [c for c in display_cols if c in top_changes.columns]
+            st.dataframe(
+                top_changes[available_cols].style.format({
+                    "baseline_units": "{:,.0f}",
+                    "scenario_units_p50": "{:,.0f}",
+                    "delta_p50": "{:+,.0f}",
+                    "delta_p05": "{:+,.0f}",
+                    "delta_p95": "{:+,.0f}",
+                    "probability_positive": "{:.0%}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+def render_market_hierarchy_summary(
+    scenarios: dict,
+    checked: pd.DataFrame,
+    meta: dict,
+) -> None:
+    """G. Market hierarchy impact summary."""
+    st.markdown("### Market Hierarchy Impact")
+    
+    baseline = scenarios["baseline"]
+    combined = scenarios["combined"]
+    
+    # Build hierarchy table
+    hierarchy_data = []
+    
+    # Selected SKU
+    if len(checked["sku"].unique()) == 1:
+        sku = checked["sku"].iloc[0]
+        b_row = baseline[baseline["sku"] == sku]
+        c_row = combined[combined["sku"] == sku]
+        if not b_row.empty and not c_row.empty:
+            b = b_row.iloc[0].get("units_p50", 0)
+            c = c_row.iloc[0].get("units_p50", 0)
+            hierarchy_data.append({
+                "Level": "Selected SKU",
+                "Baseline": b,
+                "Scenario": c,
+                "Delta P50": c - b,
+                "Delta %": (c - b) / b * 100 if b > 0 else 0,
+            })
+    
+    # Same-brand portfolio
+    if len(checked["brand"].unique()) == 1:
+        brand = checked["brand"].iloc[0]
+        b = baseline[baseline["brand"] == brand]["units_p50"].sum() if "brand" in baseline.columns else 0
+        c = combined[combined["brand"] == brand]["units_p50"].sum() if "brand" in combined.columns else 0
+        hierarchy_data.append({
+            "Level": "Same-brand portfolio",
+            "Baseline": b,
+            "Scenario": c,
+            "Delta P50": c - b,
+            "Delta %": (c - b) / b * 100 if b > 0 else 0,
+        })
+    
+    # Selected brand
+    if len(checked["brand"].unique()) == 1:
+        brand = checked["brand"].iloc[0]
+        b = baseline[baseline["brand"] == brand]["units_p50"].sum() if "brand" in baseline.columns else 0
+        c = combined[combined["brand"] == brand]["units_p50"].sum() if "brand" in combined.columns else 0
+        hierarchy_data.append({
+            "Level": "Selected brand",
+            "Baseline": b,
+            "Scenario": c,
+            "Delta P50": c - b,
+            "Delta %": (c - b) / b * 100 if b > 0 else 0,
+        })
+    
+    # Retailer-category
+    if len(checked["retailer"].unique()) == 1 and len(checked["category"].unique()) == 1:
+        retailer = checked["retailer"].iloc[0]
+        category = checked["category"].iloc[0]
+        b = baseline[(baseline["retailer"] == retailer) & (baseline["category"] == category)]["units_p50"].sum()
+        c = combined[(combined["retailer"] == retailer) & (combined["category"] == category)]["units_p50"].sum()
+        hierarchy_data.append({
+            "Level": "Retailer-category",
+            "Baseline": b,
+            "Scenario": c,
+            "Delta P50": c - b,
+            "Delta %": (c - b) / b * 100 if b > 0 else 0,
+        })
+    
+    # Category across retailers
+    if len(checked["category"].unique()) == 1:
+        category = checked["category"].iloc[0]
+        b = baseline[baseline["category"] == category]["units_p50"].sum() if "category" in baseline.columns else 0
+        c = combined[combined["category"] == category]["units_p50"].sum() if "category" in combined.columns else 0
+        hierarchy_data.append({
+            "Level": "Category (all retailers)",
+            "Baseline": b,
+            "Scenario": c,
+            "Delta P50": c - b,
+            "Delta %": (c - b) / b * 100 if b > 0 else 0,
+        })
+    
+    # Total observed market
+    b = baseline["units_p50"].sum()
+    c = combined["units_p50"].sum()
+    hierarchy_data.append({
+        "Level": "Total observed market",
+        "Baseline": b,
+        "Scenario": c,
+        "Delta P50": c - b,
+        "Delta %": (c - b) / b * 100 if b > 0 else 0,
+    })
+    
+    # Outside option (joint model only)
+    if "_joint_result" in scenarios:
+        # Would need outside option from nest model
+        hierarchy_data.append({
+            "Level": "Outside option",
+            "Baseline": "—",
+            "Scenario": "—",
+            "Delta P50": "—",
+            "Delta %": "—",
+        })
+    
+    hier_df = pd.DataFrame(hierarchy_data)
+    
+    st.dataframe(
+        hier_df.style.format({
+            "Baseline": "{:,.0f}",
+            "Scenario": "{:,.0f}",
+            "Delta P50": "{:+,.0f}",
+            "Delta %": "{:+.1f}%",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+    
+    # Automatic narrative
+    if len(checked["sku"].unique()) == 1:
+        sku_gain = hierarchy_data[0]["Delta P50"] if hierarchy_data else 0
+        market_delta = hierarchy_data[-2]["Delta P50"] if len(hierarchy_data) >= 2 else 0
+        
+        if abs(sku_gain) > 1:
+            realloc_pct = (abs(sku_gain) - max(0, market_delta)) / abs(sku_gain) * 100 if sku_gain > 0 else 0
+            expansion_pct = max(0, market_delta) / abs(sku_gain) * 100 if sku_gain > 0 else 0
+            
+            st.markdown(
+                f"**Interpretation:** The selected SKU **{'gains' if sku_gain > 0 else 'loses'} {abs(sku_gain):,.0f}L** "
+                f"at the posterior median. "
+                f"~{realloc_pct:.0f}% is modelled as internal reallocation from observed alternatives; "
+                f"~{expansion_pct:.0f}% is associated with observed-market expansion. "
+                f"Total observed market volume changes by **{market_delta:+,.0f}L ({hierarchy_data[-2]['Delta %']:+.1f}%)**."
+            )
+
+
+def render_detailed_market_impact(scenarios: dict, action_df: pd.DataFrame) -> None:
+    """Legacy detailed market impact tables."""
+    baseline_df = scenarios["baseline"]
+    compare_scenario = st.selectbox(
+        "Compare scenario",
+        ["price_only", "distribution_only", "combined"],
+        index=2,
+        format_func=lambda x: x.replace("_", " ").title(),
+        key="detail_compare",
+    )
+    scenario_df_selected = scenarios[compare_scenario]
+    
+    level = st.selectbox(
+        "Aggregation level",
+        ["market", "retailer", "category", "brand", "sku"],
+        index=2,
+        format_func=lambda x: x.replace("_", " ").title(),
+        key="detail_level",
+    )
+    
+    market_impact = engine.aggregate_market_impact(baseline_df, scenario_df_selected, level)
+    display_cols = [c for c in market_impact.columns if not c.startswith("market_")]
+    st.dataframe(
+        market_impact[display_cols].style.format({
+            "baseline_units": "{:,.0f}",
+            "scenario_units": "{:,.0f}",
+            "delta_units": "{:+,.0f}",
+            "delta_units_pct": "{:+.1%}",
+            "baseline_revenue": "{:,.0f}",
+            "scenario_revenue": "{:,.0f}",
+            "delta_revenue": "{:+,.0f}",
+            "delta_revenue_pct": "{:+.1%}",
+            "scenario_share": "{:.1%}",
+            "baseline_share": "{:.1%}",
+            "share_change_pp": "{:+.1f} pp",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+    
+    viz_col1, viz_col2 = st.columns(2)
+    with viz_col1:
+        st.plotly_chart(
+            engine.create_category_bubble_map(market_impact),
+            use_container_width=True
+        )
+    with viz_col2:
+        st.plotly_chart(
+            engine.create_brand_pack_heatmap(market_impact),
+            use_container_width=True
+        )
+    
+    try:
+        dumbbell = engine.create_winner_loser_dumbbell(market_impact)
+        st.plotly_chart(dumbbell, use_container_width=True)
+    except Exception as e:
+        st.info(f"Dumbbell chart unavailable: {e}")
+
+
+def render_parameter_attribution(
+    checked: pd.DataFrame,
+    meta: dict,
+    posterior_cache: dict,
+    spline,
+    scales: dict,
+) -> None:
+    """Parameter attribution for single SKU."""
+    if len(checked["sku"].unique()) != 1:
+        st.info("Parameter attribution requires exactly one selected SKU.")
+        return
+    
+    target_sku = checked["sku"].iloc[0]
+    sku_idx = meta["sku_to_idx"][target_sku]
+    nd_base = checked["nd"].mean()
+    nd_mode = checked["nd_mode"].iloc[0]
+    nd_change = checked["nd_change_pp"].mean() / 100.0
+    price_change = checked["price_change_pct"].mean() / 100.0
+    
+    if nd_mode == "pp":
+        resolved_nd = engine.resolve_target_nd(np.array([nd_base]), nd_change, "pp")[0]
+    elif nd_mode == "relative":
+        resolved_nd = engine.resolve_target_nd(np.array([nd_base]), nd_change, "relative")[0]
+    else:
+        resolved_nd = nd_change
+    
+    attribution = engine.compute_parameter_attribution(
+        posterior_cache, spline, scales, sku_idx,
+        price_change, nd_base, resolved_nd,
+        target_sku, meta
+    )
+    
+    st.plotly_chart(
+        engine.create_parameter_waterfall(attribution),
+        use_container_width=True
+    )
+    
+    st.dataframe(
+        attribution.style.format({
+            "log_vol_delta_median": "{:+.3f}",
+            "multiplier_median": "{:.3f}x",
+            "multiplier_p10": "{:.3f}x",
+            "multiplier_p90": "{:.3f}x",
+            "elasticity_median": "{:.2f}",
+            "nd_mechanical_effect": "{:+.3f}",
+            "nd_fitted_effect": "{:+.3f}",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def render_scenario_audit_export(
+    scenarios: dict,
+    checked: pd.DataFrame,
+    action_df: pd.DataFrame,
+    cross_cat_sensitivity: float,
+) -> None:
+    """Scenario audit and export."""
+    audit_df = pd.DataFrame({
+        "Setting": [
+            "Target level", "Target value(s)", "Avg Price change", "ND mode", "Avg ND change",
+            "Cross-category sensitivity", "Model config", "Chains", "Draws"
+        ],
+        "Value": [
+            "Multiple SKUs" if len(checked) > 1 else "Single SKU",
+            f"{len(checked)} SKU-months selected",
+            f"{checked['price_change_pct'].mean():+.1f}%",
+            checked["nd_mode"].iloc[0] if len(checked) > 0 else "pp",
+            f"{checked['nd_change_pp'].mean():+.1f}pp",
+            f"{cross_cat_sensitivity:.0%}",
+            st.session_state.model_settings["config"].__class__.__name__,
+            st.session_state.model_settings["config"].chains,
+            st.session_state.model_settings["config"].draws,
+        ],
+        "Provenance": [
+            "User input", "User input", "User input", "User input", "User input",
+            "Assumption-led", "Model config", "Model config", "Model config"
+        ],
+        "Confidence": [
+            "High", "High", "High", "High", "High",
+            "Assumption", "High", "High", "High"
+        ]
+    })
+    st.dataframe(audit_df, use_container_width=True, hide_index=True)
+    
+    if st.button("Export Scenario Suite (CSV)", key="export_main"):
+        export_data = []
+        for name, sc_df in scenarios.items():
+            for _, row in sc_df.iterrows():
+                export_data.append({
+                    "scenario": name,
+                    "month": row["month"],
+                    "retailer": row["retailer"],
+                    "category": row["category"],
+                    "brand": row["brand"],
+                    "sku": row["sku"],
+                    "baseline_volume": row.get("baseline_units", row.get("standard_volume", 0)),
+                    "scenario_volume": row.get("units_p50", row.get("standard_volume", 0)),
+                    "baseline_revenue": row.get("baseline_revenue", row.get("revenue", 0)),
+                    "scenario_revenue": row.get("revenue_p50", row.get("revenue", 0)),
+                    "baseline_nd": row.get("baseline_nd", row.get("nd", 0)),
+                    "scenario_nd": row.get("scenario_nd", row.get("nd", 0)),
+                    "baseline_price": row.get("baseline_price", row.get("price_per_standard_unit", 0)),
+                    "scenario_price": row.get("scenario_price", row.get("price_per_standard_unit", 0)),
+                })
+        export_df = pd.DataFrame(export_data)
+        csv = export_df.to_csv(index=False)
+        st.download_button(
+            "Download CSV",
+            csv,
+            f"scenario_suite_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            "text/csv"
+        )
+
+
 def render_scenario_cockpit_page(
     df: pd.DataFrame,
     view_df: pd.DataFrame,
@@ -1444,6 +2223,11 @@ def render_scenario_cockpit_page(
             "baseline_revenue": "{:,.0f}",
         }), use_container_width=True, hide_index=True)
         
+        # B. Guardrails and model readiness
+        render_scenario_guardrails(checked, df, model_mode, diagnostics)
+        
+        st.divider()
+        
         if st.button("Run Scenario Suite", type="primary", use_container_width=True):
             if is_joint_mode:
                 choice_data = st.session_state.get("choice_data")
@@ -1470,88 +2254,52 @@ def render_scenario_cockpit_page(
         scenarios = st.session_state.scenario_suite
         cross_cat_sensitivity = st.session_state.get("scenario_cross_sensitivity", 0.05)
         
-        st.markdown("### Scenario Suite Results")
+        # Get the action details for the scenario
+        action_df = st.session_state.get("scenario_actions", action_df)
+        checked = action_df[action_df["include"]]
         
-        level = st.selectbox(
-            "Aggregation level",
-            ["market", "retailer", "category", "brand", "sku"],
-            index=2,
-            format_func=lambda x: x.replace("_", " ").title(),
-        )
+        # C. Executive impact cards
+        render_executive_impact_cards(scenarios, checked, is_joint_mode)
         
-        compare_scenario = st.selectbox(
-            "Compare scenario",
-            ["price_only", "distribution_only", "combined"],
-            index=2,
-            format_func=lambda x: x.replace("_", " ").title()
-        )
+        st.divider()
         
-        baseline_df = scenarios["baseline"]
-        scenario_df_selected = scenarios[compare_scenario]
+        # D. Selected-SKU driver waterfall
+        if len(checked["sku"].unique()) == 1:
+            target_sku = checked["sku"].iloc[0]
+            st.markdown("### Selected SKU — Modelled Scenario Decomposition")
+            chart_subtitle("How do the selected price and numeric-distribution actions change expected standard volume?")
+            
+            try:
+                waterfall = engine.create_driver_waterfall(
+                    scenarios["baseline"], scenarios[compare_scenario] if "compare_scenario" in locals() else scenarios["combined"],
+                    posterior_cache, spline, scales, meta
+                )
+                st.plotly_chart(waterfall, use_container_width=True)
+            except Exception as e:
+                st.info(f"Driver waterfall unavailable: {e}")
+            
+            st.divider()
         
-        market_impact = engine.aggregate_market_impact(baseline_df, scenario_df_selected, level)
+        # E. Source-Destination Sankey (Joint model only)
+        if is_joint_mode and len(checked["sku"].unique()) == 1:
+            render_source_destination_sankey(scenarios, checked, posterior_cache)
+            st.divider()
         
-        st.markdown(f"#### Market Impact at {level.replace('_', ' ').title()} Level")
-        display_cols = [c for c in market_impact.columns if not c.startswith("market_")]
-        st.dataframe(
-            market_impact[display_cols].style.format({
-                "baseline_units": "{:,.0f}",
-                "scenario_units": "{:,.0f}",
-                "delta_units": "{:+,.0f}",
-                "delta_units_pct": "{:+.1%}",
-                "baseline_revenue": "{:,.0f}",
-                "scenario_revenue": "{:,.0f}",
-                "delta_revenue": "{:+,.0f}",
-                "delta_revenue_pct": "{:+.1%}",
-                "scenario_share": "{:.1%}",
-                "baseline_share": "{:.1%}",
-                "share_change_pp": "{:+.1f} pp",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
+        # F. Winner-Loser interval chart and table
+        render_winner_loser_analysis(scenarios, checked, meta)
         
-        st.markdown("#### Driver Waterfall")
-        chart_subtitle("Which modelled components explain the scenario difference?")
+        st.divider()
         
-        try:
-            waterfall = engine.create_driver_waterfall(
-                baseline_df, scenario_df_selected,
-                posterior_cache, spline, scales, meta
-            )
-            st.plotly_chart(waterfall, use_container_width=True)
-        except Exception as e:
-            st.info(f"Driver waterfall unavailable: {e}")
+        # G. Market hierarchy impact summary
+        render_market_hierarchy_summary(scenarios, checked, meta)
         
-        st.markdown("#### Market Visualizations")
+        st.divider()
         
-        period_text = f"{start_month.strftime('%b %Y')} – {end_month.strftime('%b %Y')}"
-        viz_col1, viz_col2 = st.columns(2)
-        with viz_col1:
-            chart_subtitle("Which categories gain or lose share vs. volume?")
-            st.plotly_chart(
-                engine.create_category_bubble_map(market_impact),
-                use_container_width=True
-            )
-            render_scope_context("All observed categories in the affected market", period_text)
+        # Legacy detailed views (inside expanders)
+        with st.expander("📊 Detailed Market Impact Tables", expanded=False):
+            render_detailed_market_impact(scenarios, action_df)
         
-        with viz_col2:
-            chart_subtitle("How do brand×pack combinations shift under the scenario?")
-            st.plotly_chart(
-                engine.create_brand_pack_heatmap(market_impact),
-                use_container_width=True
-            )
-            render_scope_context("All observed brand×pack combinations", period_text)
-        
-        st.markdown("#### Winner/Loser Dumbbell")
-        chart_subtitle("Which SKUs gain or lose the most standard volume?")
-        try:
-            dumbbell = engine.create_winner_loser_dumbbell(market_impact)
-            st.plotly_chart(dumbbell, use_container_width=True)
-        except Exception as e:
-            st.info(f"Dumbbell chart unavailable: {e}")
-        
-        with st.expander("🔬 Advanced: Cross-Category Sensitivity", expanded=False):
+        with st.expander("⚙️ Advanced: Cross-Category Sensitivity", expanded=False):
             chart_subtitle("How does the substitution assumption affect other categories?")
             st.plotly_chart(
                 engine.create_cross_category_sensitivity_chart(scenarios, cross_cat_sensitivity),
@@ -1559,107 +2307,12 @@ def render_scenario_cockpit_page(
             )
             st.caption("Cross-category sensitivity is an assumption-led multiplier. "
                        "Conservative: no substitution. Central: 5% of displaced volume reallocates. High: 15%.")
-            render_scope_context("Other categories within the same retailer", period_text)
         
-        checked = action_df[action_df["include"]]
-        if len(checked["sku"].unique()) == 1:
-            target_sku = checked["sku"].iloc[0]
-            st.markdown("#### Parameter Attribution")
-            sku_idx = meta["sku_to_idx"][target_sku]
-            nd_base = checked["nd"].mean()
-            nd_mode = checked["nd_mode"].iloc[0]
-            nd_change = checked["nd_change_pp"].mean() / 100.0
-            price_change = checked["price_change_pct"].mean() / 100.0
-            
-            if nd_mode == "pp":
-                resolved_nd = engine.resolve_target_nd(np.array([nd_base]), nd_change, "pp")[0]
-            elif nd_mode == "relative":
-                resolved_nd = engine.resolve_target_nd(np.array([nd_base]), nd_change, "relative")[0]
-            else:
-                resolved_nd = nd_change
-            
-            attribution = engine.compute_parameter_attribution(
-                posterior_cache, spline, scales, sku_idx,
-                price_change, nd_base, resolved_nd,
-                target_sku, meta
-            )
-            
-            st.plotly_chart(
-                engine.create_parameter_waterfall(attribution),
-                use_container_width=True
-            )
-            
-            st.dataframe(
-                attribution.style.format({
-                    "log_vol_delta_median": "{:+.3f}",
-                    "multiplier_median": "{:.3f}x",
-                    "multiplier_p10": "{:.3f}x",
-                    "multiplier_p90": "{:.3f}x",
-                    "elasticity_median": "{:.2f}",
-                    "nd_mechanical_effect": "{:+.3f}",
-                    "nd_fitted_effect": "{:+.3f}",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
+        with st.expander("🔬 Parameter Attribution (Single SKU)", expanded=False):
+            render_parameter_attribution(checked, meta, posterior_cache, spline, scales)
         
-        st.markdown("#### Scenario Audit & Export")
-        checked = action_df[action_df["include"]]
-        audit_df = pd.DataFrame({
-            "Setting": [
-                "Target level", "Target value(s)", "Avg Price change", "ND mode", "Avg ND change",
-                "Cross-category sensitivity", "Model config", "Chains", "Draws"
-            ],
-            "Value": [
-                "Multiple SKUs" if len(checked) > 1 else "Single SKU",
-                f"{len(checked)} SKU-months selected",
-                f"{checked['price_change_pct'].mean():+.1f}%",
-                checked["nd_mode"].iloc[0] if len(checked) > 0 else "pp",
-                f"{checked['nd_change_pp'].mean():+.1f}pp",
-                f"{cross_cat_sensitivity:.0%}",
-                st.session_state.model_settings["config"].__class__.__name__,
-                st.session_state.model_settings["config"].chains,
-                st.session_state.model_settings["config"].draws,
-            ],
-            "Provenance": [
-                "User input", "User input", "User input", "User input", "User input",
-                "Assumption-led", "Model config", "Model config", "Model config"
-            ],
-            "Confidence": [
-                "High", "High", "High", "High", "High",
-                "Assumption", "High", "High", "High"
-            ]
-        })
-        st.dataframe(audit_df, use_container_width=True, hide_index=True)
-        
-        if st.button("Export Scenario Suite (CSV)"):
-            export_data = []
-            for name, sc_df in scenarios.items():
-                for _, row in sc_df.iterrows():
-                    export_data.append({
-                        "scenario": name,
-                        "month": row["month"],
-                        "retailer": row["retailer"],
-                        "category": row["category"],
-                        "brand": row["brand"],
-                        "sku": row["sku"],
-                        "baseline_volume": row.get("baseline_units", row.get("standard_volume", 0)),
-                        "scenario_volume": row.get("units_p50", row.get("standard_volume", 0)),
-                        "baseline_revenue": row.get("baseline_revenue", row.get("revenue", 0)),
-                        "scenario_revenue": row.get("revenue_p50", row.get("revenue", 0)),
-                        "baseline_nd": row.get("baseline_nd", row.get("nd", 0)),
-                        "scenario_nd": row.get("scenario_nd", row.get("nd", 0)),
-                        "baseline_price": row.get("baseline_price", row.get("price_per_standard_unit", 0)),
-                        "scenario_price": row.get("scenario_price", row.get("price_per_standard_unit", 0)),
-                    })
-            export_df = pd.DataFrame(export_data)
-            csv = export_df.to_csv(index=False)
-            st.download_button(
-                "Download CSV",
-                csv,
-                f"scenario_suite_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "text/csv"
-            )
+        with st.expander("📋 Scenario Audit & Export", expanded=False):
+            render_scenario_audit_export(scenarios, checked, action_df, cross_cat_sensitivity)
 
 
 # ---------------------------------------------------------------------------

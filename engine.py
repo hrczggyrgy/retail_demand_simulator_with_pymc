@@ -2253,6 +2253,333 @@ def check_scenario_reconciliation(
 
 
 # ============================================================================
+# Source-Destination Analysis for Joint Model Scenarios
+# ============================================================================
+
+SOURCE_DESTINATION_COLUMNS = (
+    "selected_sku",
+    "source_relationship",
+    "baseline_standard_volume_p50",
+    "scenario_standard_volume_p50",
+    "delta_standard_volume_p05",
+    "delta_standard_volume_p50",
+    "delta_standard_volume_p95",
+    "source_share_p50",
+    "probability_source_loss",
+)
+
+
+def _classify_source_relationship(
+    selected_sku: str,
+    selected_brand: str,
+    selected_category: str,
+    selected_retailer: str,
+    selected_pack_group: str,
+    row_sku: str,
+    row_brand: str,
+    row_category: str,
+    row_retailer: str,
+    row_pack_group: str,
+) -> str:
+    """Classify a SKU's relationship to the selected SKU for source-destination analysis."""
+    if row_sku == selected_sku:
+        return "selected_sku"
+    
+    if row_brand == selected_brand:
+        if row_category == selected_category:
+            if row_pack_group != selected_pack_group:
+                return "same_brand_other_pack"
+        return "same_brand_other_category"
+    
+    if row_category == selected_category:
+        if row_pack_group == selected_pack_group:
+            if row_retailer == selected_retailer:
+                return "other_brand_same_pack"
+            else:
+                return "other_brand_same_pack_other_retailer"
+        else:
+            if row_retailer == selected_retailer:
+                return "other_category_same_retailer"
+            else:
+                return "other_category_other_retailer"
+    
+    if row_retailer == selected_retailer:
+        return "same_retailer_other_category"
+    
+    return "other_retailer_other_category"
+
+
+def build_source_destination_summary(
+    result: ScenarioResult,
+    choice_data: ChoiceSetData,
+    selected_action: ScenarioAction,
+    pack_group_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """
+    Aggregate draw-level changes into mutually exclusive source segments.
+    
+    Only returns valid flows when scenario reconciliation passes.
+    
+    Args:
+        result: ScenarioResult from run_joint_scenario_draws
+        choice_data: ChoiceSetData with SKU/market metadata
+        selected_action: The ScenarioAction for the selected SKU
+        pack_group_map: Optional mapping from SKU to pack_group
+    
+    Returns:
+        DataFrame with canonical SOURCE_DESTINATION_COLUMNS
+    """
+    # Get selected SKU info
+    selected_sku = selected_action.sku
+    selected_brand = selected_action.brand
+    selected_category = selected_action.category
+    selected_retailer = selected_action.retailer
+    selected_month = selected_action.month
+    
+    # Find the market index for the selected action
+    month_str = pd.Timestamp(selected_month).strftime("%Y-%m")
+    selected_market_id = f"{month_str}|{selected_retailer}|{selected_category}"
+    
+    market_lookup = {m_id: m_idx for m_idx, m_id in enumerate(choice_data.market_ids)}
+    if selected_market_id not in market_lookup:
+        return pd.DataFrame(columns=SOURCE_DESTINATION_COLUMNS)
+    
+    selected_market_idx = market_lookup[selected_market_id]
+    selected_sku_idx = choice_data.sku_to_idx.get(selected_sku)
+    
+    if selected_sku_idx is None:
+        return pd.DataFrame(columns=SOURCE_DESTINATION_COLUMNS)
+    
+    # Get per-draw deltas for the selected market
+    # result.delta_units_p50 is (n_markets, n_skus) but we need per-draw
+    # result.scenario_units and result.baseline_units are (n_draws, n_markets, n_skus)
+    n_draws = result.baseline_units.shape[0]
+    n_skus = len(choice_data.sku_ids)
+    
+    # Build SKU metadata
+    sku_meta = []
+    for s_idx, sku in enumerate(choice_data.sku_ids):
+        brand_idx = choice_data.sku_brand_idx[s_idx]
+        brand = choice_data.brand_levels[brand_idx]
+        
+        cat_idx = choice_data.sku_category_idx[s_idx]
+        category = choice_data.category_levels[cat_idx]
+        
+        pg_idx = choice_data.sku_pack_group_idx[s_idx]
+        pack_group = choice_data.pack_group_levels[pg_idx]
+        
+        sku_meta.append({
+            "sku_idx": s_idx,
+            "sku": sku,
+            "brand": brand,
+            "category": category,
+            "pack_group": pack_group,
+        })
+    sku_meta_df = pd.DataFrame(sku_meta)
+    
+    # Get pack group for selected SKU
+    selected_pack_group = sku_meta_df.loc[
+        sku_meta_df["sku"] == selected_sku, "pack_group"
+    ].values[0] if selected_sku in sku_meta_df["sku"].values else "Unknown"
+    
+    # Classify each SKU's relationship
+    sku_meta_df["source_relationship"] = sku_meta_df.apply(
+        lambda row: _classify_source_relationship(
+            selected_sku, selected_brand, selected_category, selected_retailer, selected_pack_group,
+            row["sku"], row["brand"], row["category"], 
+            # Need retailer per market - use choice_data market metadata
+            selected_retailer,  # This is simplified - ideally per-market retailer
+            row["pack_group"],
+        ),
+        axis=1
+    )
+    
+    # For the selected market, get per-draw deltas
+    # baseline_units_all: (n_draws, n_markets, n_skus)
+    # We need deltas per draw for the selected market
+    baseline_draws = result.baseline_units[:, selected_market_idx, :]  # (n_draws, n_skus)
+    scenario_draws = result.scenario_units[:, selected_market_idx, :]  # (n_draws, n_skus)
+    delta_draws = scenario_draws - baseline_draws  # (n_draws, n_skus)
+    
+    # Also get standard volume conversion
+    # choice_data has observed_units but we need standard_volume per SKU per market
+    # Use observed_units as proxy for standard volume in choice set
+    
+    # Compute summary statistics per SKU
+    records = []
+    for s_idx in range(n_skus):
+        sku = choice_data.sku_ids[s_idx]
+        rel = sku_meta_df.loc[sku_meta_df["sku_idx"] == s_idx, "source_relationship"].values[0]
+        
+        baseline_p50 = float(np.median(baseline_draws[:, s_idx]))
+        scenario_p50 = float(np.median(scenario_draws[:, s_idx]))
+        delta_p50 = scenario_p50 - baseline_p50
+        delta_p05 = float(np.percentile(delta_draws[:, s_idx], 5))
+        delta_p95 = float(np.percentile(delta_draws[:, s_idx], 95))
+        
+        # Source share: what fraction of total source volume does this SKU represent?
+        # For sources (losers), this is their contribution to the selected SKU's gain
+        total_source_volume = float(np.sum(np.minimum(delta_draws, 0).sum(axis=1)))  # negative
+        if total_source_volume < -1e-6:
+            source_share_p50 = delta_p50 / total_source_volume if delta_p50 < 0 else 0.0
+        else:
+            source_share_p50 = 0.0
+        
+        # Probability this SKU loses volume
+        prob_loss = float(np.mean(delta_draws[:, s_idx] < 0))
+        
+        records.append({
+            "selected_sku": selected_sku,
+            "source_relationship": rel,
+            "baseline_standard_volume_p50": baseline_p50,
+            "scenario_standard_volume_p50": scenario_p50,
+            "delta_standard_volume_p05": delta_p05,
+            "delta_standard_volume_p50": delta_p50,
+            "delta_standard_volume_p95": delta_p95,
+            "source_share_p50": source_share_p50,
+            "probability_source_loss": prob_loss,
+        })
+    
+    df = pd.DataFrame.from_records(records)
+    
+    # Exclude the selected SKU itself from sources (it's the destination)
+    # The selected SKU is the recipient, not a source
+    source_df = df[df["source_relationship"] != "selected_sku"].copy()
+    
+    # Aggregate by source_relationship for the Sankey
+    # Summarize at segment level
+    segment_cols = [
+        "source_relationship",
+        "baseline_standard_volume_p50",
+        "scenario_standard_volume_p50",
+        "delta_standard_volume_p05",
+        "delta_standard_volume_p50",
+        "delta_standard_volume_p95",
+        "source_share_p50",
+        "probability_source_loss",
+    ]
+    segment_summary = source_df.groupby("source_relationship", as_index=False)[
+        [c for c in segment_cols if c != "source_relationship"]
+    ].sum()
+    
+    # Compute probability that segment as a whole loses volume
+    # (proportion of draws where sum of segment deltas < 0)
+    segment_probs = []
+    for rel in segment_summary["source_relationship"]:
+        segment_skus = source_df[source_df["source_relationship"] == rel]["sku_idx"].values
+        if len(segment_skus) > 0:
+            segment_delta_sum = delta_draws[:, segment_skus].sum(axis=1)
+            prob = float(np.mean(segment_delta_sum < 0))
+        else:
+            prob = 0.0
+        segment_probs.append(prob)
+    segment_summary["probability_source_loss"] = segment_probs
+    
+    # Recompute source_share_p50 from aggregated deltas
+    total_source_delta = segment_summary["delta_standard_volume_p50"].sum()
+    if total_source_delta < -1e-6:
+        segment_summary["source_share_p50"] = segment_summary["delta_standard_volume_p50"] / total_source_delta
+    else:
+        segment_summary["source_share_p50"] = 0.0
+    
+    return segment_summary
+
+
+def create_reallocation_sankey(
+    source_df: pd.DataFrame,
+    selected_sku_label: str,
+    title: str = "Model-Implied Source of Selected SKU Growth",
+) -> go.Figure:
+    """
+    Create a Sankey diagram showing source segments feeding selected SKU growth.
+    
+    Args:
+        source_df: DataFrame from build_source_destination_summary (segment level)
+        selected_sku_label: Label for the destination node (selected SKU)
+        title: Chart title
+    
+    Returns:
+        Plotly Figure with Sankey diagram
+    """
+    if source_df.empty:
+        # Return empty figure with message
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No source-destination flow available (reconciliation failed or no data)",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="gray")
+        )
+        fig.update_layout(height=400, title=title)
+        return fig
+    
+    # Filter to segments with meaningful contribution
+    # (negative delta = source of volume)
+    source_segments = source_df[source_df["delta_standard_volume_p50"] < -1].copy()
+    
+    if source_segments.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No significant source segments identified (selected SKU may not gain volume)",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="gray")
+        )
+        fig.update_layout(height=400, title=title)
+        return fig
+    
+    # Node labels: sources + selected SKU
+    source_labels = source_segments["source_relationship"].tolist()
+    all_labels = source_labels + [selected_sku_label]
+    
+    # Node colors
+    source_colors = [
+        "#ef5350" if d < 0 else "#66bb6a"  # red for sources (losers), green for gains
+        for d in source_segments["delta_standard_volume_p50"]
+    ]
+    node_colors = source_colors + ["#1e88e5"]  # blue for selected SKU
+    
+    # Links: each source -> selected SKU
+    source_indices = list(range(len(source_labels)))
+    target_index = len(source_labels)  # selected SKU is last node
+    
+    # Link values: absolute delta for sources (positive flow)
+    link_values = (-source_segments["delta_standard_volume_p50"]).tolist()
+    link_colors = ["rgba(239, 83, 80, 0.4)"] * len(source_labels)  # semi-transparent red
+    
+    fig = go.Figure(data=[go.Sankey(
+        arrangement="snap",
+        node=dict(
+            pad=20,
+            thickness=20,
+            line=dict(color="black", width=0.5),
+            label=all_labels,
+            color=node_colors,
+        ),
+        link=dict(
+            source=source_indices,
+            target=[target_index] * len(source_labels),
+            value=link_values,
+            color=link_colors,
+            hovertemplate="%{source.label} → %{target.label}<br>Volume: %{value:,.0f} std units<extra></extra>",
+        ),
+    )])
+    
+    fig.update_layout(
+        title=dict(
+            text=title,
+            font=dict(size=16),
+            x=0.5,
+        ),
+        font=dict(size=12),
+        height=500,
+        margin=dict(l=20, r=20, t=60, b=20),
+    )
+    
+    return fig
+
+
+# ============================================================================
 # Retailer-Category Upper-Level Allocation (Phase 5) - Layer B
 # ============================================================================
 
