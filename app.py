@@ -1228,14 +1228,17 @@ def run_joint_scenario_from_actions(
     choice_data,
     posterior_cache: dict,
 ) -> dict:
-    """Run the joint SKU share model scenario based on checked actions."""
+    """Run the joint SKU share model scenario based on checked actions.
+    
+    Runs four true counterfactuals: baseline, price_only, distribution_only, combined.
+    """
     checked = action_df[action_df["include"]].copy()
     
     if checked.empty:
         st.warning("No actions selected. Check 'Include' for at least one row.")
         return {}
     
-    actions = []
+    full_actions = []
     for _, row in checked.iterrows():
         price_change_pct = row["price_change_pct"] / 100.0
         baseline_price_std = row["price_std"]
@@ -1265,63 +1268,110 @@ def run_joint_scenario_from_actions(
             new_nd=new_nd,
             nd_mode=nd_mode,
         )
-        actions.append(action)
+        full_actions.append(action)
     
-    with st.spinner("Running joint SKU share scenario..."):
+    price_actions = [
+        engine.ScenarioAction(
+            retailer=a.retailer,
+            category=a.category,
+            brand=a.brand,
+            sku=a.sku,
+            month=a.month,
+            new_price_std=a.new_price_std,
+            new_nd=None,
+            nd_mode=a.nd_mode,
+        )
+        for a in full_actions if a.new_price_std is not None
+    ]
+    
+    nd_actions = [
+        engine.ScenarioAction(
+            retailer=a.retailer,
+            category=a.category,
+            brand=a.brand,
+            sku=a.sku,
+            month=a.month,
+            new_price_std=None,
+            new_nd=a.new_nd,
+            nd_mode=a.nd_mode,
+        )
+        for a in full_actions if a.new_nd is not None
+    ]
+    
+    with st.spinner("Running joint SKU share scenario suite..."):
         n_draws = min(500, posterior_cache.get("beta_sku", np.array([0])).shape[0])
         if n_draws == 0:
             n_draws = 500
         
-        result = engine.run_joint_scenario_draws(
+        baseline_result = engine.run_joint_scenario_draws(
             choice_data=choice_data,
             posterior_cache=posterior_cache,
-            actions=actions,
+            actions=[],
             n_draws=n_draws,
             random_seed=42,
         )
         
-        recon = engine.check_scenario_reconciliation(result, choice_data)
+        price_only_result = engine.run_joint_scenario_draws(
+            choice_data=choice_data,
+            posterior_cache=posterior_cache,
+            actions=price_actions,
+            n_draws=n_draws,
+            random_seed=42,
+        ) if price_actions else baseline_result
+        
+        dist_only_result = engine.run_joint_scenario_draws(
+            choice_data=choice_data,
+            posterior_cache=posterior_cache,
+            actions=nd_actions,
+            n_draws=n_draws,
+            random_seed=42,
+        ) if nd_actions else baseline_result
+        
+        combined_result = engine.run_joint_scenario_draws(
+            choice_data=choice_data,
+            posterior_cache=posterior_cache,
+            actions=full_actions,
+            n_draws=n_draws,
+            random_seed=42,
+        )
+        
+        recon = engine.check_scenario_reconciliation(combined_result, choice_data)
         if not recon.get("all_passed", False):
             st.warning("Scenario reconciliation checks failed: " + ", ".join(
                 [k for k, v in recon.items() if not v and k != "all_passed"]
             ))
     
-    agg_sku = engine.aggregate_scenario_result(result, choice_data, level="sku")
+    baseline_agg = engine.aggregate_scenario_result(baseline_result, choice_data, level="sku")
+    price_only_agg = engine.aggregate_scenario_result(price_only_result, choice_data, level="sku")
+    dist_only_agg = engine.aggregate_scenario_result(dist_only_result, choice_data, level="sku")
+    combined_agg = engine.aggregate_scenario_result(combined_result, choice_data, level="sku")
     
-    baseline_df = agg_sku.copy()
-    baseline_df = baseline_df.rename(columns={
-        "baseline_units": "units_p50",
-        "scenario_units": "scenario_units",
-        "delta_units": "delta_units",
-    })
-    baseline_df["scenario"] = "baseline"
-    baseline_df["price_change"] = 0.0
-    baseline_df["nd_change"] = 0.0
+    def _prep_df(agg, scenario_label, avg_price_change, avg_nd_change):
+        df = agg.copy()
+        df = df.rename(columns={
+            "baseline_units": "units_p50",
+            "scenario_units": "scenario_units",
+            "delta_units": "delta_units",
+        })
+        df["scenario"] = scenario_label
+        df["price_change"] = avg_price_change
+        df["nd_change"] = avg_nd_change
+        return df
     
-    combined_df = agg_sku.copy()
-    combined_df = combined_df.rename(columns={
-        "baseline_units": "units_p50",
-        "scenario_units": "scenario_units",
-        "delta_units": "delta_units",
-    })
-    combined_df["scenario"] = "combined"
-    combined_df["price_change"] = checked["price_change_pct"].mean() / 100.0 if len(checked) > 0 else 0.0
-    combined_df["nd_change"] = checked["nd_change_pp"].mean() / 100.0 if len(checked) > 0 else 0.0
+    avg_price_change_pct = checked["price_change_pct"].mean() / 100.0 if len(checked) > 0 else 0.0
+    avg_nd_change_pp = checked["nd_change_pp"].mean() / 100.0 if len(checked) > 0 else 0.0
     
-    price_only_df = combined_df.copy()
-    price_only_df["scenario"] = "price_only"
-    price_only_df["nd_change"] = 0.0
-    
-    dist_only_df = combined_df.copy()
-    dist_only_df["scenario"] = "distribution_only"
-    dist_only_df["price_change"] = 0.0
+    baseline_df = _prep_df(baseline_agg, "baseline", 0.0, 0.0)
+    price_only_df = _prep_df(price_only_agg, "price_only", avg_price_change_pct, 0.0)
+    dist_only_df = _prep_df(dist_only_agg, "distribution_only", 0.0, avg_nd_change_pp)
+    combined_df = _prep_df(combined_agg, "combined", avg_price_change_pct, avg_nd_change_pp)
     
     return {
         "baseline": baseline_df,
         "price_only": price_only_df,
         "distribution_only": dist_only_df,
         "combined": combined_df,
-        "_joint_result": result,
+        "_joint_result": combined_result,
         "_joint_choice_data": choice_data,
     }
 
@@ -2276,8 +2326,11 @@ def render_scenario_cockpit_page(
             
             try:
                 waterfall = engine.create_driver_waterfall(
-                    scenarios["baseline"], scenarios.get("combined", scenarios["baseline"]),
-                    posterior_cache, spline, scales, meta
+                    scenarios["baseline"],
+                    scenarios["price_only"],
+                    scenarios["distribution_only"],
+                    scenarios["combined"],
+                    selected_sku,
                 )
                 st.plotly_chart(waterfall, use_container_width=True)
             except Exception as e:

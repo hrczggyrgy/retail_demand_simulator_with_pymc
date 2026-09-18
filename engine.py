@@ -705,7 +705,8 @@ class ChoiceSetData:
     # Core arrays
     observed_units: np.ndarray              # (n_markets, n_skus)
     market_total_units: np.ndarray          # (n_markets,)
-    relative_price: np.ndarray              # (n_markets, n_skus)
+    price_std: np.ndarray                   # (n_markets, n_skus) - absolute price per standard unit
+    relative_price: np.ndarray              # (n_markets, n_skus) - price_std / peer_price
     nd: np.ndarray                          # (n_markets, n_skus)
     available_mask: np.ndarray              # (n_markets, n_skus)
     # Mapping arrays
@@ -836,6 +837,7 @@ def build_choice_set_data(
     
     # Initialize padded arrays
     observed_units = np.zeros((n_markets, n_skus), dtype=np.float64)
+    price_std = np.zeros((n_markets, n_skus), dtype=np.float64)
     relative_price = np.ones((n_markets, n_skus), dtype=np.float64)
     nd_array = np.zeros((n_markets, n_skus), dtype=np.float64)
     available_mask = np.zeros((n_markets, n_skus), dtype=bool)
@@ -846,6 +848,7 @@ def build_choice_set_data(
         for _, row in market_df.iterrows():
             s_idx = sku_to_idx[row["sku"]]
             observed_units[m_idx, s_idx] = row["units"]
+            price_std[m_idx, s_idx] = row[price_col]
             relative_price[m_idx, s_idx] = row["relative_price"]
             nd_array[m_idx, s_idx] = row["nd"]
             # Available if ND > 0 (listed in at least one store)
@@ -873,6 +876,7 @@ def build_choice_set_data(
     return ChoiceSetData(
         observed_units=observed_units,
         market_total_units=market_total_units,
+        price_std=price_std,
         relative_price=relative_price,
         nd=nd_array,
         available_mask=available_mask,
@@ -1874,14 +1878,15 @@ def run_joint_scenario_draws(
     
     For each posterior draw:
     1. Compute baseline utilities and shares
-    2. Apply scenario actions (price/ND changes)
+    2. Apply scenario actions (price/ND changes) to absolute price_std
     3. Recalculate peer prices for affected markets
-    4. Recalculate utilities and shares
-    5. Draw baseline and scenario package units from Dirichlet-Multinomial
-    6. Compute deltas
+    4. Recompute relative prices for all SKUs in affected markets
+    5. Recalculate utilities and shares
+    6. Draw baseline and scenario package units from Dirichlet-Multinomial
+    7. Compute deltas
     
     Args:
-        choice_data: ChoiceSetData with baseline arrays
+        choice_data: ChoiceSetData with baseline arrays (including price_std)
         posterior_cache: Posterior parameter cache
         actions: List of ScenarioAction objects
         n_draws: Number of posterior draws to use (None = all in cache)
@@ -1900,28 +1905,25 @@ def run_joint_scenario_draws(
     
     n_markets, n_skus = choice_data.observed_units.shape
     
-    # Baseline price and ND
-    baseline_price = choice_data.relative_price * 1.0  # placeholder, need actual price_std
+    # Baseline absolute price and ND
+    baseline_price_std = choice_data.price_std.copy()
     baseline_nd = choice_data.nd.copy()
     baseline_available = choice_data.available_mask.copy()
     baseline_volume = choice_data.observed_units.copy()
     market_totals = choice_data.market_total_units.copy()
     
-    # For baseline, we need actual price_std to compute relative price
-    # Since we only have relative_price in choice_data, we'll work with relative_price directly
-    # The utility uses log(relative_price), so we can just modify relative_price
-    baseline_rel_price = choice_data.relative_price.copy()
-    
-    # Prepare scenario relative_price and ND
-    scenario_rel_price = baseline_rel_price.copy()
-    scenario_nd = baseline_nd.copy()
-    scenario_available = baseline_available.copy()
-    
     # Build market lookup
     market_lookup = {m_id: m_idx for m_idx, m_id in enumerate(choice_data.market_ids)}
     sku_lookup = choice_data.sku_to_idx
     
+    # Prepare scenario absolute price_std and ND
+    scenario_price_std = baseline_price_std.copy()
+    scenario_nd = baseline_nd.copy()
+    scenario_available = baseline_available.copy()
+    
     # Apply actions to scenario arrays
+    affected_markets = set()
+    
     for action in actions:
         month_str = pd.Timestamp(action.month).strftime("%Y-%m")
         m_id = f"{month_str}|{action.retailer}|{action.category}"
@@ -1932,37 +1934,34 @@ def run_joint_scenario_draws(
         if s_idx is None:
             continue
         
-        # Price change
-        if action.new_price_std is not None:
-            # Need to convert absolute price to relative price
-            # This requires peer price recalculation - simplified for now
-            old_price_std = baseline_rel_price[m_idx, s_idx]  # This is relative price, not absolute
-            # For proper implementation, we need absolute price and peer price
-            # Simplified: assume relative price changes proportionally
-            scenario_rel_price[m_idx, s_idx] = action.new_price_std
+        affected_markets.add(m_idx)
         
-        # ND change
+        # Price change - apply absolute price change
+        if action.new_price_std is not None:
+            scenario_price_std[m_idx, s_idx] = action.new_price_std
+        
+        # ND change - allow exact zero for ND=0 (unavailable)
         if action.new_nd is not None:
             if action.nd_mode == "pp":
-                scenario_nd[m_idx, s_idx] = np.clip(baseline_nd[m_idx, s_idx] + action.new_nd, 1e-4, 1.0)
+                scenario_nd[m_idx, s_idx] = baseline_nd[m_idx, s_idx] + action.new_nd
             elif action.nd_mode == "relative":
-                scenario_nd[m_idx, s_idx] = np.clip(baseline_nd[m_idx, s_idx] * (1 + action.new_nd), 1e-4, 1.0)
+                scenario_nd[m_idx, s_idx] = baseline_nd[m_idx, s_idx] * (1 + action.new_nd)
             elif action.nd_mode == "absolute":
-                scenario_nd[m_idx, s_idx] = np.clip(action.new_nd, 1e-4, 1.0)
+                scenario_nd[m_idx, s_idx] = action.new_nd
+            # Clip to [0, 1] - allow exact 0 for unavailable SKUs
+            scenario_nd[m_idx, s_idx] = np.clip(scenario_nd[m_idx, s_idx], 0.0, 1.0)
+            # Available if ND > 0
             scenario_available[m_idx, s_idx] = scenario_nd[m_idx, s_idx] > 0
     
-    # Recalculate peer prices for affected markets
-    # Group affected markets
-    affected_markets = set()
-    for action in actions:
-        month_str = pd.Timestamp(action.month).strftime("%Y-%m")
-        m_id = f"{month_str}|{action.retailer}|{action.category}"
-        if m_id in market_lookup:
-            affected_markets.add(market_lookup[m_id])
+    # Recalculate peer prices and relative prices for affected markets
+    # We need to recompute for ALL SKUs in affected markets because peer baskets change
+    # when any SKU's price changes
+    scenario_rel_price = _recompute_relative_prices(
+        choice_data, scenario_price_std, affected_markets
+    )
     
-    # Recompute peer prices for affected markets (simplified)
-    # Full implementation would recompute peer prices based on new absolute prices
-    # For now, we use the relative price directly
+    # Baseline relative price (precomputed in choice_data)
+    baseline_rel_price = choice_data.relative_price
     
     # Storage for results
     baseline_units_all = np.zeros((n_draws, n_markets, n_skus), dtype=np.float64)
@@ -1975,7 +1974,7 @@ def run_joint_scenario_draws(
         # Baseline
         baseline_utility = _compute_utility(
             choice_data, posterior_cache, d,
-            np.exp(np.log(np.maximum(baseline_rel_price, 1e-4))),  # price_std proxy
+            baseline_rel_price,
             baseline_nd,
             baseline_available,
         )
@@ -1984,7 +1983,7 @@ def run_joint_scenario_draws(
         # Scenario
         scenario_utility = _compute_utility(
             choice_data, posterior_cache, d,
-            np.exp(np.log(np.maximum(scenario_rel_price, 1e-4))),
+            scenario_rel_price,
             scenario_nd,
             scenario_available,
         )
@@ -2034,6 +2033,52 @@ def run_joint_scenario_draws(
     )
 
 
+def _recompute_relative_prices(
+    choice_data: ChoiceSetData,
+    price_std: np.ndarray,
+    affected_markets: set[int],
+) -> np.ndarray:
+    """
+    Recompute relative prices for all SKUs in affected markets.
+    
+    Relative price = price_std / peer_price, where peer_price is the
+    volume-weighted average of OTHER SKUs in the same retailer-category-pack_group-month.
+    """
+    n_markets, n_skus = price_std.shape
+    rel_price = choice_data.relative_price.copy()
+    
+    sku_pack_group = choice_data.sku_pack_group_idx
+    baseline_volume = choice_data.observed_units
+    
+    for m_idx in affected_markets:
+        avail = choice_data.available_mask[m_idx]
+        market_skus = np.where(avail)[0]
+        
+        if len(market_skus) <= 1:
+            for s_idx in market_skus:
+                rel_price[m_idx, s_idx] = 1.0
+            continue
+        
+        for s_idx in market_skus:
+            pg = sku_pack_group[s_idx]
+            other_skus = [s for s in market_skus if s != s_idx and sku_pack_group[s] == pg]
+            if len(other_skus) == 0:
+                rel_price[m_idx, s_idx] = 1.0
+                continue
+            
+            other_vol = baseline_volume[m_idx, other_skus]
+            other_price = price_std[m_idx, other_skus]
+            if other_vol.sum() > 0:
+                peer_price = np.sum(other_price * other_vol) / np.sum(other_vol)
+                rel_price[m_idx, s_idx] = price_std[m_idx, s_idx] / peer_price
+            else:
+                rel_price[m_idx, s_idx] = 1.0
+    
+    rel_price = np.where(np.isfinite(rel_price), rel_price, 1.0)
+    
+    return rel_price
+
+
 def aggregate_scenario_result(
     result: ScenarioResult,
     choice_data: ChoiceSetData,
@@ -2043,22 +2088,23 @@ def aggregate_scenario_result(
     Aggregate scenario results to specified level.
     
     Levels: market, retailer, category, brand, sku, brand_pack
+    
+    Aggregation is done per-draw first, then quantiles are computed
+    over the aggregated draw distribution (correct uncertainty propagation).
     """
     n_markets, n_skus = choice_data.observed_units.shape
     sku_ids = choice_data.sku_ids
+    n_draws = result.baseline_units.shape[0]
     
     # Build SKU metadata DataFrame
     sku_meta = []
     for s_idx, sku in enumerate(sku_ids):
-        # Get brand from sku_brand_idx
         brand_idx = choice_data.sku_brand_idx[s_idx]
         brand = choice_data.brand_levels[brand_idx]
         
-        # Get category from sku_category_idx
         cat_idx = choice_data.sku_category_idx[s_idx]
         category = choice_data.category_levels[cat_idx]
         
-        # Get pack_group from sku_pack_group_idx
         pg_idx = choice_data.sku_pack_group_idx[s_idx]
         pack_group = choice_data.pack_group_levels[pg_idx]
         
@@ -2092,40 +2138,7 @@ def aggregate_scenario_result(
         })
     market_meta_df = pd.DataFrame(market_meta)
     
-    # Use p50 (median) for aggregation
-    baseline = result.baseline_units_p50  # (n_markets, n_skus)
-    scenario = result.scenario_units_p50  # (n_markets, n_skus)
-    delta_p50 = result.delta_units_p50
-    delta_p05 = result.delta_units_p05
-    delta_p95 = result.delta_units_p95
-    
-    # Flatten to long format
-    records = []
-    for m_idx in range(n_markets):
-        m_info = market_meta_df.iloc[m_idx]
-        for s_idx in range(n_skus):
-            s_info = sku_meta_df.iloc[s_idx]
-            records.append({
-                "market_idx": m_idx,
-                "market_id": m_info["market_id"],
-                "retailer": m_info["retailer"],
-                "category": m_info["category"],
-                "month": m_info["month"],
-                "sku_idx": s_idx,
-                "sku": s_info["sku"],
-                "brand": s_info["brand"],
-                "pack_group": s_info["pack_group"],
-                "baseline_units": baseline[m_idx, s_idx],
-                "scenario_units": scenario[m_idx, s_idx],
-                "delta_units": scenario[m_idx, s_idx] - baseline[m_idx, s_idx],
-                "delta_p05": delta_p05[m_idx, s_idx],
-                "delta_p50": delta_p50[m_idx, s_idx],
-                "delta_p95": delta_p95[m_idx, s_idx],
-            })
-    
-    df = pd.DataFrame(records)
-    
-    # Aggregate based on level
+    # Determine grouping columns
     if level == "market":
         group_cols = []
     elif level == "retailer":
@@ -2145,24 +2158,70 @@ def aggregate_scenario_result(
     else:
         raise ValueError(f"Unknown level: {level}")
     
-    if group_cols:
-        agg = df.groupby(group_cols, as_index=False).agg(
-            baseline_units=("baseline_units", "sum"),
-            scenario_units=("scenario_units", "sum"),
-            delta_units=("delta_units", "sum"),
-            delta_p05=("delta_p05", "sum"),
-            delta_p50=("delta_p50", "sum"),
-            delta_p95=("delta_p95", "sum"),
+    # Build groupby keys for each SKU/market combination
+    # We'll create a mapping from (market_idx, sku_idx) to group keys
+    group_keys = {}
+    for m_idx in range(n_markets):
+        m_info = market_meta_df.iloc[m_idx]
+        for s_idx in range(n_skus):
+            s_info = sku_meta_df.iloc[s_idx]
+            if group_cols:
+                key = tuple(m_info[col] if col in m_info else s_info[col] for col in group_cols)
+            else:
+                key = ()
+            group_keys[(m_idx, s_idx)] = key
+    
+    # Get unique group keys
+    unique_keys = sorted(set(group_keys.values()))
+    key_to_idx = {k: i for i, k in enumerate(unique_keys)}
+    n_groups = len(unique_keys)
+    
+    # Aggregate per draw, then compute quantiles
+    baseline_agg_draws = np.zeros((n_draws, n_groups), dtype=np.float64)
+    scenario_agg_draws = np.zeros((n_draws, n_groups), dtype=np.float64)
+    
+    for d in range(n_draws):
+        for (m_idx, s_idx), key in group_keys.items():
+            g_idx = key_to_idx[key]
+            baseline_agg_draws[d, g_idx] += result.baseline_units[d, m_idx, s_idx]
+            scenario_agg_draws[d, g_idx] += result.scenario_units[d, m_idx, s_idx]
+    
+    delta_agg_draws = scenario_agg_draws - baseline_agg_draws
+    
+    # Compute quantiles across draws
+    def quantiles(arr, axis=0):
+        return (
+            np.quantile(arr, 0.05, axis=axis),
+            np.quantile(arr, 0.50, axis=axis),
+            np.quantile(arr, 0.95, axis=axis),
         )
+    
+    baseline_p05, baseline_p50, baseline_p95 = quantiles(baseline_agg_draws)
+    scenario_p05, scenario_p50, scenario_p95 = quantiles(scenario_agg_draws)
+    delta_p05, delta_p50, delta_p95 = quantiles(delta_agg_draws)
+    
+    # Build result DataFrame
+    if group_cols:
+        rows = []
+        for key in unique_keys:
+            row = {}
+            for i, col in enumerate(group_cols):
+                row[col] = key[i]
+            rows.append(row)
+        agg = pd.DataFrame(rows)
     else:
-        agg = pd.DataFrame([{
-            "baseline_units": df["baseline_units"].sum(),
-            "scenario_units": df["scenario_units"].sum(),
-            "delta_units": df["delta_units"].sum(),
-            "delta_p05": df["delta_p05"].sum(),
-            "delta_p50": df["delta_p50"].sum(),
-            "delta_p95": df["delta_p95"].sum(),
-        }])
+        agg = pd.DataFrame([{}])
+    
+    agg["baseline_units"] = baseline_p50
+    agg["baseline_units_p05"] = baseline_p05
+    agg["baseline_units_p95"] = baseline_p95
+    agg["scenario_units"] = scenario_p50
+    agg["scenario_units_p05"] = scenario_p05
+    agg["scenario_units_p95"] = scenario_p95
+    agg["delta_units"] = delta_p50
+    agg["delta_units_p05"] = delta_p05
+    agg["delta_units_p50"] = delta_p50
+    agg["delta_units_p95"] = delta_p95
     
     # Add pct change
     agg["delta_units_pct"] = np.where(
@@ -2228,11 +2287,19 @@ def check_scenario_reconciliation(
         checks["scenario_units_match_totals"] = False
         checks["details"].append("Scenario units don't match market totals")
     
-    # Delta consistency: sum of deltas should be zero (market held fixed)
-    delta_sum = result.delta_units_p50.sum()
-    if abs(delta_sum) > tol:
+    # Delta consistency: sum of deltas should be zero per market per draw (market held fixed)
+    delta_per_draw_market = (result.scenario_units - result.baseline_units).sum(axis=2)  # (n_draws, n_markets)
+    if not np.allclose(delta_per_draw_market, 0.0, atol=tol):
         checks["delta_consistency"] = False
-        checks["details"].append(f"Total delta = {delta_sum:.4f} (expected 0)")
+        max_delta = np.abs(delta_per_draw_market).max()
+        checks["details"].append(f"Max per-market per-draw delta = {max_delta:.4f} (expected 0)")
+    
+    # Also check total delta across all markets for completeness
+    total_delta = delta_per_draw_market.sum(axis=1)  # (n_draws,)
+    if not np.allclose(total_delta, 0.0, atol=tol):
+        checks["delta_consistency"] = False
+        max_total_delta = np.abs(total_delta).max()
+        checks["details"].append(f"Max total delta across markets = {max_total_delta:.4f} (expected 0)")
     
     checks["all_passed"] = all([
         checks["baseline_shares_sum_to_one"],
@@ -3109,6 +3176,8 @@ def summarize_convergence_diagnostics(
     min_ess_bulk = None
     min_ess_tail = None
     coverage_90 = None
+    min_bfmi = None
+    max_tree_depth = None
 
     try:
         summary = az.summary(idata, round_to=None, kind="diagnostics")
@@ -3120,6 +3189,19 @@ def summarize_convergence_diagnostics(
             min_ess_tail = float(summary["ess_tail"].min())
     except (ValueError, KeyError, AttributeError, RuntimeError):
         pass
+
+    # E-BFMI and max tree depth from sample_stats
+    if hasattr(idata, "sample_stats"):
+        if "bfmi" in idata.sample_stats:
+            try:
+                min_bfmi = float(idata.sample_stats["bfmi"].min().item())
+            except (ValueError, AttributeError):
+                pass
+        if "tree_depth" in idata.sample_stats:
+            try:
+                max_tree_depth = float(idata.sample_stats["tree_depth"].max().item())
+            except (ValueError, AttributeError):
+                pass
 
     # Posterior predictive coverage
     if (hasattr(idata, "posterior_predictive") and predictive_var in idata.posterior_predictive
@@ -3133,10 +3215,17 @@ def summarize_convergence_diagnostics(
         except (KeyError, ValueError, AttributeError, IndexError):
             pass
 
+    # Missing diagnostics fail - require all checks to be present and pass
     is_acceptable = (
         divergences == 0
-        and (max_rhat is None or max_rhat < 1.01)
-        and (min_ess_bulk is None or min_ess_bulk > 400)
+        and max_rhat is not None
+        and max_rhat < 1.01
+        and min_ess_bulk is not None
+        and min_ess_bulk >= 400
+        and min_ess_tail is not None
+        and min_ess_tail >= 400
+        and (min_bfmi is None or min_bfmi >= 0.3)
+        and (max_tree_depth is None or max_tree_depth < 10)
     )
 
     return ConvergenceDiagnostics(
@@ -6170,56 +6259,64 @@ def run_scenario_suite_actions(
 
 def create_driver_waterfall(
     baseline_df: pd.DataFrame,
-    scenario_df: pd.DataFrame,
+    price_only_df: pd.DataFrame,
+    distribution_only_df: pd.DataFrame,
+    combined_df: pd.DataFrame,
     selected_sku: str = None,
 ) -> pd.DataFrame:
     """
-    Create driver decomposition waterfall data.
+    Create driver decomposition waterfall data from four counterfactual scenarios.
     
-    Returns DataFrame with components:
+    Decomposition:
     - Baseline standard volume
-    - Price-associated velocity change
-    - Mechanical new-store / ND effect
-    - Nonlinear ND velocity effect
-    - Price × ND interaction
+    - Price effect = price_only - baseline
+    - ND effect = distribution_only - baseline
+    - Interaction = combined - price_only - distribution_only + baseline
     - Scenario standard volume
+    
+    This follows the standard 2x2 factorial decomposition.
     """
     if selected_sku:
         base = baseline_df[baseline_df["sku"] == selected_sku].copy()
-        scen = scenario_df[scenario_df["sku"] == selected_sku].copy()
+        price = price_only_df[price_only_df["sku"] == selected_sku].copy()
+        dist = distribution_only_df[distribution_only_df["sku"] == selected_sku].copy()
+        comb = combined_df[combined_df["sku"] == selected_sku].copy()
     else:
         base = baseline_df.copy()
-        scen = scenario_df.copy()
+        price = price_only_df.copy()
+        dist = distribution_only_df.copy()
+        comb = combined_df.copy()
     
-    if base.empty or scen.empty:
+    if base.empty or comb.empty:
         return pd.DataFrame()
     
-    # Aggregate
+    # Aggregate standard volume
     base_q = base["standard_volume"].sum()
-    scen_q = scen["standard_volume"].sum()
+    price_q = price["standard_volume"].sum() if not price.empty else base_q
+    dist_q = dist["standard_volume"].sum() if not dist.empty else base_q
+    comb_q = comb["standard_volume"].sum()
     
-    # Calculate components from the scenario math
-    # We need to extract the effects from the scenario calculations
-    # For now, return a structured summary that can be used for waterfall
+    # Compute components
+    price_effect = price_q - base_q
+    nd_effect = dist_q - base_q
+    interaction = comb_q - price_q - dist_q + base_q
     
     components = pd.DataFrame({
         "component": [
             "Baseline standard volume",
-            "Price-associated velocity change",
-            "Mechanical new-store / ND effect",
-            "Nonlinear ND velocity effect",
+            "Price effect",
+            "ND effect",
             "Price × ND interaction",
             "Scenario standard volume",
         ],
         "value": [
             base_q,
-            scen_q - base_q,  # Placeholder - needs proper decomposition
-            0.0,
-            0.0,
-            0.0,
-            scen_q,
+            price_effect,
+            nd_effect,
+            interaction,
+            comb_q,
         ],
-        "is_delta": [False, True, True, True, True, False],
+        "is_delta": [False, True, True, True, False],
     })
     
     return components
