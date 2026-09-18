@@ -67,13 +67,10 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------------
-# Constants & column mapping
+# Constants & column mapping (from contracts - single source of truth)
 # ---------------------------------------------------------------------------
 
-REQUIRED_RAW_COLUMNS = {
-    "month", "retailer", "category", "brand", "sku",
-    "units", "revenue", "sku_stores", "retailer_stores", "pack_size"
-}
+from contracts import REQUIRED_COLUMNS as REQUIRED_RAW_COLUMNS
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2330,7 +2327,7 @@ def render_scenario_cockpit_page(
                     scenarios["price_only"],
                     scenarios["distribution_only"],
                     scenarios["combined"],
-                    selected_sku,
+                    target_sku,
                 )
                 st.plotly_chart(waterfall, use_container_width=True)
             except Exception as e:

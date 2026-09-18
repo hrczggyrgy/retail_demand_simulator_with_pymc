@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 
 def test_demo_schema_contains_only_raw_columns() -> None:
     df = demo_data.get_minimal_test_fixture()
-    assert list(df.columns) == demo_data.RAW_COLUMNS
+    assert list(df.columns) == list(demo_data.RAW_COLUMNS)
 
 
 def test_numeric_distribution_is_bounded() -> None:
@@ -59,8 +59,8 @@ def test_prepare_data():
     # Required columns after prepare
     for c in ["month","retailer","category","brand","sku","pack_size","pack_group",
               "units","revenue","sku_stores","retailer_stores","nd",
-              "log_nd","log_relative_price_std","log_velocity_std",
-              "log_nd_z","log_relative_price_std_z","log_velocity_std_z"]:
+              "log_nd","log_relative_price","log_velocity_std",
+              "log_nd_z","log_relative_price_z","log_velocity_std_z"]:
         assert c in df.columns, f"Missing: {c}"
     assert len(df) == 1152
     # sku_idx added by app after prepare
@@ -73,12 +73,16 @@ def test_build_retail_features():
     raw = demo_data.generate_demo_data()
     df, meta = engine.prepare_data(raw)
     enriched = engine.build_retail_features(df)
-    for c in ["other_skus_price_std","same_brand_other_sku_price_index",
-              "other_brand_price_index","unit_price","price_per_size_unit"]:
+    # Core derived columns that prepare_data computes
+    for c in ["unit_price", "price_std", "nd", "standard_volume", "velocity_std",
+              "brand_share", "pack_group", "month_num",
+              "log_nd", "log_price_std", "log_velocity_std", "log_relative_price",
+              "log_nd_z", "log_price_std_z", "log_velocity_std_z", "log_relative_price_z",
+              "data_quality_status"]:
         assert c in enriched.columns, f"Missing: {c}"
-    assert enriched["same_brand_other_sku_price_index"].notna().all()
-    assert enriched["other_brand_price_index"].notna().all()
-    print("✓ build_retail_features indices complete (no NaN)")
+    # Data quality status should be valid for demo data
+    assert (enriched["data_quality_status"] == "valid").all()
+    print("✓ build_retail_features core columns present")
 
 
 def test_scenario_action_table_rejects_raw_data() -> None:

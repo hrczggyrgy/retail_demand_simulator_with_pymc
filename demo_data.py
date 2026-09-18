@@ -7,10 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from engine import REQUIRED_COLUMNS
-
-# Exported raw column schema (exactly 10 columns)
-RAW_COLUMNS = REQUIRED_COLUMNS
+from contracts import RAW_COLUMNS, REQUIRED_COLUMNS
 
 
 def get_input_template() -> pd.DataFrame:
