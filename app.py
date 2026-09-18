@@ -1672,8 +1672,8 @@ def render_winner_loser_analysis(
     
     # Merge baseline and combined
     if "sku" in baseline.columns and "sku" in combined.columns:
-        merged = combined[["sku", "units_p50", "baseline_units", "delta_p05", "delta_p50", "delta_p95"]].copy()
-        merged = merged.rename(columns={"units_p50": "scenario_units_p50"})
+        merged = combined[["sku", "units_p50", "scenario_units", "delta_p05", "delta_p50", "delta_p95"]].copy()
+        merged = merged.rename(columns={"scenario_units": "scenario_units_p50"})
         
         # Add metadata
         if "brand" in combined.columns:

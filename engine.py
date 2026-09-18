@@ -2095,6 +2095,9 @@ def aggregate_scenario_result(
     # Use p50 (median) for aggregation
     baseline = result.baseline_units_p50  # (n_markets, n_skus)
     scenario = result.scenario_units_p50  # (n_markets, n_skus)
+    delta_p50 = result.delta_units_p50
+    delta_p05 = result.delta_units_p05
+    delta_p95 = result.delta_units_p95
     
     # Flatten to long format
     records = []
@@ -2115,6 +2118,9 @@ def aggregate_scenario_result(
                 "baseline_units": baseline[m_idx, s_idx],
                 "scenario_units": scenario[m_idx, s_idx],
                 "delta_units": scenario[m_idx, s_idx] - baseline[m_idx, s_idx],
+                "delta_p05": delta_p05[m_idx, s_idx],
+                "delta_p50": delta_p50[m_idx, s_idx],
+                "delta_p95": delta_p95[m_idx, s_idx],
             })
     
     df = pd.DataFrame(records)
@@ -2144,12 +2150,18 @@ def aggregate_scenario_result(
             baseline_units=("baseline_units", "sum"),
             scenario_units=("scenario_units", "sum"),
             delta_units=("delta_units", "sum"),
+            delta_p05=("delta_p05", "sum"),
+            delta_p50=("delta_p50", "sum"),
+            delta_p95=("delta_p95", "sum"),
         )
     else:
         agg = pd.DataFrame([{
             "baseline_units": df["baseline_units"].sum(),
             "scenario_units": df["scenario_units"].sum(),
             "delta_units": df["delta_units"].sum(),
+            "delta_p05": df["delta_p05"].sum(),
+            "delta_p50": df["delta_p50"].sum(),
+            "delta_p95": df["delta_p95"].sum(),
         }])
     
     # Add pct change
