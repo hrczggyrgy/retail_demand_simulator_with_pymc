@@ -277,7 +277,7 @@ class ScenarioPlan:
 # ENGINE CORE TYPES
 # =============================================================================
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=False, slots=True)
 class ChoiceSetData:
     """Container for all choice-set arrays and metadata for the SKU allocation model."""
     # Core arrays

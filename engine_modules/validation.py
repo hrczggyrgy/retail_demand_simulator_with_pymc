@@ -192,6 +192,35 @@ def prepare_data(
     df["relative_price"] = df["price_std"] / df["peer_price_std"]
     df["relative_price"] = df["relative_price"].replace([np.inf, -np.inf], np.nan).fillna(1.0)
 
+    # Same-brand other-SKU price index: volume-weighted avg price of other SKUs sharing the brand identifier
+    df["_pxu"] = df["price_std"] * df["standard_volume"]
+
+    brand_grp = ["month", "retailer", "category", "brand"]
+    brand_pu = df.groupby(brand_grp)["_pxu"].transform("sum")
+    brand_v = df.groupby(brand_grp)["standard_volume"].transform("sum")
+
+    own_denom = brand_v - df["standard_volume"]
+    df["same_brand_other_sku_price_index"] = np.where(
+        own_denom > 0,
+        (brand_pu - df["_pxu"]) / own_denom,
+        np.nan,
+    )
+
+    # Other-brand price index: volume-weighted avg price of all other brands
+    cat_grp = ["month", "retailer", "category"]
+    cat_pu = df.groupby(cat_grp)["_pxu"].transform("sum")
+    cat_v = df.groupby(cat_grp)["standard_volume"].transform("sum")
+
+    comp_denom = cat_v - brand_v
+    df["other_brand_price_index"] = np.where(
+        comp_denom > 0,
+        (cat_pu - brand_pu) / comp_denom,
+        np.nan,
+    )
+
+    # Clean up temporary column
+    df.drop(columns=["_pxu"], inplace=True)
+
     # Month number for seasonality
     df["month_num"] = df["month"].dt.month
 

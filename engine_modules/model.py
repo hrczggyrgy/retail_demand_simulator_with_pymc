@@ -275,6 +275,24 @@ class JointModelConfig:
     chains: int = 4
     target_accept: float = 0.98
     random_seed: int = 42
+    
+    # Legacy hierarchy options (kept for backward compatibility, not used in current model)
+    use_category_price_pooling: bool = True
+    use_sku_nd_effects: bool = True
+    use_category_nesting: bool = True
+    
+    # Legacy prior scales (kept for backward compatibility)
+    beta_category_mu: float = -1.0
+    beta_category_sigma: float = 0.75
+    sigma_beta_brand: float = 0.35
+    sigma_beta_sku: float = 0.25
+    sigma_gamma1: float = 0.5
+    sigma_gamma2: float = 0.5
+    sigma_alpha_retailer_sku: float = 0.7
+    sigma_alpha_sku: float = 0.5
+    
+    # Legacy concentration prior
+    concentration_sigma: float = 1.0
 
 
 def build_joint_model(
@@ -336,22 +354,22 @@ def build_joint_model(
 
         # Retailer×SKU effects (non-centered) - tighter prior, explicit init
         sigma_rs = pm.HalfNormal("sigma_rs", 0.3)
-        alpha_rs_raw = pm.Normal("alpha_rs_raw", 0.0, 1.0, shape=(n_retailers, n_skus), initval=0.0)
+        alpha_rs_raw = pm.Normal("alpha_rs_raw", 0.0, 1.0, shape=(n_retailers, n_skus), initval=np.zeros((n_retailers, n_skus)))
         alpha_rs = pm.Deterministic("alpha_rs", sigma_rs * alpha_rs_raw)
 
         # Price slope by SKU (non-centered, pooled by brand) - tighter prior, negative expected
         sigma_beta = pm.HalfNormal("sigma_beta", 0.3)
-        beta_sku_raw = pm.Normal("beta_sku_raw", 0.0, 1.0, shape=n_skus, initval=0.0)
+        beta_sku_raw = pm.Normal("beta_sku_raw", 0.0, 1.0, shape=n_skus, initval=np.zeros(n_skus))
         beta_sku = pm.Deterministic("beta_sku", -sigma_beta * beta_sku_raw)  # Negative elasticity
 
         # ND linear coefficient by SKU - tighter prior
         sigma_gamma1 = pm.HalfNormal("sigma_gamma1", 0.3)
-        gamma1_sku_raw = pm.Normal("gamma1_sku_raw", 0.0, 1.0, shape=n_skus, initval=0.0)
+        gamma1_sku_raw = pm.Normal("gamma1_sku_raw", 0.0, 1.0, shape=n_skus, initval=np.zeros(n_skus))
         gamma1_sku = pm.Deterministic("gamma1_sku", sigma_gamma1 * gamma1_sku_raw)
 
         # ND quadratic coefficient by SKU - tighter prior, negative for concave
         sigma_gamma2 = pm.HalfNormal("sigma_gamma2", 0.3)
-        gamma2_sku_raw = pm.Normal("gamma2_sku_raw", 0.0, 1.0, shape=n_skus, initval=0.0)
+        gamma2_sku_raw = pm.Normal("gamma2_sku_raw", 0.0, 1.0, shape=n_skus, initval=np.zeros(n_skus))
         gamma2_sku = pm.Deterministic("gamma2_sku", -sigma_gamma2 * gamma2_sku_raw)  # Concave
 
         # Pack group effect - tighter prior
@@ -359,7 +377,7 @@ def build_joint_model(
 
         # Category-month effect - tighter prior
         sigma_cat_month = pm.HalfNormal("sigma_cat_month", 0.25)
-        cat_month_raw = pm.Normal("cat_month_raw", 0.0, 1.0, shape=(n_categories, n_months), initval=0.0)
+        cat_month_raw = pm.Normal("cat_month_raw", 0.0, 1.0, shape=(n_categories, n_months), initval=np.zeros((n_categories, n_months)))
         cat_month_effect = pm.Deterministic("cat_month_effect", sigma_cat_month * cat_month_raw)
 
         # Concentration parameter for Dirichlet-Multinomial - shifted prior
@@ -425,10 +443,13 @@ def build_joint_model(
         )
 
         # Softmax shares
-        shares = pm.Deterministic("shares", pm.math.softmax(utility, axis=1))
+        sku_share = pm.Deterministic("sku_share", pm.math.softmax(utility, axis=1))
+
+        # Inclusive value (log-sum-exp of utilities) for nested logit compatibility
+        inclusive_value = pm.Deterministic("inclusive_value", pm.math.logsumexp(utility, axis=1))
 
         # Dirichlet-Multinomial likelihood
-        alpha_dm = concentration * shares
+        alpha_dm = concentration * sku_share
         pm.DirichletMultinomial(
             "sku_units_obs",
             a=alpha_dm,
