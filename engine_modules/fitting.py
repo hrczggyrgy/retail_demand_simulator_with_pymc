@@ -4,12 +4,10 @@ Model fitting and sampling utilities.
 
 from __future__ import annotations
 
-from typing import Any
-
 import arviz as az
 import pymc as pm
 
-from contracts import ModelConfig, FAST_CONFIG, DEFAULT_CONFIG, ADVANCED_CONFIG, JOINT_CONFIG
+from contracts import ADVANCED_CONFIG, DEFAULT_CONFIG, FAST_CONFIG, JOINT_CONFIG, ModelConfig
 from engine_modules.model import JointModelConfig
 
 

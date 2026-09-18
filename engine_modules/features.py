@@ -9,12 +9,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from contracts import (
-    REQUIRED_COLUMNS,
-    NUMERIC_RAW_COLUMNS as NUMERIC_COLUMNS,
-    KEY_COLUMNS,
-)
-
 
 def make_pack_group(pack_size: pd.Series) -> pd.Series:
     """Map continuous pack_size to discrete pack groups."""

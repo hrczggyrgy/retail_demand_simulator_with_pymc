@@ -2,12 +2,12 @@
 """Comprehensive test of app functionality: data, model, tabs, scenarios, reasonable outputs."""
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import pytest
 
 import demo_data
 import engine
 from engine import REQUIRED_COLUMNS
-import plotly.graph_objects as go
 
 # ============================================================
 # Issue 2: Deterministic fixtures and engine tests

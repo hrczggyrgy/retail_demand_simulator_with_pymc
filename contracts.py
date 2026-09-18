@@ -231,6 +231,47 @@ class ScenarioPlan:
         if len(keys) != len(set(keys)):
             raise ValueError("Duplicate (month, retailer, sku) in scenario actions")
 
+    @classmethod
+    def from_action_table(cls, action_df: pd.DataFrame, name: str = "Custom Scenario") -> ScenarioPlan:
+        """Build a ScenarioPlan from the editable action table DataFrame."""
+        checked = action_df[action_df.get("include", False)].copy()
+        if checked.empty:
+            raise ValueError("No actions selected (check 'Include' column)")
+        
+        actions = []
+        for _, row in checked.iterrows():
+            price_change_pct = row.get("price_change_pct", 0.0) / 100.0
+            baseline_price_std = row.get("price_std", 0.0)
+            new_price_std = baseline_price_std * (1 + price_change_pct) if price_change_pct != 0 else None
+            
+            nd_change_pp = row.get("nd_change_pp", 0.0) / 100.0
+            nd_mode = row.get("nd_mode", "pp")
+            if nd_change_pp != 0:
+                if nd_mode == "pp":
+                    new_nd = row["nd"] + nd_change_pp
+                elif nd_mode == "relative":
+                    new_nd = row["nd"] * (1 + nd_change_pp)
+                elif nd_mode == "absolute":
+                    new_nd = nd_change_pp
+                else:
+                    new_nd = None
+            else:
+                new_nd = None
+            
+            action = ScenarioAction(
+                retailer=row["retailer"],
+                category=row["category"],
+                brand=row["brand"],
+                sku=row["sku"],
+                month=str(row["month"]),
+                new_price_std=new_price_std,
+                new_nd=new_nd,
+                nd_mode=nd_mode,
+            )
+            actions.append(action)
+        
+        return cls(actions=tuple(actions), name=name)
+
 
 # =============================================================================
 # ENGINE CORE TYPES
@@ -287,6 +328,63 @@ class ScenarioResult:
     # Metadata
     choice_data: ChoiceSetData
     actions: tuple[ScenarioAction, ...]
+
+
+# =============================================================================
+# MARKET-FIRST OUTCOME CONTRACT (market-level scenario results)
+# =============================================================================
+
+@dataclass(frozen=True, slots=True)
+class MarketOutcome:
+    """
+    Market-level scenario outcome - the primary commercial answer.
+    
+    Aggregated to retailer×category level (the decision unit).
+    Shows total market volume change, selected SKU/brand impact,
+    and competitor reallocation sources.
+    """
+    market_id: str                          # "retailer|category"
+    retailer: str
+    category: str
+    # Baseline vs scenario
+    baseline_volume: float
+    scenario_volume: float
+    delta_volume: float
+    delta_volume_pct: float
+    # Share impact
+    baseline_share: float
+    scenario_share: float
+    delta_share_pp: float
+    # Revenue
+    baseline_revenue: float
+    scenario_revenue: float
+    delta_revenue: float
+    # Selected focal SKU impact (if single action)
+    focal_sku: str | None = None
+    focal_baseline_volume: float | None = None
+    focal_scenario_volume: float | None = None
+    focal_delta_volume: float | None = None
+    # Competitor reallocation sources (per-draw median)
+    competitor_sources: dict[str, float] | None = None  # {source_label: delta_volume}
+    # Confidence
+    probability_positive: float = 0.5
+    is_decision_ready: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioOutcome:
+    """
+    Complete scenario outcome bundle.
+    
+    Contains market-level outcomes (primary) plus SKU-level detail (secondary).
+    """
+    plan: ScenarioPlan
+    market_outcomes: tuple[MarketOutcome, ...]
+    sku_outcomes: pd.DataFrame              # Per-SKU deltas with intervals
+    driver_waterfall: pd.DataFrame | None = None  # Price vs ND vs Interaction
+    source_destination: pd.DataFrame | None = None  # Reallocation flows
+    reconciliation_passed: bool = True
+    diagnostics: ConvergenceDiagnostics | None = None
 
 
 # =============================================================================

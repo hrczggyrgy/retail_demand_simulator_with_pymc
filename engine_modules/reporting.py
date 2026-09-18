@@ -9,7 +9,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-
 # Common aggregation metrics for descriptive summaries
 _SUMMARY_METRICS = {
     "revenue": ("revenue", "sum"),

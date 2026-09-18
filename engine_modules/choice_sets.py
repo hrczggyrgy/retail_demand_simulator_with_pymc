@@ -7,17 +7,14 @@ for the Dirichlet-Multinomial choice model.
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 import pandas as pd
 
 from contracts import (
-    ChoiceSetData,
-    DERIVED_COLUMNS,
+    ND,
     PRICE_STD,
     RELATIVE_PRICE,
-    ND,
+    ChoiceSetData,
 )
 
 

@@ -10,8 +10,10 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 
-from contracts import ModelConfig, FAST_CONFIG, DEFAULT_CONFIG, ADVANCED_CONFIG, JOINT_CONFIG
-from engine_modules.choice_sets import ChoiceSetData, _compute_peer_price_matrix, _recompute_relative_prices
+from contracts import DEFAULT_CONFIG, ModelConfig
+from engine_modules.choice_sets import (
+    ChoiceSetData,
+)
 
 
 def build_pymc_model(
@@ -262,7 +264,7 @@ def build_pymc_model_v2(
 # Joint SKU Market-Share Model (Dirichlet-Multinomial)
 # =============================================================================
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +288,11 @@ def build_joint_model(
     - Utilities: U[m,s] = alpha_rs + beta_s * log_rel_price + gamma1_s * ND + gamma2_s * ND^2 + pack + cat_month
     - Shares: softmax(U)
     - Observed: Dirichlet-Multinomial(total_units, shares * concentration)
+    
+    Initialization fixes:
+    - Tighter priors on hierarchical SDs for stable NUTS sampling
+    - Explicit initval=0.0 for raw parameters to avoid extreme initial utilities
+    - Concentration prior shifted to encourage reasonable shares
     """
     n_markets, n_skus = choice_data.observed_units.shape
     n_retailers = len(choice_data.retailer_levels)
@@ -324,39 +331,39 @@ def build_joint_model(
         pm.Data("market_totals", choice_data.market_total_units)
         pm.Data("available_mask", choice_data.available_mask.astype(float))
 
-        # Global intercept
-        alpha = pm.Normal("alpha", 0.0, 0.5)
+        # Global intercept - slightly tighter
+        alpha = pm.Normal("alpha", 0.0, 0.35)
 
-        # Retailer×SKU effects (non-centered)
-        sigma_rs = pm.HalfNormal("sigma_rs", 0.5)
-        alpha_rs_raw = pm.Normal("alpha_rs_raw", 0.0, 1.0, shape=(n_retailers, n_skus))
+        # Retailer×SKU effects (non-centered) - tighter prior, explicit init
+        sigma_rs = pm.HalfNormal("sigma_rs", 0.3)
+        alpha_rs_raw = pm.Normal("alpha_rs_raw", 0.0, 1.0, shape=(n_retailers, n_skus), initval=0.0)
         alpha_rs = pm.Deterministic("alpha_rs", sigma_rs * alpha_rs_raw)
 
-        # Price slope by SKU (non-centered, pooled by brand)
-        sigma_beta = pm.HalfNormal("sigma_beta", 0.5)
-        beta_sku_raw = pm.Normal("beta_sku_raw", 0.0, 1.0, shape=n_skus)
+        # Price slope by SKU (non-centered, pooled by brand) - tighter prior, negative expected
+        sigma_beta = pm.HalfNormal("sigma_beta", 0.3)
+        beta_sku_raw = pm.Normal("beta_sku_raw", 0.0, 1.0, shape=n_skus, initval=0.0)
         beta_sku = pm.Deterministic("beta_sku", -sigma_beta * beta_sku_raw)  # Negative elasticity
 
-        # ND linear coefficient by SKU
-        sigma_gamma1 = pm.HalfNormal("sigma_gamma1", 0.5)
-        gamma1_sku_raw = pm.Normal("gamma1_sku_raw", 0.0, 1.0, shape=n_skus)
+        # ND linear coefficient by SKU - tighter prior
+        sigma_gamma1 = pm.HalfNormal("sigma_gamma1", 0.3)
+        gamma1_sku_raw = pm.Normal("gamma1_sku_raw", 0.0, 1.0, shape=n_skus, initval=0.0)
         gamma1_sku = pm.Deterministic("gamma1_sku", sigma_gamma1 * gamma1_sku_raw)
 
-        # ND quadratic coefficient by SKU
-        sigma_gamma2 = pm.HalfNormal("sigma_gamma2", 0.5)
-        gamma2_sku_raw = pm.Normal("gamma2_sku_raw", 0.0, 1.0, shape=n_skus)
+        # ND quadratic coefficient by SKU - tighter prior, negative for concave
+        sigma_gamma2 = pm.HalfNormal("sigma_gamma2", 0.3)
+        gamma2_sku_raw = pm.Normal("gamma2_sku_raw", 0.0, 1.0, shape=n_skus, initval=0.0)
         gamma2_sku = pm.Deterministic("gamma2_sku", -sigma_gamma2 * gamma2_sku_raw)  # Concave
 
-        # Pack group effect
-        pack_effect = pm.Normal("pack_effect", 0.0, 0.5, shape=n_pack_groups)
+        # Pack group effect - tighter prior
+        pack_effect = pm.Normal("pack_effect", 0.0, 0.35, shape=n_pack_groups)
 
-        # Category-month effect
-        sigma_cat_month = pm.HalfNormal("sigma_cat_month", 0.35)
-        cat_month_raw = pm.Normal("cat_month_raw", 0.0, 1.0, shape=(n_categories, n_months))
+        # Category-month effect - tighter prior
+        sigma_cat_month = pm.HalfNormal("sigma_cat_month", 0.25)
+        cat_month_raw = pm.Normal("cat_month_raw", 0.0, 1.0, shape=(n_categories, n_months), initval=0.0)
         cat_month_effect = pm.Deterministic("cat_month_effect", sigma_cat_month * cat_month_raw)
 
-        # Concentration parameter for Dirichlet-Multinomial
-        concentration = pm.HalfNormal("concentration", 2.0)
+        # Concentration parameter for Dirichlet-Multinomial - shifted prior
+        concentration = pm.HalfNormal("concentration", 1.5) + 0.5  # Ensures > 0.5
 
         # Deterministic utility computation
         def _compute_utility(

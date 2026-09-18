@@ -4,17 +4,19 @@ Validation and data preparation functions.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from contracts import (
-    REQUIRED_COLUMNS,
-    NUMERIC_RAW_COLUMNS as NUMERIC_COLUMNS,
     KEY_COLUMNS,
+    REQUIRED_COLUMNS,
     ValidationReport,
+)
+from contracts import (
+    NUMERIC_RAW_COLUMNS as NUMERIC_COLUMNS,
 )
 
 

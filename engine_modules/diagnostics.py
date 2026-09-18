@@ -6,14 +6,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import arviz as az
 import numpy as np
 import pandas as pd
-import arviz as az
 
 from contracts import (
-    ModelVariableNames,
     ConvergenceDiagnostics,
-    get_model_variable_names,
 )
 
 

@@ -4,18 +4,301 @@ Scenario engine for counterfactual evaluation.
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 import pandas as pd
 
 from contracts import (
-    ScenarioAction,
-    ScenarioResult,
     ChoiceSetData,
+    MarketOutcome,
+    ScenarioAction,
+    ScenarioOutcome,
     ScenarioPlan,
+    ScenarioResult,
 )
 from engine_modules.choice_sets import _recompute_relative_prices
+
+
+def run_scenario_plan(
+    plan: ScenarioPlan,
+    choice_data: ChoiceSetData,
+    posterior_cache: dict[str, np.ndarray],
+    n_draws: int | None = None,
+    random_seed: int = 42,
+) -> ScenarioOutcome:
+    """
+    Run a full ScenarioPlan evaluation: four true counterfactuals + market-first aggregation.
+    
+    This is the primary entry point for scenario evaluation. It:
+    1. Runs four counterfactuals: baseline, price_only, distribution_only, combined
+    2. Computes per-draw per-market reconciliation checks
+    3. Aggregates to market-level (retailer×category) for commercial decision-making
+    4. Provides SKU-level detail for diagnostic drill-down
+    5. Builds driver waterfall and source-destination flows
+    
+    Args:
+        plan: High-level ScenarioPlan with focal actions
+        choice_data: ChoiceSetData with baseline arrays
+        posterior_cache: Posterior parameter cache
+        n_draws: Number of posterior draws to use
+        random_seed: Random seed for reproducible draws
+    
+    Returns:
+        ScenarioOutcome with market-level outcomes (primary) and SKU detail (secondary)
+    """
+    # Build action sets for four counterfactuals
+    full_actions = list(plan.actions)
+    
+    price_actions = [
+        ScenarioAction(
+            retailer=a.retailer,
+            category=a.category,
+            brand=a.brand,
+            sku=a.sku,
+            month=a.month,
+            new_price_std=a.new_price_std,
+            new_nd=None,
+            nd_mode=a.nd_mode,
+        )
+        for a in full_actions if a.new_price_std is not None
+    ]
+    
+    nd_actions = [
+        ScenarioAction(
+            retailer=a.retailer,
+            category=a.category,
+            brand=a.brand,
+            sku=a.sku,
+            month=a.month,
+            new_price_std=None,
+            new_nd=a.new_nd,
+            nd_mode=a.nd_mode,
+        )
+        for a in full_actions if a.new_nd is not None
+    ]
+    
+    # Run four counterfactuals
+    baseline_result = run_joint_scenario_draws(
+        choice_data=choice_data,
+        posterior_cache=posterior_cache,
+        actions=[],
+        n_draws=n_draws,
+        random_seed=random_seed,
+    )
+    
+    price_only_result = run_joint_scenario_draws(
+        choice_data=choice_data,
+        posterior_cache=posterior_cache,
+        actions=price_actions,
+        n_draws=n_draws,
+        random_seed=random_seed,
+    ) if price_actions else baseline_result
+    
+    dist_only_result = run_joint_scenario_draws(
+        choice_data=choice_data,
+        posterior_cache=posterior_cache,
+        actions=nd_actions,
+        n_draws=n_draws,
+        random_seed=random_seed,
+    ) if nd_actions else baseline_result
+    
+    combined_result = run_joint_scenario_draws(
+        choice_data=choice_data,
+        posterior_cache=posterior_cache,
+        actions=full_actions,
+        n_draws=n_draws,
+        random_seed=random_seed,
+    )
+    
+    # Reconciliation check
+    recon = check_scenario_reconciliation(combined_result, choice_data)
+    
+    # Market-first aggregation (retailer×category = decision unit)
+    market_outcomes = _aggregate_to_market_outcomes(
+        baseline_result, combined_result, choice_data, plan
+    )
+    
+    # SKU-level detail for drill-down
+    sku_outcomes = _aggregate_to_sku_outcomes(
+        baseline_result, combined_result, choice_data
+    )
+    
+    # Driver waterfall
+    driver_waterfall = create_driver_waterfall(
+        aggregate_scenario_result(baseline_result, choice_data, "sku"),
+        aggregate_scenario_result(price_only_result, choice_data, "sku"),
+        aggregate_scenario_result(dist_only_result, choice_data, "sku"),
+        aggregate_scenario_result(combined_result, choice_data, "sku"),
+        selected_sku=plan.actions[0].sku if len(plan.actions) == 1 else None,
+    )
+    
+    # Source-destination (if single SKU)
+    source_destination = None
+    if len(plan.actions) == 1:
+        source_destination = compute_source_destination_flows(
+            combined_result, choice_data, plan.actions[0].sku
+        )
+    
+    # Diagnostics
+    diagnostics = None
+    if "divergences" in posterior_cache:
+        # Build ConvergenceDiagnostics from posterior cache if available
+        pass  # Will be provided by caller
+    
+    return ScenarioOutcome(
+        plan=plan,
+        market_outcomes=market_outcomes,
+        sku_outcomes=sku_outcomes,
+        driver_waterfall=driver_waterfall,
+        source_destination=source_destination,
+        reconciliation_passed=recon["all_passed"],
+        diagnostics=diagnostics,
+    )
+
+
+def _aggregate_to_market_outcomes(
+    baseline_result: ScenarioResult,
+    combined_result: ScenarioResult,
+    choice_data: ChoiceSetData,
+    plan: ScenarioPlan,
+) -> tuple[MarketOutcome, ...]:
+    """
+    Aggregate scenario results to market-level (retailer×category).
+    
+    This is the PRIMARY commercial output - the decision unit.
+    Shows total market impact, focal SKU/brand impact, and competitor sources.
+    """
+    n_markets = len(choice_data.market_ids)
+    market_outcomes = []
+    
+    # Determine focal SKU/brand
+    focal_sku = plan.actions[0].sku if len(plan.actions) == 1 else None
+    focal_brand = plan.actions[0].brand if len(plan.actions) == 1 else None
+    
+    # Compute source-destination for competitor attribution
+    source_flows = {}
+    if focal_sku:
+        try:
+            source_df = compute_source_destination_flows(combined_result, choice_data, focal_sku)
+            # Aggregate by relationship
+            if not source_df.empty:
+                source_flows = (
+                    source_df.groupby("source_relationship")["delta_standard_volume_p50"]
+                    .sum()
+                    .to_dict()
+                )
+        except Exception:
+            pass
+    
+    for m_idx in range(n_markets):
+        market_id = choice_data.market_ids[m_idx]
+        parts = market_id.split("|")
+        month_str = parts[0]
+        retailer = parts[1] if len(parts) > 1 else ""
+        category = parts[2] if len(parts) > 2 else ""
+        
+        # Baseline and scenario volumes
+        baseline_vol = baseline_result.baseline_units_p50[m_idx].sum()
+        scenario_vol = combined_result.scenario_units_p50[m_idx].sum()
+        delta_vol = scenario_vol - baseline_vol
+        delta_pct = delta_vol / baseline_vol * 100 if baseline_vol > 0 else 0.0
+        
+        # Share
+        baseline_share = 1.0  # This market is 100% of itself
+        scenario_share = scenario_vol / baseline_vol if baseline_vol > 0 else 1.0
+        
+        # Revenue (approximate via price_std)
+        # Would need price data for exact revenue
+        baseline_rev = baseline_vol  # Placeholder
+        scenario_rev = scenario_vol
+        
+        # Focal SKU impact
+        focal_baseline = None
+        focal_scenario = None
+        focal_delta = None
+        if focal_sku:
+            sku_idx = choice_data.sku_to_idx.get(focal_sku)
+            if sku_idx is not None:
+                focal_baseline = baseline_result.baseline_units_p50[m_idx, sku_idx]
+                focal_scenario = combined_result.scenario_units_p50[m_idx, sku_idx]
+                focal_delta = focal_scenario - focal_baseline
+        
+        # Probability positive (from per-draw deltas)
+        delta_draws = (combined_result.scenario_units - baseline_result.baseline_units)[:, m_idx].sum(axis=1)
+        prob_positive = float((delta_draws > 0).mean())
+        
+        market_outcomes.append(MarketOutcome(
+            market_id=market_id,
+            retailer=retailer,
+            category=category,
+            baseline_volume=baseline_vol,
+            scenario_volume=scenario_vol,
+            delta_volume=delta_vol,
+            delta_volume_pct=delta_pct,
+            baseline_share=baseline_share,
+            scenario_share=scenario_share,
+            delta_share_pp=(scenario_share - baseline_share) * 100,
+            baseline_revenue=baseline_rev,
+            scenario_revenue=scenario_rev,
+            delta_revenue=scenario_rev - baseline_rev,
+            focal_sku=focal_sku,
+            focal_baseline_volume=focal_baseline,
+            focal_scenario_volume=focal_scenario,
+            focal_delta_volume=focal_delta,
+            competitor_sources=source_flows if source_flows else None,
+            probability_positive=prob_positive,
+            is_decision_ready=False,  # Set by caller based on diagnostics
+        ))
+    
+    return tuple(market_outcomes)
+
+
+def _aggregate_to_sku_outcomes(
+    baseline_result: ScenarioResult,
+    combined_result: ScenarioResult,
+    choice_data: ChoiceSetData,
+) -> pd.DataFrame:
+    """Aggregate to SKU-level detail with intervals for drill-down."""
+    n_markets = len(choice_data.market_ids)
+    n_skus = len(choice_data.sku_ids)
+    n_draws = baseline_result.baseline_units.shape[0]
+    
+    rows = []
+    for m_idx in range(n_markets):
+        market_id = choice_data.market_ids[m_idx]
+        retailer = choice_data.retailer_levels[choice_data.market_retailer_idx[m_idx]]
+        category = choice_data.category_levels[choice_data.market_category_idx[m_idx]]
+        month = choice_data.month_levels[choice_data.market_month_idx[m_idx]]
+        
+        for s_idx in range(n_skus):
+            sku = choice_data.sku_ids[s_idx]
+            brand = choice_data.brand_levels[choice_data.sku_brand_idx[s_idx]]
+            pack_group = choice_data.pack_group_levels[choice_data.sku_pack_group_idx[s_idx]]
+            
+            base_draws = baseline_result.baseline_units[:, m_idx, s_idx]
+            scen_draws = combined_result.scenario_units[:, m_idx, s_idx]
+            delta_draws = scen_draws - base_draws
+            
+            rows.append({
+                "market_id": market_id,
+                "retailer": retailer,
+                "category": category,
+                "month": month,
+                "sku": sku,
+                "brand": brand,
+                "pack_group": pack_group,
+                "baseline_units_p05": float(np.percentile(base_draws, 5)),
+                "baseline_units_p50": float(np.median(base_draws)),
+                "baseline_units_p95": float(np.percentile(base_draws, 95)),
+                "scenario_units_p05": float(np.percentile(scen_draws, 5)),
+                "scenario_units_p50": float(np.median(scen_draws)),
+                "scenario_units_p95": float(np.percentile(scen_draws, 95)),
+                "delta_units_p05": float(np.percentile(delta_draws, 5)),
+                "delta_units_p50": float(np.median(delta_draws)),
+                "delta_units_p95": float(np.percentile(delta_draws, 95)),
+                "probability_positive": float((delta_draws > 0).mean()),
+            })
+    
+    return pd.DataFrame(rows)
 
 
 def run_joint_scenario_draws(

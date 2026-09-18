@@ -15,128 +15,130 @@ This package splits the monolithic engine.py into focused modules:
 
 # Re-export contracts (single source of truth)
 from contracts import (
-    RAW_COLUMNS,
-    REQUIRED_COLUMNS,
-    NUMERIC_RAW_COLUMNS as NUMERIC_COLUMNS,
-    KEY_COLUMNS,
-    DERIVED_COLUMNS,
-    SCENARIO_RESULT_COLUMNS,
-    SCENARIO_AGG_LEVELS,
-    DEFAULT_TARGET_ACCEPT,
-    DEFAULT_N_SPLINE_KNOTS,
-    DEFAULT_SPLINE_DEGREE,
-    FAST_DRAWS,
-    FAST_TUNE,
-    FAST_CHAINS,
-    DEFAULT_DRAWS,
-    DEFAULT_TUNE,
-    DEFAULT_CHAINS,
+    ADVANCED_CHAINS,
+    ADVANCED_CONFIG,
     ADVANCED_DRAWS,
     ADVANCED_TUNE,
-    ADVANCED_CHAINS,
+    DEFAULT_CHAINS,
+    DEFAULT_CONFIG,
+    DEFAULT_DRAWS,
+    DEFAULT_N_SPLINE_KNOTS,
     DEFAULT_SCENARIO_DRAWS,
+    DEFAULT_SPLINE_DEGREE,
+    DEFAULT_TARGET_ACCEPT,
+    DEFAULT_TUNE,
+    DERIVED_COLUMNS,
+    FAST_CHAINS,
+    FAST_CONFIG,
+    FAST_DRAWS,
+    FAST_TUNE,
+    JOINT_CONFIG,
+    KEY_COLUMNS,
     MAX_RHAT_THRESHOLD,
+    MAX_TREE_DEPTH_THRESHOLD,
+    MIN_BFMI_THRESHOLD,
     MIN_ESS_BULK_THRESHOLD,
     MIN_ESS_TAIL_THRESHOLD,
-    MIN_BFMI_THRESHOLD,
-    MAX_TREE_DEPTH_THRESHOLD,
+    RAW_COLUMNS,
+    REQUIRED_COLUMNS,
+    SCENARIO_AGG_LEVELS,
+    SCENARIO_RESULT_COLUMNS,
+    ChoiceSetData,
+    ConvergenceDiagnostics,
     ModelConfig,
-    FAST_CONFIG,
-    DEFAULT_CONFIG,
-    ADVANCED_CONFIG,
-    JOINT_CONFIG,
+    ModelHealth,
+    ModelVariableNames,
+    PreprocessState,
     ScenarioAction,
     ScenarioPlan,
-    ChoiceSetData,
     ScenarioResult,
-    PreprocessState,
-    ModelVariableNames,
-    ConvergenceDiagnostics,
-    ModelHealth,
     ValidationReport,
     validate_raw_columns,
     validate_scenario_result,
 )
+from contracts import (
+    NUMERIC_RAW_COLUMNS as NUMERIC_COLUMNS,
+)
 
-# Re-export validation
-from .validation import (
-    make_pack_group,
-    validate_input_data,
-    prepare_data,
-    build_retail_features,
-    PreparedData,
+# Re-export choice_sets
+from .choice_sets import (
+    _compute_peer_price_matrix,
+    _get_category_pack_peer_price,
+    _recompute_relative_prices,
+    build_choice_set_data,
+)
+
+# Re-export diagnostics
+from .diagnostics import (
+    build_elasticity_forest_figure,
+    compute_posterior_predictive_check,
+    compute_sku_elasticities,
+    get_model_diagnostics,
+    summarize_convergence_diagnostics,
 )
 
 # Re-export features
 from .features import (
     add_core_features,
-    add_pack_group,
-    add_time_features,
     add_log_features,
+    add_pack_group,
     add_standardized_features,
-    build_spline_basis,
+    add_time_features,
     apply_standardization,
     build_all_features,
-)
-
-# Re-export choice_sets
-from .choice_sets import (
-    _get_category_pack_peer_price,
-    build_choice_set_data,
-    _compute_peer_price_matrix,
-    _recompute_relative_prices,
-)
-
-# Re-export model
-from .model import (
-    build_pymc_model,
-    build_pymc_model_v2,
-    JointModelConfig,
-    build_joint_model,
-    extract_joint_posterior,
+    build_spline_basis,
 )
 
 # Re-export fitting
 from .fitting import (
-    fit_model,
     fit_joint_model,
-    run_prior_predictive,
-    run_posterior_predictive,
+    fit_model,
     get_model_config,
+    run_posterior_predictive,
+    run_prior_predictive,
 )
 
-# Re-export diagnostics
-from .diagnostics import (
-    get_model_diagnostics,
-    summarize_convergence_diagnostics,
-    compute_sku_elasticities,
-    build_elasticity_forest_figure,
-    compute_posterior_predictive_check,
-)
-
-# Re-export scenarios
-from .scenarios import (
-    run_joint_scenario_draws,
-    _compute_utility,
-    _softmax,
-    compute_source_destination_flows,
-    SOURCE_DESTINATION_COLUMNS,
-    MARKET_LEVELS,
-    aggregate_scenario_result,
-    check_scenario_reconciliation,
-    create_driver_waterfall,
+# Re-export model
+from .model import (
+    JointModelConfig,
+    build_joint_model,
+    build_pymc_model,
+    build_pymc_model_v2,
+    extract_joint_posterior,
 )
 
 # Re-export reporting
 from .reporting import (
+    _SUMMARY_METRICS,
     aggregate_scenario,
+    build_market_overview,
+    build_nd_velocity_quadrant,
+    build_price_pack_architecture,
     calculate_shares,
     decompose_sales_growth,
     prepare_market,
-    build_market_overview,
-    build_price_pack_architecture,
-    build_nd_velocity_quadrant,
-    _SUMMARY_METRICS,
+)
+
+# Re-export scenarios
+from .scenarios import (
+    MARKET_LEVELS,
+    SOURCE_DESTINATION_COLUMNS,
+    _compute_utility,
+    _softmax,
+    aggregate_scenario_result,
+    check_scenario_reconciliation,
+    compute_source_destination_flows,
+    create_driver_waterfall,
+    run_joint_scenario_draws,
+)
+
+# Re-export validation
+from .validation import (
+    PreparedData,
+    build_retail_features,
+    make_pack_group,
+    prepare_data,
+    validate_input_data,
 )
 
 # Legacy ValidationReport from validation.py

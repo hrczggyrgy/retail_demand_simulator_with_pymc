@@ -13,94 +13,29 @@ Design goals
 
 from __future__ import annotations
 
-import warnings
+# Legacy model output dataclasses that might be referenced
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
-import pymc as pm
 
 # Re-export everything from engine_modules for backward compatibility
 from engine_modules import *
-
-# Additional legacy functions that app.py might need
-from engine_modules.validation import (
-    make_pack_group,
-    validate_input_data,
-    prepare_data,
-    build_retail_features,
-    PreparedData,
-    ValidationReport as LegacyValidationReport,
-)
-
-from engine_modules.features import (
-    add_core_features,
-    add_pack_group,
-    add_time_features,
-    add_log_features,
-    add_standardized_features,
-    build_spline_basis,
-    apply_standardization,
-    build_all_features,
-)
-
-from engine_modules.choice_sets import (
-    _get_category_pack_peer_price,
-    build_choice_set_data,
-    _compute_peer_price_matrix,
-    _recompute_relative_prices,
-)
-
 from engine_modules.model import (
-    build_pymc_model,
-    build_pymc_model_v2,
-    JointModelConfig,
-    build_joint_model,
     extract_joint_posterior,
 )
-
-from engine_modules.fitting import (
-    fit_model,
-    fit_joint_model,
-    run_prior_predictive,
-    run_posterior_predictive,
-    get_model_config,
-)
-
-from engine_modules.diagnostics import (
-    get_model_diagnostics,
-    summarize_convergence_diagnostics,
-    compute_sku_elasticities,
-    build_elasticity_forest_figure,
-    compute_posterior_predictive_check,
-)
-
-from engine_modules.scenarios import (
-    run_joint_scenario_draws,
-    _compute_utility,
-    _softmax,
-    compute_source_destination_flows,
-    SOURCE_DESTINATION_COLUMNS,
-    MARKET_LEVELS,
-    aggregate_scenario_result,
-    check_scenario_reconciliation,
-    create_driver_waterfall,
-)
-
 from engine_modules.reporting import (
-    aggregate_scenario,
-    calculate_shares,
     decompose_sales_growth,
     prepare_market,
-    build_market_overview,
-    build_price_pack_architecture,
-    build_nd_velocity_quadrant,
-    _SUMMARY_METRICS,
+)
+from engine_modules.scenarios import (
+    aggregate_scenario_result,
+    run_joint_scenario_draws,
 )
 
-# Legacy model output dataclasses that might be referenced
-from dataclasses import dataclass
+# Additional legacy functions that app.py might need
+
 
 @dataclass(frozen=True, slots=True)
 class ModelOutput:
