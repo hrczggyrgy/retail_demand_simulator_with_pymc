@@ -28,7 +28,7 @@ from contracts import (
     ScenarioPlan,
     get_model_variable_names,
 )
-from engine_modules.scenarios import run_scenario_from_actions
+from engine import run_scenario_from_actions
 
 # ---------------------------------------------------------------------------
 # Page setup

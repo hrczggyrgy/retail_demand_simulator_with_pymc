@@ -918,6 +918,58 @@ def run_scenario_suite(
     }
 
 
+def run_scenario_from_actions(
+    action_df: pd.DataFrame,
+    df: pd.DataFrame,
+    posterior_cache: dict,
+    spline,
+    scales: dict,
+    meta: dict,
+) -> dict:
+    """
+    Run legacy scenario suite based on checked actions in the action table.
+    Backward compatibility wrapper for old app interface.
+    """
+    checked = action_df[action_df["include"]].copy()
+    
+    if checked.empty:
+        return {}
+    
+    if len(checked) > 0:
+        avg_price_change = checked["price_change_pct"].mean() / 100.0
+        avg_nd_change = checked["nd_change_pp"].mean() / 100.0
+        nd_mode = checked["nd_mode"].iloc[0]
+    else:
+        avg_price_change = 0.0
+        avg_nd_change = 0.0
+        nd_mode = "pp"
+    
+    if len(checked["sku"].unique()) == 1:
+        target_level = "sku"
+        target_value = checked["sku"].iloc[0]
+    elif len(checked["brand"].unique()) == 1:
+        target_level = "brand"
+        target_value = checked["brand"].iloc[0]
+    elif len(checked["retailer"].unique()) == 1:
+        target_level = "retailer"
+        target_value = checked["retailer"].iloc[0]
+    elif len(checked["category"].unique()) == 1:
+        target_level = "category"
+        target_value = checked["category"].iloc[0]
+    else:
+        target_level = "market"
+        target_value = None
+    
+    return run_scenario_suite(
+        df, posterior_cache, spline, scales,
+        price_change=avg_price_change,
+        nd_change=avg_nd_change,
+        nd_mode=nd_mode,
+        target_level=target_level,
+        target_value=target_value
+    )
+
+
 # Legacy constants for backward compatibility
 MARKET_LEVELS = {
     "market": ["month"],
