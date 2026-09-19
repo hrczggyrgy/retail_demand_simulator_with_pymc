@@ -220,7 +220,7 @@ def build_pymc_model_v2(
         nd_coef = pm.Normal("nd_coef", 0.0, 0.35, dims="spline_basis")
         nd_effect = pm.Deterministic(
             "nd_effect",
-            pm.math.dot(pm.Data("nd_basis", nd_basis, dims=("obs_id", "spline_basis")), nd_coef),
+            pm.math.dot(model.named_vars["nd_basis"], nd_coef),
             dims="obs_id",
         )
 

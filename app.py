@@ -544,8 +544,9 @@ def render_market_page(
     
     # Column validation
     st.markdown("### Column Validation")
-    missing = REQUIRED_RAW_COLUMNS - set(raw.columns)
-    extra = set(raw.columns) - REQUIRED_RAW_COLUMNS
+    required_set = set(REQUIRED_RAW_COLUMNS)
+    missing = required_set - set(raw.columns)
+    extra = set(raw.columns) - required_set
     
     if missing:
         st.error(f"Missing required columns: {', '.join(sorted(missing))}")
