@@ -446,9 +446,11 @@ def run_joint_scenario_draws(
     baseline_units_p95 = np.percentile(baseline_units_all, 95, axis=0)
     scenario_units_p95 = np.percentile(scenario_units_all, 95, axis=0)
     
-    delta_units_p50 = scenario_units_p50 - baseline_units_p50
-    delta_units_p05 = scenario_units_p05 - baseline_units_p05
-    delta_units_p95 = scenario_units_p95 - baseline_units_p95
+    # Compute delta quantiles correctly: difference per draw, then quantiles
+    delta_units_all = scenario_units_all - baseline_units_all
+    delta_units_p50 = np.median(delta_units_all, axis=0)
+    delta_units_p05 = np.percentile(delta_units_all, 5, axis=0)
+    delta_units_p95 = np.percentile(delta_units_all, 95, axis=0)
     
     return ScenarioResult(
         baseline_units=baseline_units_all,
@@ -697,6 +699,8 @@ def aggregate_scenario_result(
         group_cols = ["retailer", "category", "brand", "pack_group"]
     elif level == "sku":
         group_cols = ["retailer", "category", "brand", "pack_group", "sku"]
+    elif level == "retailer_category":
+        group_cols = ["retailer", "category"]
     else:
         raise ValueError(f"Unknown level: {level}")
     
@@ -788,6 +792,7 @@ def check_scenario_reconciliation(
     checks = {
         "baseline_shares_sum_to_one": True,
         "scenario_shares_sum_to_one": True,
+        "baseline_units_match_totals": True,
         "scenario_units_match_totals": True,
         "delta_consistency": True,
         "all_passed": True,
@@ -805,6 +810,12 @@ def check_scenario_reconciliation(
     if not np.allclose(scenario_share_sum, 1.0, atol=tol):
         checks["scenario_shares_sum_to_one"] = False
         checks["details"].append("Scenario shares don't sum to 1")
+    
+    # Baseline units match market totals
+    baseline_units_sum = result.baseline_units.sum(axis=2)
+    if not np.allclose(baseline_units_sum, choice_data.market_total_units, atol=tol):
+        checks["baseline_units_match_totals"] = False
+        checks["details"].append("Baseline units don't match market totals")
     
     # Scenario units match market totals
     scenario_units_sum = result.scenario_units.sum(axis=2)
@@ -829,6 +840,7 @@ def check_scenario_reconciliation(
     checks["all_passed"] = all([
         checks["baseline_shares_sum_to_one"],
         checks["scenario_shares_sum_to_one"],
+        checks["baseline_units_match_totals"],
         checks["scenario_units_match_totals"],
         checks["delta_consistency"],
     ])
@@ -899,3 +911,71 @@ def create_driver_waterfall(
     })
     
     return components
+
+
+def create_reallocation_sankey(
+    source_df: pd.DataFrame,
+    selected_sku: str,
+) -> "go.Figure":
+    """Create Sankey diagram for reallocation flows.
+    
+    Handles edge case where no sources exist (all deltas positive).
+    """
+    import plotly.graph_objects as go
+    
+    # Filter to source losses only (negative deltas)
+    sources = source_df[source_df["delta_standard_volume_p50"] < 0].copy()
+    
+    if sources.empty:
+        # No sources - return empty figure with message
+        fig = go.Figure()
+        fig.add_annotation(
+            text=f"No reallocation sources found for {selected_sku}.<br>All deltas are positive (no volume lost to other SKUs).",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5,
+            showarrow=False,
+            font=dict(size=16, color="gray"),
+        )
+        fig.update_layout(
+            title=f"Reallocation for {selected_sku}",
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+        )
+        return fig
+    
+    # Build Sankey
+    # Nodes: Selected SKU (center), Source segments
+    # Links: from sources to selected SKU (positive flow = loss from source)
+    
+    source_segments = sources["source_relationship"].tolist()
+    source_values = (-sources["delta_standard_volume_p50"]).tolist()  # positive = volume lost
+    
+    nodes = [selected_sku] + source_segments
+    node_indices = {name: i for i, name in enumerate(nodes)}
+    
+    source_indices = [node_indices[seg] for seg in source_segments]
+    target_indices = [0] * len(source_segments)  # all point to selected SKU
+    
+    fig = go.Figure(data=[go.Sankey(
+        node=dict(
+            pad=15,
+            thickness=20,
+            line=dict(color="black", width=0.5),
+            label=nodes,
+            color=["rgba(31, 119, 180, 0.8)"] + ["rgba(255, 127, 14, 0.8)"] * len(source_segments),
+        ),
+        link=dict(
+            source=source_indices,
+            target=target_indices,
+            value=source_values,
+            color=["rgba(255, 127, 14, 0.4)"] * len(source_segments),
+        ),
+    )])
+    
+    fig.update_layout(
+        title_text=f"Reallocation Sources for {selected_sku}",
+        font_size=12,
+        height=400,
+    )
+    
+    return fig

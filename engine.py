@@ -76,6 +76,140 @@ class NestModelConfig:
     sigma_rc_month: float = 0.3
     sigma_outside: float = 0.5
 
+
+_DEFAULT_NEST_MODEL_CONFIG = NestModelConfig()
+
+def build_nest_allocation_model(
+    choice_data: ChoiceSetData,
+    joint_posterior_cache: dict,
+    config: NestModelConfig | None = None,
+) -> pm.Model:
+    if config is None:
+        config = _DEFAULT_NEST_MODEL_CONFIG
+    """Build the retailer-category nest allocation model (Layer B). Legacy wrapper.
+    
+    This model allocates total observed market volume across retailer-category nests
+    using the inclusive value from the SKU-level model (Layer C).
+    
+    Args:
+        choice_data: ChoiceSetData from SKU-level model
+        joint_posterior_cache: Posterior cache from joint SKU share model (for IV)
+        config: NestModelConfig
+    
+    Returns:
+        PyMC model for nest allocation
+    """
+    n_markets = len(choice_data.market_ids)
+    
+    # Get unique retailer-category combinations
+    rc_combos = []
+    for m_idx in range(n_markets):
+        retailer = choice_data.retailer_levels[choice_data.market_retailer_idx[m_idx]]
+        category = choice_data.category_levels[choice_data.market_category_idx[m_idx]]
+        rc_combos.append((retailer, category))
+    
+    unique_rc = sorted(set(rc_combos))
+    n_rc = len(unique_rc)
+    
+    # Map market to rc index
+    market_to_rc = np.array([unique_rc.index(rc) for rc in rc_combos], dtype=np.int32)
+    
+    # Get months
+    months = sorted({choice_data.month_levels[choice_data.market_month_idx[m_idx]] for m_idx in range(n_markets)})
+    n_months = len(months)
+    month_to_idx = {m: i for i, m in enumerate(months)}
+    market_month_idx = np.array([month_to_idx[choice_data.month_levels[choice_data.market_month_idx[m_idx]]] for m_idx in range(n_markets)], dtype=np.int32)
+    
+    # Get categories for nesting parameter
+    rc_categories = [rc[1] for rc in unique_rc]
+    rc_category_idx = np.array([np.where(choice_data.category_levels == cat)[0][0] for cat in rc_categories], dtype=np.int32)
+    
+    # Market totals (total units per retailer-category-month)
+    market_totals = choice_data.market_total_units
+    
+    # Inclusive values from joint model
+    if "inclusive_value" in joint_posterior_cache:
+        iv_per_market = joint_posterior_cache["inclusive_value"].mean(axis=0)  # (n_markets,)
+    else:
+        iv_per_market = np.log(np.maximum(choice_data.available_mask.sum(axis=1), 1))
+    
+    # Aggregate IV to retailer-category level (mean across months)
+    iv_rc = np.zeros(n_rc)
+    iv_rc_counts = np.zeros(n_rc)
+    for m_idx in range(n_markets):
+        rc_idx = market_to_rc[m_idx]
+        iv_rc[rc_idx] += iv_per_market[m_idx]
+        iv_rc_counts[rc_idx] += 1
+    iv_rc = np.where(iv_rc_counts > 0, iv_rc / iv_rc_counts, 0.0)
+    
+    coords = {
+        "rc": np.arange(n_rc),
+        "month": np.arange(n_months),
+        "category": choice_data.category_levels,
+    }
+    
+    with pm.Model(coords=coords) as model:
+        # Data containers
+        market_totals_data = pm.Data("market_totals", market_totals, dims="market")
+        iv_data = pm.Data("iv_rc", iv_rc, dims="rc")
+        market_to_rc_data = pm.Data("market_to_rc", market_to_rc, dims="market")
+        market_month_idx_data = pm.Data("market_month_idx", market_month_idx, dims="market")
+        
+        # Retailer-category baseline attractiveness
+        alpha_rc = pm.Normal("alpha_rc", 0.0, config.sigma_alpha_rc, dims="rc")
+        
+        # Category-level CPI effect
+        theta_c = pm.Normal("theta_c", 0.0, config.sigma_cpi, dims="category")
+        cpi_rc = pm.Data("cpi_rc", np.zeros(n_rc), dims="rc")
+        
+        # Category-level assortment effect
+        omega_c = pm.Normal("omega_c", 0.0, config.sigma_assortment, dims="category")
+        assortment_rc = pm.Data("assortment_rc", np.zeros(n_rc), dims="rc")
+        
+        # Nesting parameter lambda_c (0 < lambda <= 1)
+        lambda_raw = pm.Normal("lambda_raw", 0.0, config.sigma_nesting, dims="category")
+        lambda_c = pm.Deterministic("lambda_c", pm.math.sigmoid(lambda_raw), dims="category")
+        
+        # Outside option
+        sigma_outside = pm.HalfNormal("sigma_outside", config.sigma_outside)
+        outside = pm.Normal("outside", 0.0, sigma_outside)
+        
+        # Utility for each retailer-category nest (average over months)
+        # U_rc = alpha_rc + theta_c * CPI_rc + omega_c * Assortment_rc + lambda_c * IV_rc
+        utility_rc = (
+            alpha_rc
+            + theta_c[rc_category_idx] * cpi_rc
+            + omega_c[rc_category_idx] * assortment_rc
+            + lambda_c[rc_category_idx] * iv_data
+        )
+        
+        # Nest shares (multinomial logit with outside option)
+        # w_rc = exp(U_rc) / (sum(exp(U_rc')) + exp(U_outside))
+        exp_utility = pm.math.exp(utility_rc)
+        exp_outside = pm.math.exp(outside)
+        denom = exp_utility.sum() + exp_outside
+        nest_shares = exp_utility / denom
+        
+        # Nest shares with outside option
+        w_rc = pm.Deterministic("w_rc", nest_shares, dims="rc")
+        w_outside = pm.Deterministic("w_outside", exp_outside / denom)
+        
+        # Since we don't observe nest-level breakdown, we model the total market volume
+        # with a simple Normal likelihood on the total (placeholder)
+        # The nest shares are available for scenario analysis
+        total_units_pred = pm.Deterministic("total_units_pred", market_totals_data, dims="market")
+        sigma_total = pm.HalfNormal("sigma_total", 0.5)
+        pm.Normal(
+            "market_totals_obs",
+            mu=total_units_pred,
+            sigma=sigma_total,
+            observed=market_totals_data,
+            dims="market",
+        )
+    
+    return model
+
+
 def build_joint_sku_share_model(
     choice_data: ChoiceSetData,
     config: JointModelConfig | None = None,
@@ -99,7 +233,27 @@ from engine_modules.reporting import (
 from engine_modules.scenarios import (
     aggregate_scenario_result,
     run_joint_scenario_draws,
+    compute_source_destination_flows,
+    create_reallocation_sankey,
 )
+
+
+def build_source_destination_summary(
+    result: ScenarioResult,
+    choice_data: ChoiceSetData,
+    action: ScenarioAction,
+) -> pd.DataFrame:
+    """Build source-destination reallocation summary aggregated by segment. Legacy wrapper."""
+    flows = compute_source_destination_flows(result, choice_data, action.sku)
+    # Aggregate by segment
+    agg = flows.groupby("source_relationship").agg({
+        "baseline_standard_volume_p50": "sum",
+        "scenario_standard_volume_p50": "sum",
+        "delta_standard_volume_p50": "sum",
+        "delta_standard_volume_p05": "sum",
+        "delta_standard_volume_p95": "sum",
+    }).reset_index()
+    return agg
 
 
 def build_choice_set_data(

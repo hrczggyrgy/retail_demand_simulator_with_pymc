@@ -426,11 +426,12 @@ def build_joint_model(
                 + pack_term
                 + cat_month_term
             )
-            # Mask unavailable
+            # Mask unavailable: use -30 so softmax gives small but positive shares (exp(-30) ≈ 9e-14)
+            # This ensures a = concentration * sku_share > 0 for all SKUs, satisfying DirichletMultinomial's a > 0 requirement
             utility = pm.math.where(
                 choice_data.available_mask,
                 utility,
-                -1e9  # Large negative for unavailable
+                -30.0  # Small negative for unavailable (gives ~1e-13 share)
             )
             return utility
 
@@ -464,8 +465,16 @@ def extract_joint_posterior(
     idata: Any,
     max_draws: int = 500,
     random_seed: int = 42,
+    choice_data: Any = None,
 ) -> dict[str, np.ndarray]:
-    """Extract posterior draws for joint model scenario evaluation."""
+    """Extract posterior draws for joint model scenario evaluation.
+    
+    Args:
+        idata: InferenceData object from PyMC sampling
+        max_draws: Maximum number of draws to return
+        random_seed: Random seed for subsampling
+        choice_data: Optional ChoiceSetData to compute sku_share deterministics
+    """
     rng = np.random.default_rng(random_seed)
 
     def get_var(name: str) -> np.ndarray:
@@ -487,13 +496,100 @@ def extract_joint_posterior(
         "gamma2_sku": get_var("gamma2_sku"),
         "pack_effect": get_var("pack_effect"),
         "cat_month_effect": get_var("cat_month_effect"),
+        "concentration": get_var("concentration"),
     }
+
+    # Backward compatibility aliases
+    # alpha_sku: average over retailers
+    posterior["alpha_sku"] = posterior["alpha_rs"].mean(axis=1)  # (draws, n_skus)
+    # alpha_retailer_sku: alias for alpha_rs
+    posterior["alpha_retailer_sku"] = posterior["alpha_rs"]
+    # concentration_category: alias for concentration (single value per draw)
+    posterior["concentration_category"] = posterior["concentration"]
+
+    # Compute sku_share if choice_data is provided
+    if choice_data is not None:
+        posterior["sku_share"] = _compute_sku_share_from_posterior(posterior, choice_data)
 
     # Subsample draws if needed
     n_draws = posterior["alpha"].shape[0]
     if n_draws > max_draws:
         idx = rng.choice(n_draws, size=max_draws, replace=False)
         for key in posterior:
-            posterior[key] = posterior[key][idx]
+            if posterior[key] is not None:
+                posterior[key] = posterior[key][idx]
 
     return posterior
+
+
+def _compute_sku_share_from_posterior(
+    posterior: dict[str, np.ndarray],
+    choice_data: Any,
+) -> np.ndarray:
+    """Compute sku_share for each posterior draw using choice_data."""
+    n_draws = posterior["alpha"].shape[0]
+    n_markets = len(choice_data.market_ids)
+    n_skus = choice_data.observed_units.shape[1]
+    
+    # Indices
+    market_retailer = choice_data.market_retailer_idx
+    market_category = choice_data.market_category_idx
+    market_month = choice_data.market_month_idx
+    sku_category = choice_data.sku_category_idx
+    sku_pack_group = choice_data.sku_pack_group_idx
+    log_rel_price = np.log(np.maximum(choice_data.relative_price, 1e-4))
+    nd = choice_data.nd
+    nd_sq = nd ** 2
+    
+    sku_shares = np.zeros((n_draws, n_markets, n_skus))
+    
+    for d in range(n_draws):
+        # Get draw parameters
+        alpha = posterior["alpha"][d]
+        alpha_rs = posterior["alpha_rs"][d]  # (n_retailers, n_skus)
+        beta_sku = posterior["beta_sku"][d]  # (n_skus,)
+        gamma1_sku = posterior["gamma1_sku"][d]  # (n_skus,)
+        gamma2_sku = posterior["gamma2_sku"][d]  # (n_skus,)
+        pack_effect = posterior["pack_effect"][d]  # (n_pack_groups,)
+        cat_month_effect = posterior["cat_month_effect"][d]  # (n_categories, n_months)
+        
+        # Compute utility for each market and SKU
+        # alpha_rs[market_retailer, :] -> (n_markets, n_skus)
+        alpha_rs_market = alpha_rs[market_retailer, :]
+        
+        # beta_sku * log_rel_price -> (n_markets, n_skus)
+        price_term = beta_sku.reshape((1, n_skus)) * log_rel_price
+        
+        # gamma1_sku * nd -> (n_markets, n_skus)
+        nd_term1 = gamma1_sku.reshape((1, n_skus)) * nd
+        
+        # gamma2_sku * nd_sq -> (n_markets, n_skus)
+        nd_term2 = gamma2_sku.reshape((1, n_skus)) * nd_sq
+        
+        # pack_effect[sku_pack_group] -> (n_skus,) -> (1, n_skus)
+        pack_term = pack_effect[sku_pack_group].reshape((1, n_skus))
+        
+        # cat_month_effect[market_category, market_month] -> (n_markets,) -> (n_markets, 1)
+        cat_month_term = cat_month_effect[market_category, market_month].reshape((n_markets, 1))
+        
+        utility = (
+            alpha
+            + alpha_rs_market
+            + price_term
+            + nd_term1
+            + nd_term2
+            + pack_term
+            + cat_month_term
+        )
+        
+        # Mask unavailable
+        utility = np.where(
+            choice_data.available_mask,
+            utility,
+            -30.0  # Same as in model
+        )
+        
+        # Softmax
+        sku_shares[d] = np.exp(utility) / np.exp(utility).sum(axis=1, keepdims=True)
+    
+    return sku_shares
