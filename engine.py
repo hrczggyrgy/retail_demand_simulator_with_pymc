@@ -9,11 +9,13 @@ from __future__ import annotations
 
 # Legacy model output dataclasses that might be referenced
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict
 
 import arviz as az
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
 import pymc as pm
 
 # Re-export everything from engine_modules for backward compatibility
@@ -23,8 +25,7 @@ from engine_modules.model import (
     extract_joint_posterior,
     UNAVAILABLE_UTILITY,
     UNAVAILABLE_SHARE_TOLERANCE,
-)
-from engine_modules.model import (
+    build_pymc_model_v2 as _build_pymc_model_v2,
     build_joint_model as _build_joint_model,
 )
 from engine_modules.choice_sets import (
@@ -32,6 +33,10 @@ from engine_modules.choice_sets import (
 )
 from engine_modules.choice_sets import (
     build_choice_set_data as _build_choice_set_data,
+)
+from engine_modules.fitting import (
+    fit_model as _fit_model,
+    run_posterior_predictive as _run_posterior_predictive,
 )
 from engine_modules.reporting import (
     decompose_sales_growth,
@@ -42,6 +47,32 @@ from engine_modules.reporting import (
     calculate_shares,
     aggregate_scenario,
     _SUMMARY_METRICS,
+)
+from engine_modules.diagnostics import (
+    build_elasticity_forest_figure as _build_elasticity_forest_figure,
+)
+from engine_modules.scenarios import (
+    create_reallocation_sankey as _create_reallocation_sankey,
+    run_scenario_plan as _run_scenario_plan,
+)
+from engine_modules.validation import (
+    validate_input_data as _validate_input_data,
+    prepare_data as _prepare_data,
+    build_retail_features as _build_retail_features,
+)
+from contracts import (
+    NUMERIC_RAW_COLUMNS as NUMERIC_COLUMNS,
+    KEY_COLUMNS,
+    ValidationReport,
+    DEFAULT_N_SPLINE_KNOTS,
+    DEFAULT_SPLINE_DEGREE,
+    FAST_CONFIG,
+    DEFAULT_CONFIG,
+    ADVANCED_CONFIG,
+    JOINT_CONFIG,
+)
+from engine_modules.model import (
+    JointModelConfig,
 )
 
 
@@ -1445,3 +1476,285 @@ def add_indices(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
     }
     
     return df, meta
+
+
+def extract_scenario_posterior(
+    idata: Any,
+    max_draws: int = 400,
+    random_seed: int = 42,
+) -> dict[str, np.ndarray]:
+    """Extract posterior draws for fast scenarios (v2 compatible). Legacy wrapper."""
+    return extract_joint_posterior(idata, max_draws, random_seed)
+
+
+def add_posterior_predictive(
+    model: pm.Model,
+    idata: az.InferenceData,
+) -> az.InferenceData:
+    """Add posterior predictive samples to inference data. Legacy wrapper."""
+    return _run_posterior_predictive(model, idata)
+
+
+def build_pymc_model_v2(
+    df: pd.DataFrame,
+    meta: dict[str, Any],
+    nd_basis: np.ndarray,
+    config: Any = DEFAULT_CONFIG,
+) -> pm.Model:
+    """Build the improved hierarchical model (v2) with better pooling structure. Legacy wrapper."""
+    return _build_pymc_model_v2(df, meta, nd_basis, config)
+
+
+def fit_model(
+    model: pm.Model,
+    config: Any = DEFAULT_CONFIG,
+) -> az.InferenceData:
+    """Fit the Bayesian model with standard configuration. Legacy wrapper."""
+    return _fit_model(model, config)
+
+
+def create_data_quality_report(
+    raw_df: pd.DataFrame,
+    prepared_df: pd.DataFrame,
+    validation: ValidationReport,
+) -> Dict[str, Any]:
+    """Create a data quality report from raw and prepared data. Legacy wrapper."""
+    input_n = len(raw_df)
+    prepared_n = len(prepared_df)
+
+    numeric = raw_df.copy()
+    for col in NUMERIC_COLUMNS:
+        numeric[col] = pd.to_numeric(numeric[col], errors="coerce")
+
+    duplicate_records = int(
+        numeric.duplicated(subset=KEY_COLUMNS, keep=False).sum()
+    )
+
+    missing = {
+        str(k): int(v)
+        for k, v in numeric.isna().sum().items()
+        if int(v) > 0
+    }
+
+    counts = {
+        "retailers": int(prepared_df["retailer"].nunique()),
+        "categories": int(prepared_df["category"].nunique()),
+        "brands": int(prepared_df["brand"].nunique()),
+        "skus": int(prepared_df["sku"].nunique()),
+        "pack_sizes": int(prepared_df["pack_size"].nunique()),
+    }
+
+    sku_obs = (
+        prepared_df.groupby("sku", observed=True)["month"]
+        .nunique()
+        .sort_values()
+    )
+    entity_obs = (
+        prepared_df.groupby(["retailer", "sku"], observed=True)["month"]
+        .nunique()
+        .sort_values()
+    )
+
+    report = {
+        "input_row_count": input_n,
+        "valid_model_row_count": prepared_n,
+        "dropped_row_count": max(0, input_n - prepared_n),
+        "dropped_reasons": validation.invalid_reasons if hasattr(validation, 'invalid_reasons') else [],
+        "missing_values": missing,
+        "duplicate_records": duplicate_records,
+        "date_coverage": {
+            "min": str(prepared_df["month"].min()),
+            "max": str(prepared_df["month"].max()),
+            "n_months": int(prepared_df["month"].nunique()),
+        },
+        "counts": counts,
+        "distribution_validity": {
+            "nd_min": float(prepared_df["nd"].min()),
+            "nd_max": float(prepared_df["nd"].max()),
+            "nd_gt_1_count": int((prepared_df["nd"] > 1).sum()),
+        },
+        "price_variation": {
+            "rel_price_min": float(prepared_df["relative_price"].min()),
+            "rel_price_max": float(prepared_df["relative_price"].max()),
+            "rel_price_std": float(prepared_df["relative_price"].std()),
+        },
+        "observations_per_retailer_sku": {
+            "min": int(entity_obs.min()) if len(entity_obs) else 0,
+            "median": float(entity_obs.median()) if len(entity_obs) else 0,
+            "max": int(entity_obs.max()) if len(entity_obs) else 0,
+        },
+        "observations_per_sku": {
+            "min": int(sku_obs.min()) if len(sku_obs) else 0,
+            "median": float(sku_obs.median()) if len(sku_obs) else 0,
+            "max": int(sku_obs.max()) if len(sku_obs) else 0,
+        },
+        "low_observation_skus": sku_obs[sku_obs < 6].index.tolist(),
+        "warnings": validation.warnings,
+    }
+    return report
+
+
+def create_category_bubble_map(market_impact_df: pd.DataFrame) -> go.Figure:
+    """Create a category bubble map: x=volume share, y=share change, size=revenue, color=category."""
+    df = market_impact_df.copy()
+    
+    if "category" not in df.columns:
+        return go.Figure().update_layout(title="Category data not available")
+    
+    fig = px.scatter(
+        df,
+        x="scenario_share",
+        y="share_change_pp",
+        size="scenario_revenue",
+        color="category",
+        hover_data=["category", "baseline_share", "scenario_share", "share_change_pp", "delta_revenue_pct"],
+        title="Category Market Map: Share vs Share Change",
+        labels={
+            "scenario_share": "Scenario Volume Share",
+            "share_change_pp": "Share Change (pp)",
+            "scenario_revenue": "Scenario Revenue"
+        }
+    )
+    
+    fig.update_layout(height=500)
+    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+    return fig
+
+
+def create_brand_pack_heatmap(market_impact_df: pd.DataFrame) -> go.Figure:
+    """Create a brand × pack-group heatmap of share change (pp)."""
+    df = market_impact_df.copy()
+    
+    if "brand" not in df.columns or "pack_group" not in df.columns:
+        return go.Figure().update_layout(title="Brand×Pack data not available")
+    
+    pivot = df.pivot_table(
+        values="share_change_pp",
+        index="brand",
+        columns="pack_group",
+        aggfunc="mean"
+    )
+    
+    fig = px.imshow(
+        pivot,
+        color_continuous_scale="RdBu",
+        color_continuous_midpoint=0,
+        title="Brand × Pack Group: Share Change (pp)",
+        labels={"color": "Share Change (pp)", "x": "Pack Group", "y": "Brand"}
+    )
+    
+    fig.update_layout(height=400)
+    return fig
+
+
+def create_winner_loser_dumbbell(
+    baseline_df: pd.DataFrame,
+    scenario_df: pd.DataFrame,
+    level: str = "brand",
+    top_n: int = 15,
+) -> go.Figure:
+    """Create winner/loser dumbbell chart at segment level."""
+    group_cols = {"brand": ["brand"], "sku": ["brand", "sku"], 
+                  "category": ["category"], "retailer": ["retailer"]}
+    
+    cols = group_cols.get(level, ["brand"])
+    
+    base_agg = baseline_df.groupby(cols, observed=True).agg(
+        baseline_standard_volume=("standard_volume", "sum"),
+        baseline_revenue=("revenue", "sum"),
+    ).reset_index()
+    
+    scen_agg = scenario_df.groupby(cols, observed=True).agg(
+        scenario_standard_volume=("standard_volume", "sum"),
+        scenario_revenue=("revenue", "sum"),
+    ).reset_index()
+    
+    merged = base_agg.merge(scen_agg, on=cols, how="outer").fillna(0)
+    merged["delta"] = merged["scenario_standard_volume"] - merged["baseline_standard_volume"]
+    merged["delta_pct"] = np.where(
+        merged["baseline_standard_volume"] > 0,
+        merged["delta"] / merged["baseline_standard_volume"] * 100,
+        0
+    )
+    
+    # Sort by delta and take top N
+    merged = merged.sort_values("delta", ascending=False).head(top_n)
+    
+    # Create label
+    if "sku" in merged.columns:
+        merged["label"] = merged["brand"].astype(str) + " | " + merged["sku"].astype(str)
+    elif "brand" in merged.columns:
+        merged["label"] = merged["brand"].astype(str)
+    elif "category" in merged.columns:
+        merged["label"] = merged["category"].astype(str)
+    else:
+        merged["label"] = merged["retailer"].astype(str)
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=merged["baseline_standard_volume"],
+        y=merged["label"],
+        mode="markers",
+        marker=dict(size=12, color="gray", symbol="circle"),
+        name="Baseline",
+        showlegend=True
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=merged["scenario_standard_volume"],
+        y=merged["label"],
+        mode="markers",
+        marker=dict(size=12, color="blue", symbol="circle"),
+        name="Scenario",
+        showlegend=True
+    ))
+    
+    # Add connecting lines (dumbbells)
+    for _, row in merged.iterrows():
+        fig.add_shape(
+            type="line",
+            x0=row["baseline_standard_volume"],
+            x1=row["scenario_standard_volume"],
+            y0=row["label"],
+            y1=row["label"],
+            line=dict(color="gray", width=2)
+        )
+    
+    fig.update_layout(
+        title=f"Winner/Loser Dumbbell Chart ({level})",
+        xaxis_title="Standard Volume",
+        yaxis_title="",
+        height=max(400, len(merged) * 30 + 100),
+        showlegend=True,
+        yaxis=dict(autorange="reversed")
+    )
+    return fig
+
+
+def build_elasticity_forest_figure(
+    idata: az.InferenceData,
+    variable_names: list[str] | None = None,
+) -> go.Figure:
+    """Build elasticity forest plot from posterior samples. Legacy wrapper."""
+    return _build_elasticity_forest_figure(idata, variable_names)
+
+
+def run_scenario_plan(
+    choice_data: ChoiceSetData,
+    posterior_cache: dict[str, np.ndarray],
+    plan: Any,
+    n_draws: int = 400,
+) -> Any:
+    """Run scenario plan with market-first aggregation. Legacy wrapper."""
+    return _run_scenario_plan(choice_data, posterior_cache, plan, n_draws)
+
+
+def create_reallocation_sankey(
+    result: Any,
+    choice_data: ChoiceSetData,
+    action_sku: str,
+    top_n: int = 10,
+) -> go.Figure:
+    """Create reallocation sankey diagram. Legacy wrapper."""
+    return _create_reallocation_sankey(result, choice_data, action_sku, top_n)
