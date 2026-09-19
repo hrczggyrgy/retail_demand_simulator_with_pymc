@@ -25,6 +25,7 @@ from engine_modules.model import (
     extract_joint_posterior,
     UNAVAILABLE_UTILITY,
     UNAVAILABLE_SHARE_TOLERANCE,
+    build_pymc_model as _build_pymc_model,
     build_pymc_model_v2 as _build_pymc_model_v2,
     build_joint_model as _build_joint_model,
 )

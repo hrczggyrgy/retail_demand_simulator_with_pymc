@@ -79,14 +79,15 @@ def build_pymc_model(
         month_raw = pm.Normal("month_raw", 0.0, 1.0, dims="month")
         month_effect = pm.Deterministic("month_effect", sigma_month * month_raw, dims="month")
 
-        # Price slope with brand×pack pooling
+        # Price slope with brand×pack pooling - compute directly at observation level
         price_bp_mu = pm.Normal("price_bp_mu", 0.0, 0.5, dims="brand_pack")
         price_sku_sigma = pm.HalfNormal("price_sku_sigma", 0.35)
         price_sku_raw = pm.Normal("price_sku_raw", 0.0, 1.0, dims="sku")
-        price_slope = pm.Deterministic(
-            "price_slope",
-            price_bp_mu[bp_idx] + price_sku_sigma * price_sku_raw,
-            dims="sku",
+        
+        # Price slope per observation: brand_pack effect + SKU-specific deviation
+        price_slope_obs = (
+            price_bp_mu[bp_idx]
+            + price_sku_sigma * price_sku_raw[sku_idx]
         )
 
         # ND effect - B-spline
@@ -103,7 +104,7 @@ def build_pymc_model(
             alpha
             + entity_effect[entity_idx]
             + month_effect[month_idx]
-            + price_slope[sku_idx] * log_rel_price_z
+            + price_slope_obs * log_rel_price_z
             + nd_effect,
             dims="obs_id",
         )
