@@ -144,7 +144,7 @@ def test_summarise_scenario_draws():
     n_skus = df["sku"].nunique()
     df["sku_idx"] = df["sku"].map({s:i for i,s in enumerate(sorted(df["sku"].unique()))})
     nd = df["nd"].clip(1e-4).to_numpy()
-    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "sd": float(np.log(nd).std())}}
+    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "std": float(np.log(nd).std())}}
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
@@ -174,7 +174,7 @@ def test_calculate_market_shares():
     n_skus = df["sku"].nunique()
     df["sku_idx"] = df["sku"].map({s:i for i,s in enumerate(sorted(df["sku"].unique()))})
     nd = df["nd"].clip(1e-4).to_numpy()
-    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "sd": float(np.log(nd).std())}}
+    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "std": float(np.log(nd).std())}}
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
@@ -208,7 +208,7 @@ def test_scenario_suite():
     n_skus = df["sku"].nunique()
     df["sku_idx"] = df["sku"].map({s:i for i,s in enumerate(sorted(df["sku"].unique()))})
     nd = df["nd"].clip(1e-4).to_numpy()
-    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "sd": float(np.log(nd).std())}}
+    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "std": float(np.log(nd).std())}}
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
@@ -237,7 +237,7 @@ def test_aggregate_market_impact():
     n_skus = df["sku"].nunique()
     df["sku_idx"] = df["sku"].map({s:i for i,s in enumerate(sorted(df["sku"].unique()))})
     nd = df["nd"].clip(1e-4).to_numpy()
-    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "sd": float(np.log(nd).std())}}
+    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "std": float(np.log(nd).std())}}
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
@@ -259,7 +259,7 @@ def test_reallocation_breakdown():
     n_skus = df["sku"].nunique()
     df["sku_idx"] = df["sku"].map({s:i for i,s in enumerate(sorted(df["sku"].unique()))})
     nd = df["nd"].clip(1e-4).to_numpy()
-    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "sd": float(np.log(nd).std())}}
+    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "std": float(np.log(nd).std())}}
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
@@ -289,7 +289,7 @@ def test_parameter_attribution():
     n_skus = df["sku"].nunique()
     df["sku_idx"] = df["sku"].map({s:i for i,s in enumerate(sorted(df["sku"].unique()))})
     nd = df["nd"].clip(1e-4).to_numpy()
-    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "sd": float(np.log(nd).std())}}
+    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "std": float(np.log(nd).std())}}
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
@@ -339,7 +339,7 @@ def test_analytics_helpers():
     _ = engine.compute_market_share_analytics(df)
     _ = engine.compute_contribution_to_growth(df, start_month, end_month)
     # compute_model_validation_metrics needs idata - skip
-    _ = engine.create_growth_decomposition(df)
+    _ = engine.create_growth_decomposition(df, start_month, end_month)
     _ = engine.classify_distribution_velocity(df)
     _ = engine.get_expansion_candidates(df)
     print("✓ All analytics helpers execute")
@@ -356,7 +356,7 @@ def test_zero_price_and_nd_scenario_equals_baseline() -> None:
     n_skus = df["sku"].nunique()
     df["sku_idx"] = df["sku"].map({s:i for i,s in enumerate(sorted(df["sku"].unique()))})
     nd = df["nd"].clip(1e-4).to_numpy()
-    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "sd": float(np.log(nd).std())}}
+    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "std": float(np.log(nd).std())}}
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
@@ -386,7 +386,7 @@ def test_target_scope_case_insensitive_or_raises() -> None:
     n_skus = df["sku"].nunique()
     df["sku_idx"] = df["sku"].map({s:i for i,s in enumerate(sorted(df["sku"].unique()))})
     nd = df["nd"].clip(1e-4).to_numpy()
-    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "sd": float(np.log(nd).std())}}
+    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "std": float(np.log(nd).std())}}
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
@@ -423,7 +423,7 @@ def test_filtered_dataframe_non_contiguous_index_no_nans() -> None:
     n_skus = df["sku"].nunique()
     df["sku_idx"] = df["sku"].map({s:i for i,s in enumerate(sorted(df["sku"].unique()))})
     nd = df["nd"].clip(1e-4).to_numpy()
-    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "sd": float(np.log(nd).std())}}
+    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "std": float(np.log(nd).std())}}
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
@@ -448,7 +448,7 @@ def test_scenario_runs_on_full_market_not_filtered() -> None:
     n_skus = df["sku"].nunique()
     df["sku_idx"] = df["sku"].map({s:i for i,s in enumerate(sorted(df["sku"].unique()))})
     nd = df["nd"].clip(1e-4).to_numpy()
-    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "sd": float(np.log(nd).std())}}
+    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "std": float(np.log(nd).std())}}
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)
@@ -526,7 +526,7 @@ def test_scenario_segment_deltas_reconcile_to_market_delta() -> None:
     n_skus = df["sku"].nunique()
     df["sku_idx"] = df["sku"].map({s:i for i,s in enumerate(sorted(df["sku"].unique()))})
     nd = df["nd"].clip(1e-4).to_numpy()
-    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "sd": float(np.log(nd).std())}}
+    scales = {"log_nd": {"mean": float(np.log(nd).mean()), "std": float(np.log(nd).std())}}
     spline, _ = engine.fit_spline(df)
     n_basis = int(spline.transform(np.array([[0.0]])).shape[1])
     np.random.seed(42)

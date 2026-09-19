@@ -452,6 +452,30 @@ def run_joint_scenario_draws(
     delta_units_p05 = np.percentile(delta_units_all, 5, axis=0)
     delta_units_p95 = np.percentile(delta_units_all, 95, axis=0)
     
+    # Share summaries (per-draw shares then quantiles)
+    baseline_share_p50 = np.median(baseline_shares_all, axis=0)
+    scenario_share_p50 = np.median(scenario_shares_all, axis=0)
+    baseline_share_p05 = np.percentile(baseline_shares_all, 5, axis=0)
+    scenario_share_p05 = np.percentile(scenario_shares_all, 5, axis=0)
+    baseline_share_p95 = np.percentile(baseline_shares_all, 95, axis=0)
+    scenario_share_p95 = np.percentile(scenario_shares_all, 95, axis=0)
+    
+    delta_shares_all = scenario_shares_all - baseline_shares_all
+    delta_share_p50 = np.median(delta_shares_all, axis=0)
+    delta_share_p05 = np.percentile(delta_shares_all, 5, axis=0)
+    delta_share_p95 = np.percentile(delta_shares_all, 95, axis=0)
+    
+    # Reallocated units (competitor loss = -delta for non-target SKUs)
+    reallocated_units_all = -delta_units_all.copy()
+    # Only count competitor losses (positive reallocation)
+    reallocated_units_all = np.where(reallocated_units_all > 0, reallocated_units_all, 0)
+    reallocated_units_p50 = np.median(reallocated_units_all, axis=0)
+    reallocated_units_p05 = np.percentile(reallocated_units_all, 5, axis=0)
+    reallocated_units_p95 = np.percentile(reallocated_units_all, 95, axis=0)
+    
+    # Market total units (fixed)
+    market_total_units = market_totals
+    
     return ScenarioResult(
         baseline_units=baseline_units_all,
         scenario_units=scenario_units_all,
@@ -466,6 +490,20 @@ def run_joint_scenario_draws(
         delta_units_p50=delta_units_p50,
         delta_units_p05=delta_units_p05,
         delta_units_p95=delta_units_p95,
+        baseline_share_p50=baseline_share_p50,
+        scenario_share_p50=scenario_share_p50,
+        baseline_share_p05=baseline_share_p05,
+        scenario_share_p05=scenario_share_p05,
+        baseline_share_p95=baseline_share_p95,
+        scenario_share_p95=scenario_share_p95,
+        delta_share_p50=delta_share_p50,
+        delta_share_p05=delta_share_p05,
+        delta_share_p95=delta_share_p95,
+        reallocated_units_p50=reallocated_units_p50,
+        reallocated_units_p05=reallocated_units_p05,
+        reallocated_units_p95=reallocated_units_p95,
+        market_total_units=market_total_units,
+        interval_kind="posterior_expected",
         choice_data=choice_data,
         actions=tuple(actions),
     )

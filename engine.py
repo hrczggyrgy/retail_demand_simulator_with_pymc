@@ -526,13 +526,23 @@ def prepare_market(
     spline_degree: int = DEFAULT_SPLINE_DEGREE,
 ) -> dict[str, Any]:
     """High-level market preparation for the improved UI."""
-    prepared = prepare_data(raw, n_knots, spline_degree)
+    df, meta = prepare_data(raw, n_knots, spline_degree)
+    # Build spline for the returned dict (use log_nd_z which is standardized)
+    from sklearn.preprocessing import SplineTransformer as SkSplineTransformer
+    x = df["log_nd_z"].to_numpy(dtype=float).reshape(-1, 1)
+    spline = SkSplineTransformer(
+        n_knots=n_knots,
+        degree=spline_degree,
+        include_bias=False,
+    )
+    nd_basis = spline.fit_transform(x).astype(np.float64, copy=False)
+    scales = meta.get("scales", {})
     return {
-        "df": prepared.df,
-        "scales": prepared.scales,
-        "meta": prepared.meta,
-        "spline": prepared.spline,
-        "nd_basis": prepared.nd_basis,
+        "df": df,
+        "scales": scales,
+        "meta": meta,
+        "spline": spline,
+        "nd_basis": nd_basis,
     }
 
 
@@ -1758,3 +1768,173 @@ def create_reallocation_sankey(
 ) -> go.Figure:
     """Create reallocation sankey diagram. Legacy wrapper."""
     return _create_reallocation_sankey(result, choice_data, action_sku, top_n)
+
+
+def validate_choice_set(choice_data: ChoiceSetData) -> dict[str, Any]:
+    """
+    Validate choice-set data integrity. Legacy wrapper.
+    
+    Returns a dict with validation results.
+    """
+    results = {
+        "n_markets": len(choice_data.market_ids),
+        "n_skus": len(choice_data.sku_ids),
+        "total_observed_units": int(choice_data.observed_units.sum()),
+        "market_totals_match": True,
+        "unavailable_have_zero_units": True,
+        "shares_sum_to_one": True,
+        "relative_price_range": (float(choice_data.relative_price.min()), 
+                                  float(choice_data.relative_price.max())),
+        "nd_range": (float(choice_data.nd.min()), float(choice_data.nd.max())),
+        "availability_rate": float(choice_data.available_mask.mean()),
+    }
+    
+    # Check market totals
+    market_sums = choice_data.observed_units.sum(axis=1)
+    if not np.allclose(market_sums, choice_data.market_total_units, atol=1e-6):
+        results["market_totals_match"] = False
+    
+    # Check unavailable have zero units
+    if not np.allclose(choice_data.observed_units[~choice_data.available_mask].sum(), 0.0, atol=1e-6):
+        results["unavailable_have_zero_units"] = False
+    
+    # Check shares sum to one (within available)
+    shares = choice_data.observed_units / choice_data.market_total_units[:, np.newaxis]
+    available_shares = np.where(choice_data.available_mask, shares, 0)
+    share_sums = available_shares.sum(axis=1)
+    if not np.allclose(share_sums, 1.0, atol=1e-6):
+        results["shares_sum_to_one"] = False
+    
+    return results
+
+
+def build_nest_allocation_model(
+    choice_data: ChoiceSetData,
+    joint_posterior_cache: dict,
+    config: NestModelConfig | None = None,
+) -> pm.Model:
+    """Build the retailer-category nest allocation model (Layer B). Legacy wrapper.
+    
+    This model allocates total observed market volume across retailer-category nests
+    using the inclusive value from the SKU-level model (Layer C).
+    
+    Args:
+        choice_data: ChoiceSetData from SKU-level model
+        joint_posterior_cache: Posterior cache from joint SKU share model (for IV)
+        config: NestModelConfig
+    
+    Returns:
+        PyMC model for nest allocation
+    """
+    if config is None:
+        config = DEFAULT_NEST_MODEL_CONFIG
+    
+    n_markets = len(choice_data.market_ids)
+    
+    # Get unique retailer-category combinations
+    rc_combos = []
+    for m_idx in range(n_markets):
+        retailer = choice_data.retailer_levels[choice_data.market_retailer_idx[m_idx]]
+        category = choice_data.category_levels[choice_data.market_category_idx[m_idx]]
+        rc_combos.append((retailer, category))
+    
+    unique_rc = sorted(set(rc_combos))
+    n_rc = len(unique_rc)
+    
+    # Map market to rc index
+    market_to_rc = np.array([unique_rc.index(rc) for rc in rc_combos], dtype=np.int32)
+    
+    # Get months
+    months = sorted({choice_data.month_levels[choice_data.market_month_idx[m_idx]] for m_idx in range(n_markets)})
+    n_months = len(months)
+    month_to_idx = {m: i for i, m in enumerate(months)}
+    market_month_idx = np.array([month_to_idx[choice_data.month_levels[choice_data.market_month_idx[m_idx]]] for m_idx in range(n_markets)], dtype=np.int32)
+    
+    # Get categories for nesting parameter
+    rc_categories = [rc[1] for rc in unique_rc]
+    rc_category_idx = np.array([np.where(choice_data.category_levels == cat)[0][0] for cat in rc_categories], dtype=np.int32)
+    
+    # Market totals (total units per retailer-category-month)
+    market_totals = choice_data.market_total_units
+    
+    # Inclusive values from joint model
+    if "inclusive_value" in joint_posterior_cache:
+        iv_per_market = joint_posterior_cache["inclusive_value"].mean(axis=0)  # (n_markets,)
+    else:
+        iv_per_market = np.log(np.maximum(choice_data.available_mask.sum(axis=1), 1))
+    
+    # Aggregate IV to retailer-category level (mean across months)
+    iv_rc = np.zeros(n_rc)
+    iv_rc_counts = np.zeros(n_rc)
+    for m_idx in range(n_markets):
+        rc_idx = market_to_rc[m_idx]
+        iv_rc[rc_idx] += iv_per_market[m_idx]
+        iv_rc_counts[rc_idx] += 1
+    iv_rc = np.where(iv_rc_counts > 0, iv_rc / iv_rc_counts, 0.0)
+    
+    coords = {
+        "rc": np.arange(n_rc),
+        "month": np.arange(n_months),
+        "category": choice_data.category_levels,
+    }
+    
+    with pm.Model(coords=coords) as model:
+        # Data containers
+        market_totals_data = pm.Data("market_totals", market_totals, dims="market")
+        iv_data = pm.Data("iv_rc", iv_rc, dims="rc")
+        market_to_rc_data = pm.Data("market_to_rc", market_to_rc, dims="market")
+        market_month_idx_data = pm.Data("market_month_idx", market_month_idx, dims="market")
+        
+        # Retailer-category baseline attractiveness
+        alpha_rc = pm.Normal("alpha_rc", 0.0, config.sigma_alpha_rc, dims="rc")
+        
+        # Category-level CPI effect
+        theta_c = pm.Normal("theta_c", 0.0, config.sigma_cpi, dims="category")
+        cpi_rc = pm.Data("cpi_rc", np.zeros(n_rc), dims="rc")
+        
+        # Category-level assortment effect
+        omega_c = pm.Normal("omega_c", 0.0, config.sigma_assortment, dims="category")
+        assortment_rc = pm.Data("assortment_rc", np.zeros(n_rc), dims="rc")
+        
+        # Nesting parameter lambda_c (0 < lambda <= 1)
+        lambda_raw = pm.Normal("lambda_raw", 0.0, config.sigma_nesting, dims="category")
+        lambda_c = pm.Deterministic("lambda_c", pm.math.sigmoid(lambda_raw), dims="category")
+        
+        # Outside option
+        sigma_outside = pm.HalfNormal("sigma_outside", config.sigma_outside)
+        outside = pm.Normal("outside", 0.0, sigma_outside)
+        
+        # Utility for each retailer-category nest (average over months)
+        # U_rc = alpha_rc + theta_c * CPI_rc + omega_c * Assortment_rc + lambda_c * IV_rc
+        utility_rc = (
+            alpha_rc
+            + theta_c[rc_category_idx] * cpi_rc
+            + omega_c[rc_category_idx] * assortment_rc
+            + lambda_c[rc_category_idx] * iv_data
+        )
+        
+        # Nest shares (multinomial logit with outside option)
+        # w_rc = exp(U_rc) / (sum(exp(U_rc')) + exp(U_outside))
+        exp_utility = pm.math.exp(utility_rc)
+        exp_outside = pm.math.exp(outside)
+        denom = exp_utility.sum() + exp_outside
+        nest_shares = exp_utility / denom
+        
+        # Nest shares with outside option
+        w_rc = pm.Deterministic("w_rc", nest_shares, dims="rc")
+        w_outside = pm.Deterministic("w_outside", exp_outside / denom)
+        
+        # Since we don't observe nest-level breakdown, we model the total market volume
+        # with a simple Normal likelihood on the total (placeholder)
+        # The nest shares are available for scenario analysis
+        total_units_pred = pm.Deterministic("total_units_pred", market_totals_data, dims="market")
+        sigma_total = pm.HalfNormal("sigma_total", 0.5)
+        pm.Normal(
+            "market_totals_obs",
+            mu=total_units_pred,
+            sigma=sigma_total,
+            observed=market_totals_data,
+            dims="market",
+        )
+    
+    return model
