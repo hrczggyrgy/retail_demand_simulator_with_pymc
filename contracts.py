@@ -9,6 +9,7 @@ and preprocessing state are defined here exactly once.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 import numpy as np
 import pandas as pd
@@ -193,6 +194,53 @@ JOINT_CONFIG = ModelConfig(
 )
 
 
+# Preview vs Validated model configs for explicit quality gating
+@dataclass(frozen=True, slots=True)
+class PreviewModelConfig:
+    """Preview/fast model config - explicitly labeled as non-decision-grade."""
+    draws: int = 200
+    tune: int = 200
+    chains: int = 2
+    target_accept: float = 0.90
+    random_seed: int = 42
+    likelihood: str = "normal"
+    use_category_price_pooling: bool = False
+    use_sku_nd_effects: bool = False
+    n_spline_knots: int = 3
+    spline_degree: int = 3
+    scenario_draws: int = 100
+    
+    quality_label: str = "PREVIEW (non-decision-grade)"
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedModelConfig:
+    """Validated/production model config - meets all health gates."""
+    draws: int = 1200
+    tune: int = 1500
+    chains: int = 4
+    target_accept: float = 0.98
+    random_seed: int = 42
+    likelihood: str = "student_t"
+    use_category_price_pooling: bool = True
+    use_sku_nd_effects: bool = False
+    n_spline_knots: int = 4
+    spline_degree: int = 3
+    scenario_draws: int = 500
+    
+    quality_label: str = "VALIDATED (decision-grade)"
+    
+    # Health gate thresholds
+    max_rhat: float = 1.01
+    min_ess_bulk: int = 400
+    min_ess_tail: int = 400
+    min_bfmi: float = 0.3
+    max_tree_depth: int = 10
+    max_divergences: int = 0
+    min_coverage_90: float = 0.80
+    max_coverage_90: float = 0.95
+
+
 # =============================================================================
 # SCENARIO TYPES
 # =============================================================================
@@ -309,7 +357,11 @@ class ChoiceSetData:
 
 @dataclass(frozen=True, slots=True)
 class ScenarioResult:
-    """Results from a draw-by-draw counterfactual scenario."""
+    """Results from a draw-by-draw counterfactual scenario.
+    
+    Per-draw aggregation before posterior quantiles (fixing quantile-of-sum vs sum-of-quantiles).
+    All shares and deltas are computed per-draw then summarized.
+    """
     # Per-draw results (n_draws, n_markets, n_skus)
     baseline_units: np.ndarray
     scenario_units: np.ndarray
@@ -325,9 +377,27 @@ class ScenarioResult:
     delta_units_p50: np.ndarray
     delta_units_p05: np.ndarray
     delta_units_p95: np.ndarray
+    # Share summaries (n_markets, n_skus) - per-draw shares then quantiles
+    baseline_share_p50: np.ndarray
+    scenario_share_p50: np.ndarray
+    baseline_share_p05: np.ndarray
+    scenario_share_p05: np.ndarray
+    baseline_share_p95: np.ndarray
+    scenario_share_p95: np.ndarray
+    delta_share_p50: np.ndarray
+    delta_share_p05: np.ndarray
+    delta_share_p95: np.ndarray
+    # Reallocated units summaries (n_markets, n_skus) - units from competitors
+    reallocated_units_p50: np.ndarray
+    reallocated_units_p05: np.ndarray
+    reallocated_units_p95: np.ndarray
+    # Market total units (fixed, n_markets)
+    market_total_units: np.ndarray
+    # Interval kind: "posterior_expected" or "posterior_predictive"
+    interval_kind: str = "posterior_expected"
     # Metadata
-    choice_data: ChoiceSetData
-    actions: tuple[ScenarioAction, ...]
+    choice_data: ChoiceSetData = None
+    actions: tuple[ScenarioAction, ...] = ()
 
 
 # =============================================================================
@@ -470,6 +540,13 @@ def get_model_variable_names(model_mode: str) -> ModelVariableNames:
 # DIAGNOSTICS & HEALTH
 # =============================================================================
 
+class DiagnosticStatus(str, Enum):
+    """Status of individual diagnostic checks."""
+    PASS = "PASS"
+    FAIL = "FAIL"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
 @dataclass(frozen=True, slots=True)
 class ConvergenceDiagnostics:
     divergences: int
@@ -480,6 +557,15 @@ class ConvergenceDiagnostics:
     min_bfmi: float | None
     max_tree_depth: float | None
     is_acceptable: bool
+    # Per-diagnostic status and error messages
+    rhat_status: DiagnosticStatus = DiagnosticStatus.UNAVAILABLE
+    ess_bulk_status: DiagnosticStatus = DiagnosticStatus.UNAVAILABLE
+    ess_tail_status: DiagnosticStatus = DiagnosticStatus.UNAVAILABLE
+    bfmi_status: DiagnosticStatus = DiagnosticStatus.UNAVAILABLE
+    tree_depth_status: DiagnosticStatus = DiagnosticStatus.UNAVAILABLE
+    coverage_status: DiagnosticStatus = DiagnosticStatus.UNAVAILABLE
+    divergences_status: DiagnosticStatus = DiagnosticStatus.UNAVAILABLE
+    error_messages: tuple[str, ...] = tuple()
 
 
 @dataclass(frozen=True, slots=True)

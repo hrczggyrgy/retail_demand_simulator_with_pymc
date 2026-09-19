@@ -9,13 +9,13 @@ This application models an **observed total beverage market**. A selected SKU or
 ## Features
 
 - **Data Management**: CSV/XLSX upload with schema validation, template download, and synthetic demo data (exactly 10 raw columns)
-- **Descriptive Analytics**: 6 tabs — Overview, Data Health, Market & Share, Price & Distribution, Scenario Simulator, Model Health
-- **Bayesian Modeling**: Hierarchical model with entity effects, month effects, SKU-level price slopes with brand×pack pooling, and B-spline ND effects
+- **Three-Page Workflow**: Market (data + diagnostics), Scenario (plan editor + outcomes), Model Quality (convergence + PPC + elasticities)
+- **Bayesian Modeling**: Joint Dirichlet-Multinomial SKU share model with non-centered hierarchies for brand-pack price effects, ND spline effects, category-month effects
 - **Explicit Model Fitting**: Model fits only when you click "Fit / Re-fit model" — no auto-fit on data load
-- **Model Diagnostics**: Divergences, R-hat, ESS, posterior predictive coverage, observed vs predicted, residual heatmap
-- **Elasticity Analysis**: SKU-level price elasticities with 90% credible intervals, Plotly forest plot
-- **Scenario Analysis**: Price and numeric distribution what-if scenarios with guardrails, multi-level aggregation (market, retailer, category, brand, brand×pack, SKU)
-- **Market Impact Comparison**: Baseline, price-only, distribution-only, and combined scenarios with reallocation breakdown and parameter attribution
+- **Model Diagnostics**: Divergences, R-hat, ESS, BFMI, posterior predictive coverage, observed vs predicted, residual heatmap
+- **Elasticity Analysis**: SKU-level price elasticities with 90% credible intervals
+- **Scenario Analysis**: Four counterfactuals (baseline, price-only, distribution-only, combined) with per-draw aggregation and market-first outcomes
+- **Reallocation & Attribution**: Source-destination flow breakdown and parameter-level driver waterfall
 - **Data Quality**: Comprehensive quality report with exclusion reasons, missing values, observation counts
 
 ## Installation
@@ -42,12 +42,9 @@ Then open http://localhost:8501 in your browser.
 
 ### Workflow
 
-1. **Upload Data** — Use "Load uploaded data" or "Use demo market" in the sidebar
-2. **Configure Model** — Select model mode (Fast/Default/Advanced) in sidebar
-3. **Fit Model** — Click "Fit / Re-fit model" button (model does not auto-fit on load)
-4. **Explore Tabs** — View filters in sidebar affect display tabs only; scenarios always use the full market
-5. **Run Scenarios** — In Scenario Simulator tab, set price/ND changes and target, then click "Run scenario"
-6. **Compare Market Impact** — View scenario suite results, reallocation breakdown, and parameter attribution
+1. **Market Page** — Upload data or use demo market; explore market structure, shares, price-pack architecture, ND/velocity, growth decomposition
+2. **Scenario Page** — Define `ScenarioPlan` actions (price/ND changes), run 4-counterfactual suite, review market-first outcomes and reallocation
+3. **Model Quality Page** — Review convergence (R-hat, ESS, BFMI, divergences), posterior predictive checks, elasticity diagnostics
 
 ### Data Contract
 
@@ -74,12 +71,13 @@ Canonical scenario columns (no legacy aliases):
 
 | Column | Description |
 |--------|-------------|
-| `units_p05`, `units_p50`, `units_p95` | Posterior unit volume quantiles |
-| `revenue_p05`, `revenue_p50`, `revenue_p95` | Posterior revenue quantiles |
-| `scenario_unit_price` | Scenario unit price (`unit_price * (1 + price_change)`) |
-| `scenario_nd` | Scenario numeric distribution |
-| `scenario_price_change` | Applied price change |
-| `scenario_nd_change` | Applied ND change |
+| `baseline_share_p05`, `baseline_share_p50`, `baseline_share_p95` | Posterior baseline share quantiles |
+| `scenario_share_p05`, `scenario_share_p50`, `scenario_share_p95` | Posterior scenario share quantiles |
+| `reallocated_units_p05`, `reallocated_units_p50`, `reallocated_units_p95` | Posterior reallocated unit quantiles |
+| `delta_share_p05`, `delta_share_p50`, `delta_share_p95` | Posterior share delta quantiles |
+| `delta_units_p05`, `delta_units_p50`, `delta_units_p95` | Posterior unit delta quantiles |
+| `market_total_units` | Observed market total units (fixed) |
+| `interval_kind` | `posterior_expected` or `posterior_predictive` |
 
 ### Interpretation
 
@@ -90,38 +88,67 @@ Reallocation is labelled "modelled reallocation in the observed market" — segm
 ## Quality Commands
 
 ```bash
-# Run tests
-pytest -q
+# Run tests (fast deterministic tests)
+pytest -q tests/ -k "not slow" -n 1
+
+# Run slow/MCMC integration tests separately
+pytest -q tests/ -k "slow" -n 1
 
 # Lint
 ruff check .
 
 # Type check
-mypy app.py engine.py demo_data.py
+mypy app.py engine.py demo_data.py engine_modules/
 ```
 
 ## Architecture
 
-- `engine.py`: Core analytics engine (validation, preparation, modeling, scenarios, summaries) — organized by analytical layer
-- `app.py`: Streamlit frontend with 6 tabs, sidebar controls, explicit fit button — organized by page-rendering functions
-- `demo_data.py`: Raw 10-column data generator and input template only
-- `tests/test_app.py`: Comprehensive test suite (data contracts, engine functions, scenario reconciliation)
+```
+├── app.py                    # Streamlit frontend (3 pages: Market, Scenario, Model Quality)
+├── contracts.py              # Single source of truth: schemas, dataclasses, constants, thresholds
+├── engine.py                 # Thin backward-compat re-export layer (legacy API only)
+├── demo_data.py              # Raw 10-column data generator and input template only
+├── engine_modules/           # Modular engine implementation
+│   ├── validation.py         # Data validation & preparation
+│   ├── features.py           # Feature engineering (relative price, ND, splines, indices)
+│   ├── choice_sets.py        # ChoiceSetData construction for modeling
+│   ├── model.py              # Joint Dirichlet-Multinomial model builder
+│   ├── fitting.py            # PyMC sampling with non-centered parameterization
+│   ├── diagnostics.py        # Convergence, PPC, health assessment
+│   ├── scenarios.py          # ScenarioPlan runner, market-first aggregation, reallocation
+│   └── reporting.py          # Summary tables, elasticity extraction, driver waterfall
+└── tests/                    # Modular test suite
+    ├── test_validation.py
+    ├── test_features.py
+    ├── test_choice_sets.py
+    ├── test_model_structure.py
+    ├── test_diagnostics.py
+    ├── test_scenarios.py
+    ├── test_reporting.py
+    └── test_app_smoke.py
+```
 
 ## Model Specification
 
-The Bayesian model estimates:
+The Bayesian joint model estimates SKU shares within each retailer×category market via Dirichlet-Multinomial:
 
 ```
-log(V_std_{r,s,t}) = alpha + eta_{r,s} + mu_t + beta_s * log(P_rel_{r,s,t}) + f(ND_{r,s,t}) + epsilon_{r,s,t}
+V_{r,c,s,t} = exp(α + η_{r,c,s} + μ_t + β_s * log(P_rel) + f(ND) + γ_{c,t})
+share_{r,c,s,t} ~ DirichletMultinomial(n=total_units, α=concentration * V / sum(V))
 ```
 
 Where:
-- `alpha`: Global intercept
-- `eta_{r,s}`: Retailer×SKU entity effect (partial pooling)
-- `mu_t`: Month effect (seasonality)
-- `beta_s`: SKU price elasticity with brand×pack-size pooling
-- `f(ND)`: B-spline for non-linear numeric distribution effect
-- `epsilon`: Observation noise
+- `α`: Global intercept
+- `η_{r,c,s}`: Retailer×Category×SKU entity effect (non-centered, partial pooling)
+- `μ_t`: Month effect (seasonality)
+- `β_s`: SKU price elasticity with brand×pack-size pooling (non-centered)
+- `f(ND)`: B-spline for non-linear numeric distribution effect (non-centered)
+- `γ_{c,t}`: Category×month interaction (non-centered)
+- `concentration`: Dirichlet concentration parameter (HalfNormal + 0.5)
+
+**Sampling defaults (ValidatedModelConfig)**: 4 chains, 1,200 draws, 1,500 tune, `target_accept=0.98`, seed=42.
+
+**Health gates**: R-hat < 1.01, bulk/tail ESS > 400, BFMI > 0.3, 0 divergences, PPC coverage ≈ 90%.
 
 ## Standard Scenario Suite
 
@@ -134,7 +161,7 @@ Four scenarios run on the **same posterior draw set** for fair comparison:
 | Distribution only | 0% | User-specified |
 | Combined | User-specified | User-specified |
 
-Aggregation at six levels: Market, Retailer, Category, Brand, Brand×Pack, SKU. Total observed-market delta equals sum of SKU deltas within floating-point tolerance.
+Aggregation is **per-draw before posterior quantiles** (fixing the quantile-of-sum vs sum-of-quantiles error). Market-first outcomes ensure total observed-market delta equals sum of SKU deltas.
 
 ## Disclaimer
 

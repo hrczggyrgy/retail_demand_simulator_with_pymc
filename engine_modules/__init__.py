@@ -28,6 +28,7 @@ from contracts import (
     DEFAULT_TARGET_ACCEPT,
     DEFAULT_TUNE,
     DERIVED_COLUMNS,
+    DiagnosticStatus,
     FAST_CHAINS,
     FAST_CONFIG,
     FAST_DRAWS,
@@ -49,9 +50,11 @@ from contracts import (
     ModelHealth,
     ModelVariableNames,
     PreprocessState,
+    PreviewModelConfig,
     ScenarioAction,
     ScenarioPlan,
     ScenarioResult,
+    ValidatedModelConfig,
     ValidationReport,
     validate_raw_columns,
     validate_scenario_result,
@@ -60,15 +63,12 @@ from contracts import (
     NUMERIC_RAW_COLUMNS as NUMERIC_COLUMNS,
 )
 
-# Re-export choice_sets
+# Re-export choice_sets (public API only)
 from .choice_sets import (
-    _compute_peer_price_matrix,
-    _get_category_pack_peer_price,
-    _recompute_relative_prices,
     build_choice_set_data,
 )
 
-# Re-export diagnostics
+# Re-export diagnostics (public API only)
 from .diagnostics import (
     build_elasticity_forest_figure,
     compute_posterior_predictive_check,
@@ -77,7 +77,7 @@ from .diagnostics import (
     summarize_convergence_diagnostics,
 )
 
-# Re-export features
+# Re-export features (public API only)
 from .features import (
     add_core_features,
     add_log_features,
@@ -89,7 +89,7 @@ from .features import (
     build_spline_basis,
 )
 
-# Re-export fitting
+# Re-export fitting (public API only)
 from .fitting import (
     fit_joint_model,
     fit_model,
@@ -98,18 +98,19 @@ from .fitting import (
     run_prior_predictive,
 )
 
-# Re-export model
+# Re-export model (public API only)
 from .model import (
     JointModelConfig,
     build_joint_model,
     build_pymc_model,
     build_pymc_model_v2,
     extract_joint_posterior,
+    UNAVAILABLE_UTILITY,
+    UNAVAILABLE_SHARE_TOLERANCE,
 )
 
-# Re-export reporting
+# Re-export reporting (public API only)
 from .reporting import (
-    _SUMMARY_METRICS,
     aggregate_scenario,
     build_market_overview,
     build_nd_velocity_quadrant,
@@ -119,20 +120,19 @@ from .reporting import (
     prepare_market,
 )
 
-# Re-export scenarios
+# Re-export scenarios (public API only)
 from .scenarios import (
     MARKET_LEVELS,
     SOURCE_DESTINATION_COLUMNS,
-    _compute_utility,
-    _softmax,
     aggregate_scenario_result,
     check_scenario_reconciliation,
     compute_source_destination_flows,
     create_driver_waterfall,
     run_joint_scenario_draws,
+    run_scenario_plan,
 )
 
-# Re-export validation
+# Re-export validation (public API only)
 from .validation import (
     PreparedData,
     build_retail_features,
@@ -141,11 +141,8 @@ from .validation import (
     validate_input_data,
 )
 
-# Legacy ValidationReport from validation.py
-from .validation import ValidationReport as LegacyValidationReport
-
 __all__ = [
-    # Contracts
+    # Contracts (from contracts.py)
     "RAW_COLUMNS",
     "REQUIRED_COLUMNS",
     "NUMERIC_COLUMNS",
@@ -187,6 +184,16 @@ __all__ = [
     "ValidationReport",
     "validate_raw_columns",
     "validate_scenario_result",
+    "PreviewModelConfig",
+    "ValidatedModelConfig",
+    "DiagnosticStatus",
+    "UNAVAILABLE_UTILITY",
+    "UNAVAILABLE_SHARE_TOLERANCE",
+    "PreviewModelConfig",
+    "ValidatedModelConfig",
+    "DiagnosticStatus",
+    "UNAVAILABLE_UTILITY",
+    "UNAVAILABLE_SHARE_TOLERANCE",
     # Validation
     "make_pack_group",
     "validate_input_data",
@@ -203,10 +210,7 @@ __all__ = [
     "apply_standardization",
     "build_all_features",
     # Choice sets
-    "_get_category_pack_peer_price",
     "build_choice_set_data",
-    "_compute_peer_price_matrix",
-    "_recompute_relative_prices",
     # Model
     "build_pymc_model",
     "build_pymc_model_v2",
@@ -227,8 +231,7 @@ __all__ = [
     "compute_posterior_predictive_check",
     # Scenarios
     "run_joint_scenario_draws",
-    "_compute_utility",
-    "_softmax",
+    "run_scenario_plan",
     "compute_source_destination_flows",
     "SOURCE_DESTINATION_COLUMNS",
     "MARKET_LEVELS",
@@ -243,7 +246,4 @@ __all__ = [
     "build_market_overview",
     "build_price_pack_architecture",
     "build_nd_velocity_quadrant",
-    "_SUMMARY_METRICS",
-    # Legacy
-    "LegacyValidationReport",
 ]

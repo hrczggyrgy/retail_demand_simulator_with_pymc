@@ -104,6 +104,47 @@ def validate_input_data(raw: pd.DataFrame) -> ValidationReport:
     if (raw["revenue"] <= 0).any():
         warnings.append("Some rows have non-positive revenue")
 
+    # DirichletMultinomial requires integer SKU unit counts that sum to market total per market
+    units = raw["units"].to_numpy(dtype=float)
+    if not np.isfinite(units).all() or (units < 0).any():
+        return ValidationReport(
+            is_valid=False,
+            errors=("DirichletMultinomial requires finite, non-negative unit counts.",),
+            warnings=tuple(warnings),
+            row_count=len(raw),
+            column_count=len(raw.columns),
+            missing_columns=tuple(),
+            extra_columns=tuple(),
+        )
+
+    if not np.allclose(units, np.rint(units), atol=1e-8, rtol=0):
+        return ValidationReport(
+            is_valid=False,
+            errors=(
+                "DirichletMultinomial likelihood requires integer SKU unit counts. "
+                "Use a continuous-share model for weighted/fractional units.",
+            ),
+            warnings=tuple(warnings),
+            row_count=len(raw),
+            column_count=len(raw.columns),
+            missing_columns=tuple(),
+            extra_columns=tuple(),
+        )
+
+    # Verify market-level sum constraint
+    market_cols = ["month", "retailer", "category"]
+    market_totals = raw.groupby(market_cols, observed=True)["units"].sum()
+    if (market_totals <= 0).any():
+        return ValidationReport(
+            is_valid=False,
+            errors=("Each market must have a positive total unit count.",),
+            warnings=tuple(warnings),
+            row_count=len(raw),
+            column_count=len(raw.columns),
+            missing_columns=tuple(),
+            extra_columns=tuple(),
+        )
+
     return ValidationReport(
         is_valid=True,
         errors=tuple(),

@@ -4,6 +4,7 @@ Model diagnostics, convergence checks, and elasticity analysis.
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any
 
 import arviz as az
@@ -12,6 +13,7 @@ import pandas as pd
 
 from contracts import (
     ConvergenceDiagnostics,
+    DiagnosticStatus,
 )
 
 
@@ -25,6 +27,14 @@ def get_model_diagnostics(idata: Any, model_mode: str = "Default (4 chains)") ->
         "min_ess_tail": diagnostics.min_ess_tail,
         "coverage_90": diagnostics.coverage_90,
         "is_acceptable": diagnostics.is_acceptable,
+        "rhat_status": diagnostics.rhat_status,
+        "ess_bulk_status": diagnostics.ess_bulk_status,
+        "ess_tail_status": diagnostics.ess_tail_status,
+        "bfmi_status": diagnostics.bfmi_status,
+        "tree_depth_status": diagnostics.tree_depth_status,
+        "coverage_status": diagnostics.coverage_status,
+        "divergences_status": diagnostics.divergences_status,
+        "error_messages": diagnostics.error_messages,
     }
 
 
@@ -41,46 +51,69 @@ def summarize_convergence_diagnostics(
         observed_var: Name of observed variable in idata.observed_data
         predictive_var: Name of posterior predictive variable in idata.posterior_predictive
     
-    Returns a ConvergenceDiagnostics object with typed fields.
+    Returns a ConvergenceDiagnostics object with typed fields and per-diagnostic status.
     """
+    error_messages = []
+    
     # Divergences
     divergences = 0
+    divergences_status = DiagnosticStatus.UNAVAILABLE
     if hasattr(idata, "sample_stats") and "diverging" in idata.sample_stats:
-        divergences = int(idata.sample_stats["diverging"].sum().item())
+        try:
+            divergences = int(idata.sample_stats["diverging"].sum().item())
+            divergences_status = DiagnosticStatus.PASS if divergences == 0 else DiagnosticStatus.FAIL
+        except (ValueError, AttributeError) as e:
+            error_messages.append(f"Divergences computation failed: {e}")
+            divergences_status = DiagnosticStatus.UNAVAILABLE
 
     # R-hat and ESS from arviz summary
     max_rhat = None
     min_ess_bulk = None
     min_ess_tail = None
+    rhat_status = DiagnosticStatus.UNAVAILABLE
+    ess_bulk_status = DiagnosticStatus.UNAVAILABLE
+    ess_tail_status = DiagnosticStatus.UNAVAILABLE
 
     try:
         summary = az.summary(idata, round_to=None, kind="diagnostics")
         if "r_hat" in summary.columns:
             max_rhat = float(summary["r_hat"].max())
+            rhat_status = DiagnosticStatus.PASS if max_rhat < 1.01 else DiagnosticStatus.FAIL
         if "ess_bulk" in summary.columns:
             min_ess_bulk = float(summary["ess_bulk"].min())
+            ess_bulk_status = DiagnosticStatus.PASS if min_ess_bulk >= 400 else DiagnosticStatus.FAIL
         if "ess_tail" in summary.columns:
             min_ess_tail = float(summary["ess_tail"].min())
-    except (ValueError, KeyError, AttributeError, RuntimeError):
-        pass
+            ess_tail_status = DiagnosticStatus.PASS if min_ess_tail >= 400 else DiagnosticStatus.FAIL
+    except (ValueError, KeyError, AttributeError, RuntimeError) as e:
+        error_messages.append(f"ArviZ summary failed: {e}")
+        rhat_status = ess_bulk_status = ess_tail_status = DiagnosticStatus.UNAVAILABLE
 
     # E-BFMI and max tree depth from sample_stats
     min_bfmi = None
     max_tree_depth = None
+    bfmi_status = DiagnosticStatus.UNAVAILABLE
+    tree_depth_status = DiagnosticStatus.UNAVAILABLE
+    
     if hasattr(idata, "sample_stats"):
         if "bfmi" in idata.sample_stats:
             try:
                 min_bfmi = float(idata.sample_stats["bfmi"].min().item())
-            except (ValueError, AttributeError):
-                pass
+                bfmi_status = DiagnosticStatus.PASS if min_bfmi >= 0.3 else DiagnosticStatus.FAIL
+            except (ValueError, AttributeError) as e:
+                error_messages.append(f"BFMI computation failed: {e}")
+                bfmi_status = DiagnosticStatus.UNAVAILABLE
         if "tree_depth" in idata.sample_stats:
             try:
                 max_tree_depth = float(idata.sample_stats["tree_depth"].max().item())
-            except (ValueError, AttributeError):
-                pass
+                tree_depth_status = DiagnosticStatus.PASS if max_tree_depth < 10 else DiagnosticStatus.FAIL
+            except (ValueError, AttributeError) as e:
+                error_messages.append(f"Tree depth computation failed: {e}")
+                tree_depth_status = DiagnosticStatus.UNAVAILABLE
 
     # Posterior predictive coverage
     coverage_90 = None
+    coverage_status = DiagnosticStatus.UNAVAILABLE
     if (hasattr(idata, "posterior_predictive") and predictive_var in idata.posterior_predictive
         and hasattr(idata, "observed_data") and observed_var in idata.observed_data):
         try:
@@ -95,8 +128,10 @@ def summarize_convergence_diagnostics(
             
             in_interval = (obs_flat >= pred_lower) & (obs_flat <= pred_upper)
             coverage_90 = float(in_interval.mean())
-        except (KeyError, ValueError, AttributeError, IndexError):
-            pass
+            coverage_status = DiagnosticStatus.PASS if abs(coverage_90 - 0.90) < 0.1 else DiagnosticStatus.FAIL
+        except (KeyError, ValueError, AttributeError, IndexError) as e:
+            error_messages.append(f"Posterior predictive check failed: {e}")
+            coverage_status = DiagnosticStatus.UNAVAILABLE
 
     # Missing diagnostics fail - require all checks to be present and pass
     is_acceptable = (
@@ -120,6 +155,14 @@ def summarize_convergence_diagnostics(
         min_bfmi=min_bfmi,
         max_tree_depth=max_tree_depth,
         is_acceptable=is_acceptable,
+        rhat_status=rhat_status,
+        ess_bulk_status=ess_bulk_status,
+        ess_tail_status=ess_tail_status,
+        bfmi_status=bfmi_status,
+        tree_depth_status=tree_depth_status,
+        coverage_status=coverage_status,
+        divergences_status=divergences_status,
+        error_messages=tuple(error_messages),
     )
 
 

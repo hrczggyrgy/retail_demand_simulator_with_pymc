@@ -1193,18 +1193,19 @@ def test_unavailable_sku_has_zero_scenario_share() -> None:
     # Check that unavailable SKUs have zero shares in both baseline and scenario
     n_markets = choice_data.observed_units.shape[0]
     n_skus = choice_data.observed_units.shape[1]
+    tol = engine.UNAVAILABLE_SHARE_TOLERANCE
     for m in range(n_markets):
         for s in range(n_skus):
             if not choice_data.available_mask[m, s]:
                 baseline_shares = result.baseline_shares[:, m, s]
                 scenario_shares = result.scenario_shares[:, m, s]
                 
-                assert np.allclose(baseline_shares, 0.0, atol=1e-6), \
-                    f"Unavailable SKU {s} in market {m} has non-zero baseline share"
-                assert np.allclose(scenario_shares, 0.0, atol=1e-6), \
-                    f"Unavailable SKU {s} in market {m} has non-zero scenario share"
+                assert np.all(baseline_shares < tol), \
+                    f"Unavailable SKU {s} in market {m} has baseline share >= {tol}"
+                assert np.all(scenario_shares < tol), \
+                    f"Unavailable SKU {s} in market {m} has scenario share >= {tol}"
     
-    print("✓ Unavailable SKUs have zero shares in both baseline and scenario")
+    print(f"✓ Unavailable SKUs have shares < {tol} in both baseline and scenario")
 
 
 def test_total_market_delta_equals_sum_of_sku_deltas() -> None:

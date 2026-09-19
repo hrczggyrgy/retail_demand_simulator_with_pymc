@@ -266,6 +266,12 @@ def build_pymc_model_v2(
 
 from dataclasses import dataclass
 
+# Utility value for unavailable SKUs: exp(-30) ≈ 9.3e-14 share
+# This ensures DirichletMultinomial concentration parameters a = concentration * share > 0
+# for all SKUs, satisfying the distribution's requirement that all a > 0.
+UNAVAILABLE_UTILITY = -30.0
+UNAVAILABLE_SHARE_TOLERANCE = 1e-12  # Tests should assert share < this, not == 0
+
 
 @dataclass(frozen=True, slots=True)
 class JointModelConfig:
@@ -426,12 +432,13 @@ def build_joint_model(
                 + pack_term
                 + cat_month_term
             )
-            # Mask unavailable: use -30 so softmax gives small but positive shares (exp(-30) ≈ 9e-14)
-            # This ensures a = concentration * sku_share > 0 for all SKUs, satisfying DirichletMultinomial's a > 0 requirement
+            # Mask unavailable: use UNAVAILABLE_UTILITY so softmax gives small but positive shares
+            # (exp(-30) ≈ 9e-14). This ensures a = concentration * sku_share > 0 for all SKUs,
+            # satisfying DirichletMultinomial's requirement that all concentration parameters a > 0.
             utility = pm.math.where(
                 choice_data.available_mask,
                 utility,
-                -30.0  # Small negative for unavailable (gives ~1e-13 share)
+                UNAVAILABLE_UTILITY
             )
             return utility
 
@@ -586,7 +593,7 @@ def _compute_sku_share_from_posterior(
         utility = np.where(
             choice_data.available_mask,
             utility,
-            -30.0  # Same as in model
+            UNAVAILABLE_UTILITY
         )
         
         # Softmax
