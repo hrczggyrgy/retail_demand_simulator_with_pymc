@@ -902,16 +902,21 @@ def test_joint_scenario_reconciliation_passes() -> None:
     idata = engine.fit_joint_model(model, joint_config)
     
     # Extract posterior
-    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42)
+    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42, choice_data=choice_data)
+    
+    # Find a market where the first SKU is actually available
+    sku_idx = 0
+    avail_markets = np.where(choice_data.available_mask[:, sku_idx])[0]
+    m_idx = avail_markets[0]
     
     # Create a simple action
     action = engine.ScenarioAction(
-        retailer=choice_data.retailer_levels[0],
-        category=choice_data.category_levels[0],
-        brand=choice_data.brand_levels[0],
-        sku=choice_data.sku_ids[0],
-        month=str(choice_data.month_levels[0]),
-        new_price_std=choice_data.relative_price[0, 0] * 0.95,  # 5% price cut
+        retailer=choice_data.retailer_levels[choice_data.market_retailer_idx[m_idx]],
+        category=choice_data.category_levels[choice_data.market_category_idx[m_idx]],
+        brand=choice_data.brand_levels[choice_data.sku_brand_idx[sku_idx]],
+        sku=choice_data.sku_ids[sku_idx],
+        month=str(choice_data.month_levels[choice_data.market_month_idx[m_idx]]).split(" ")[0],
+        new_price_std=choice_data.price_std[m_idx, sku_idx] * 0.95,  # 5% price cut
         new_nd=None,
         nd_mode="pp",
     )
@@ -949,15 +954,20 @@ def test_source_segments_are_mutually_exclusive() -> None:
     model = engine.build_joint_sku_share_model(choice_data, joint_config)
     idata = engine.fit_joint_model(model, joint_config)
     
-    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42)
+    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42, choice_data=choice_data)
+    
+    # Find a market where the first SKU is actually available
+    sku_idx = 0
+    avail_markets = np.where(choice_data.available_mask[:, sku_idx])[0]
+    m_idx = avail_markets[0]
     
     action = engine.ScenarioAction(
-        retailer=choice_data.retailer_levels[0],
-        category=choice_data.category_levels[0],
-        brand=choice_data.brand_levels[0],
-        sku=choice_data.sku_ids[0],
-        month=str(choice_data.month_levels[0]),
-        new_price_std=choice_data.relative_price[0, 0] * 0.95,
+        retailer=choice_data.retailer_levels[choice_data.market_retailer_idx[m_idx]],
+        category=choice_data.category_levels[choice_data.market_category_idx[m_idx]],
+        brand=choice_data.brand_levels[choice_data.sku_brand_idx[sku_idx]],
+        sku=choice_data.sku_ids[sku_idx],
+        month=str(choice_data.month_levels[choice_data.market_month_idx[m_idx]]).split(" ")[0],
+        new_price_std=choice_data.price_std[m_idx, sku_idx] * 0.95,
         new_nd=None,
         nd_mode="pp",
     )
@@ -1094,15 +1104,20 @@ def test_interval_ordering_is_valid() -> None:
     model = engine.build_joint_sku_share_model(choice_data, joint_config)
     idata = engine.fit_joint_model(model, joint_config)
     
-    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42)
+    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42, choice_data=choice_data)
+    
+    # Find a market where the first SKU is actually available
+    sku_idx = 0
+    avail_markets = np.where(choice_data.available_mask[:, sku_idx])[0]
+    m_idx = avail_markets[0]
     
     action = engine.ScenarioAction(
-        retailer=choice_data.retailer_levels[0],
-        category=choice_data.category_levels[0],
-        brand=choice_data.brand_levels[0],
-        sku=choice_data.sku_ids[0],
-        month=str(choice_data.month_levels[0]),
-        new_price_std=choice_data.relative_price[0, 0] * 0.95,
+        retailer=choice_data.retailer_levels[choice_data.market_retailer_idx[m_idx]],
+        category=choice_data.category_levels[choice_data.market_category_idx[m_idx]],
+        brand=choice_data.brand_levels[choice_data.sku_brand_idx[sku_idx]],
+        sku=choice_data.sku_ids[sku_idx],
+        month=str(choice_data.month_levels[choice_data.market_month_idx[m_idx]]).split(" ")[0],
+        new_price_std=choice_data.price_std[m_idx, sku_idx] * 0.95,
         new_nd=None,
         nd_mode="pp",
     )
@@ -1149,15 +1164,20 @@ def test_unavailable_sku_has_zero_scenario_share() -> None:
     model = engine.build_joint_sku_share_model(choice_data, joint_config)
     idata = engine.fit_joint_model(model, joint_config)
     
-    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42)
+    cache = engine.extract_joint_posterior(idata, max_draws=10, random_seed=42, choice_data=choice_data)
+    
+    # Find a market where the first SKU is actually available
+    sku_idx = 0
+    avail_markets = np.where(choice_data.available_mask[:, sku_idx])[0]
+    m_idx = avail_markets[0]
     
     action = engine.ScenarioAction(
-        retailer=choice_data.retailer_levels[0],
-        category=choice_data.category_levels[0],
-        brand=choice_data.brand_levels[0],
-        sku=choice_data.sku_ids[0],
-        month=str(choice_data.month_levels[0]),
-        new_price_std=choice_data.relative_price[0, 0] * 0.95,
+        retailer=choice_data.retailer_levels[choice_data.market_retailer_idx[m_idx]],
+        category=choice_data.category_levels[choice_data.market_category_idx[m_idx]],
+        brand=choice_data.brand_levels[choice_data.sku_brand_idx[sku_idx]],
+        sku=choice_data.sku_ids[sku_idx],
+        month=str(choice_data.month_levels[choice_data.market_month_idx[m_idx]]).split(" ")[0],
+        new_price_std=choice_data.price_std[m_idx, sku_idx] * 0.95,
         new_nd=None,
         nd_mode="pp",
     )
@@ -1171,7 +1191,7 @@ def test_unavailable_sku_has_zero_scenario_share() -> None:
     )
     
     # Check that unavailable SKUs have zero shares in both baseline and scenario
-    n_markets = len(choice_data.market_ids)
+    n_markets = choice_data.observed_units.shape[0]
     n_skus = choice_data.observed_units.shape[1]
     for m in range(n_markets):
         for s in range(n_skus):

@@ -916,7 +916,7 @@ def create_driver_waterfall(
 def create_reallocation_sankey(
     source_df: pd.DataFrame,
     selected_sku: str,
-) -> "go.Figure":
+) -> go.Figure:
     """Create Sankey diagram for reallocation flows.
     
     Handles edge case where no sources exist (all deltas positive).
